@@ -1,4 +1,8 @@
-# KCLF KPM 实现说明
+# KCLF KPM 实现说明（1.1 历史文档）
+
+> 版本说明（2026-10-28）：以下保留 1.1 阶段的实现与历史测试记录，不再描述当前源码。
+> 1.2.0 的结构布局、取消 ABI、寄存器保护、11 页映射、卸载规则和设备结果见
+> [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)。下文“当前”均指当时版本。
 
 本文描述 `kpms/kclf` 当前的实际实现（代码即事实），包括触发链、寄存器处理、
 用户态 trampoline ABI、错误模型、可观测性分析与已知限制。
@@ -146,8 +150,8 @@ KernelPatch 把 `kpatch <KEY> kpm ctl0 kclf <args>` 的 `<args>` 原样交给
 `空格 / 逗号 / 制表符` 统一切分（`kclf_tokenize`），因此两种写法等价：
 
 ```
-kpatch Test6666 kpm ctl0 kclf inject,<tid>,<path>[,force][,wake][,unload]
-kpatch Test6666 kpm ctl0 kclf "inject <tid> <path> force"
+kpatch <KEY> kpm ctl0 kclf inject,<tid>,<path>[,force][,wake][,unload]
+kpatch <KEY> kpm ctl0 kclf "inject <tid> <path> force"
 ```
 
 | 命令 | 作用 |

@@ -17,21 +17,28 @@ INCLUDE_FLAGS := -I. $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 # GCC 14+ emits calls to __aarch64_ldadd*_acq_rel for C11 atomics.  Those
 # libcalls are not part of the KPM ABI on older KernelPatch builds, so keep the
 # atomics inline (LDXR/STXR or LSE) instead.
-ARCH_CFLAGS := -mno-outline-atomics
+ARCH_CFLAGS := -mno-outline-atomics -mgeneral-regs-only -ffixed-x18
+KPM_CFLAGS := -std=gnu11 -Wall -Wextra -Werror -Wno-unused-parameter \
+	-ffreestanding -fno-builtin -nostdinc -fno-pic -fno-pie \
+	-fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -MMD -MP
 
-objs := kclf.o kclf_exec.o kclf_tramp.o
+objs := kclf.o kclf_exec.o kclf_compat.o kclf_tramp.o
 
 all: kclf.kpm
 
+$(objs): Makefile
+
 kclf.kpm: ${objs}
-	${CC} -r -o $@ $^
+	${LD} -r -o $@ $^
 
 %.o: %.c
-	${CC} $(CFLAGS) $(ARCH_CFLAGS) $(INCLUDE_FLAGS) -c -O2 -fno-stack-protector -fno-asynchronous-unwind-tables -o $@ $<
+	${CC} $(CFLAGS) $(KPM_CFLAGS) $(ARCH_CFLAGS) $(INCLUDE_FLAGS) -c -O2 -o $@ $<
 
 %.o: %.S
-	${CC} $(CFLAGS) $(ARCH_CFLAGS) $(INCLUDE_FLAGS) -c -O2 -o $@ $<
+	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -MMD -MP -c -o $@ $<
+
+-include $(objs:.o=.d)
 
 .PHONY: clean
 clean:
-	rm -f *.kpm *.o
+	rm -f kclf.kpm $(objs) $(objs:.o=.d)

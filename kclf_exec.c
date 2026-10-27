@@ -3,13 +3,14 @@
  * KCLF execution engine: everything that has to run inside the target task
  * context (current->mm == target mm).
  *
- * The engine never allocates a task reference and never stops the target:
+ * The engine runs with the request's pinned PID/mm identity and never stops the target:
  *   - preparation runs from a task_work callback (sleepable, target context),
  *   - the register file is only touched at the return-to-user boundary,
  *   - the payload is entered once and gives control back through a private
  *     getpid trap, after which the original register file is restored.
  */
 #include <kclf_internal.h>
+#include <common.h>
 #include <cache.h>
 #include <syscall.h>
 #include <kputils.h>
@@ -28,7 +29,7 @@
 #define KCLF_RTLD_NOW 0x2
 #define KCLF_O_RDONLY 0
 
-#define KCLF_USER_MAX 0x0000800000000000UL
+#define KCLF_USER_MAX kclf_user_limit
 #define KCLF_MAX_VMA 2048
 #define KCLF_MAX_DYN 512
 #define KCLF_MAX_SYM 200000
@@ -44,6 +45,7 @@
 #define DT_HASH 4
 #define DT_STRTAB 5
 #define DT_SYMTAB 6
+#define DT_SYMENT 11
 #define DT_STRSZ 10
 #define DT_SONAME 14
 #define DT_GNU_HASH 0x6ffffef5
@@ -96,11 +98,13 @@ struct kclf_sym
 
 struct kclf_elf
 {
-    u64 bias;  /* load bias: mapping_start - p_vaddr of the offset 0 segment */
+    u64 bias; /* load bias: mapping_start - p_vaddr of the offset 0 segment */
     u64 start; /* lowest mapped address of the module */
-    u64 end;   /* highest mapped address of the module */
-    u64 dyn;   /* bias + PT_DYNAMIC vaddr */
+    u64 end; /* highest mapped address of the module */
+    u64 dyn; /* bias + PT_DYNAMIC vaddr */
     u64 dynsz; /* PT_DYNAMIC memsz */
+    u64 phdr;
+    u16 phnum;
 };
 
 struct kclf_dyninfo
@@ -112,9 +116,6 @@ struct kclf_dyninfo
     u64 gnu_hash;
     u64 hash;
 };
-
-static const u64 kclf_vma_off_start = 0;
-static const u64 kclf_vma_off_end = 8;
 
 static const u8 kclf_elf_magic[4] = { 0x7f, 'E', 'L', 'F' };
 
@@ -135,50 +136,25 @@ static struct pt_regs *kclf_find_regs(void);
 /* user memory access                                                   */
 /* ------------------------------------------------------------------ */
 
-static int kclf_urd(u64 addr, void *buf, int len)
+static int kclf_user_range(u64 addr, u64 len)
 {
-    if (!addr || len < 0 || (u64)len > KCLF_USER_MAX || addr > KCLF_USER_MAX - (u64)len) return -1;
-    return kclf_ks.copy_from_user(buf, (const void *)addr, len) ? -1 : 0;
+    return addr && addr < KCLF_USER_MAX && len <= KCLF_USER_MAX - addr;
 }
 
-/*
- * raw_copy_from_user() only succeeds when the source page is already present.
- * Touching one byte per page first makes file-backed mappings (linker, libc,
- * a cold payload) fault in, without walking every byte of a large dynsym.
- * Must only be used from sleepable contexts.
- */
-static int kclf_prefault(u64 addr, u64 len)
+/* Completion hooks cannot fault. Keep this API separate from the sleepable
+ * GUP accessor: nofault returns 0/-errno, access_process_vm returns bytes. */
+static int kclf_urd(u64 addr, void *buf, int len)
 {
-    u64 p, end;
-    u64 page = (u64)kclf_page_size;
-
-    if (!len) return 0;
-    if (!addr || (u64)len > KCLF_USER_MAX || addr > KCLF_USER_MAX - (u64)len) return -1;
-    if (!kclf_ks.fault_in_pages_readable) return 0;
-    if (!page) page = 4096;
-    end = addr + len;
-    p = addr & ~(page - 1);
-    for (; p < end; p += page) {
-        if (kclf_ks.fault_in_pages_readable((const void *)p, 1)) return -1;
-    }
-    return 0;
+    if (kclf_user_tbi) addr &= 0x00ffffffffffffffULL;
+    if (len < 0 || !kclf_user_range(addr, (u64)len) || !kclf_ks.copy_from_user_nofault) return -EFAULT;
+    return kclf_ks.copy_from_user_nofault(buf, (const void *)addr, len) ? -EFAULT : 0;
 }
 
 static int kclf_urds(u64 addr, void *buf, int len)
 {
-    int rc;
-
-    if (!kclf_prefault(addr, (u64)len)) {
-        rc = kclf_urd(addr, buf, len);
-        if (!rc) return 0;
-    }
-    /* Last resort for kernels without fault_in_pages_readable, or a range
-     * whose first page is a hole: let GUP fault the pages in for us. */
-    if (kclf_ks.access_process_vm) {
-        int n = kclf_ks.access_process_vm(current, (unsigned long)addr, buf, len, 0);
-        if (n == len) return 0;
-    }
-    return -1;
+    if (kclf_user_tbi) addr &= 0x00ffffffffffffffULL;
+    if (len < 0 || !kclf_user_range(addr, (u64)len)) return -EFAULT;
+    return kclf_ks.access_process_vm(current, addr, buf, len, 0) == len ? 0 : -EFAULT;
 }
 
 static int kclf_urds_u32(u64 addr, u32 *out)
@@ -188,23 +164,26 @@ static int kclf_urds_u32(u64 addr, u32 *out)
 
 static int kclf_uwr(u64 addr, const void *buf, int len)
 {
+    if (kclf_user_tbi) addr &= 0x00ffffffffffffffULL;
     if (!addr || len < 0 || (u64)len > KCLF_USER_MAX || addr > KCLF_USER_MAX - (u64)len) return -1;
-    if (kclf_ks.copy_to_user) return kclf_ks.copy_to_user((void *)addr, buf, len) ? -1 : 0;
-    /* KernelPatch helper: positive return means "copied length" */
-    return compat_copy_to_user((void __user *)addr, buf, len) == len ? 0 : -1;
+    /* FOLL_WRITE=1 is stable on the supported kernels. GUP handles PAN,
+     * cold pages and the mmap lock; never use a raw arch uaccess symbol. */
+    return kclf_ks.access_process_vm(current, addr, (void *)buf, len, 1) == len ? 0 : -EFAULT;
 }
 
 /* bounded, NUL terminated user string copy (fault-tolerant) */
 static int kclf_urd_strs(u64 addr, char *buf, int len)
 {
-    int i;
-
-    if (len <= 0) return -1;
-    for (i = 0; i < len - 1; i++) {
-        char c;
-        if (kclf_urds(addr + i, &c, 1)) return -1;
-        buf[i] = c;
-        if (!c) return 0;
+    int copied = 0;
+    if (kclf_user_tbi) addr &= 0x00ffffffffffffffULL;
+    if (len <= 0) return -EINVAL;
+    while (copied < len - 1) {
+        int i, n = kclf_page_size - ((addr + copied) & (kclf_page_size - 1));
+        if (n > len - 1 - copied) n = len - 1 - copied;
+        if (!kclf_user_range(addr, (u64)copied + n) || kclf_urds(addr + copied, buf + copied, n)) return -EFAULT;
+        for (i = 0; i < n; i++)
+            if (!buf[copied + i]) return 0;
+        copied += n;
     }
     buf[len - 1] = 0;
     return 0;
@@ -224,19 +203,24 @@ static int kclf_elf_open(u64 map_start, struct kclf_elf *ei)
     if (kclf_urds(map_start, &eh, sizeof(eh))) return -1;
     if (memcmp(eh.ident, kclf_elf_magic, 4)) return -1;
     if (eh.ident[4] != ELFCLASS64 || eh.ident[5] != ELFDATA2LSB) return -1;
-    if (eh.machine != EM_AARCH64) return -1;
+    if (eh.machine != EM_AARCH64 || eh.ident[6] != 1 || eh.version != 1 || eh.ehsize != sizeof(eh)) return -1;
     if (eh.type != ET_DYN && eh.type != 2 /* ET_EXEC */) return -1;
     if (eh.phentsize != sizeof(struct kclf_phdr) || eh.phnum == 0 || eh.phnum > 64) return -1;
-    if (eh.phoff > KCLF_USER_MAX - map_start) return -1;
+    if (eh.phoff > 1024 * 1024 || !kclf_user_range(map_start, eh.phoff + (u64)eh.phnum * sizeof(struct kclf_phdr)))
+        return -1;
 
     memset(ei, 0, sizeof(*ei));
+    ei->phdr = map_start + eh.phoff;
+    ei->phnum = eh.phnum;
     for (i = 0; i < eh.phnum; i++) {
         struct kclf_phdr ph;
         u64 pha = map_start + eh.phoff + (u64)i * sizeof(ph);
         if (pha > KCLF_USER_MAX - sizeof(ph)) return -1;
         if (kclf_urds(pha, &ph, sizeof(ph))) return -1;
+        if (ph.vaddr >= KCLF_USER_MAX || ph.memsz > KCLF_USER_MAX - ph.vaddr) return -1;
         if (ph.type == PT_LOAD) {
             if (ph.offset == 0 && !have_base) {
+                if (ph.vaddr > map_start) return -1;
                 ei->bias = map_start - ph.vaddr;
                 have_base = 1;
             }
@@ -247,10 +231,30 @@ static int kclf_elf_open(u64 map_start, struct kclf_elf *ei)
             ei->dyn = ph.vaddr; /* bias added below */
         }
     }
-    if (!have_base) return -1;
+    if (!have_base || high <= low || !kclf_user_range(ei->bias + low, high - low) || high > KCLF_USER_MAX - ei->bias)
+        return -1;
     ei->start = ei->bias + low;
     ei->end = ei->bias + high;
-    ei->dyn = ei->dyn ? ei->bias + ei->dyn : 0;
+    if (!ei->dyn || ei->dyn < low || ei->dyn >= high || ei->dynsz > high - ei->dyn) return -1;
+    ei->dyn += ei->bias;
+    return 0;
+}
+
+static int kclf_elf_range(const struct kclf_elf *ei, u64 addr, u64 len)
+{
+    return addr >= ei->start && addr < ei->end && len <= ei->end - addr;
+}
+
+static int kclf_elf_executable(const struct kclf_elf *ei, u64 addr)
+{
+    int i;
+    if (!kclf_elf_range(ei, addr, 4)) return 0;
+    for (i = 0; i < ei->phnum; i++) {
+        struct kclf_phdr ph;
+        if (kclf_urds(ei->phdr + (u64)i * sizeof(ph), &ph, sizeof(ph))) return 0;
+        if (ph.type != PT_LOAD || !(ph.flags & 1) || ph.vaddr > addr - ei->bias) continue;
+        if (addr - ei->bias - ph.vaddr < ph.memsz && ph.memsz - (addr - ei->bias - ph.vaddr) >= 4) return 1;
+    }
     return 0;
 }
 
@@ -268,17 +272,38 @@ static int kclf_elf_dyninfo(const struct kclf_elf *ei, struct kclf_dyninfo *di)
         struct kclf_dyn d;
         if (kclf_urds(ei->dyn + off * sizeof(d), &d, sizeof(d))) return -1;
         if (d.tag == DT_NULL) break;
+        if ((d.tag == DT_SYMTAB || d.tag == DT_STRTAB || d.tag == DT_GNU_HASH || d.tag == DT_HASH) &&
+            (d.val >= KCLF_USER_MAX - ei->bias || ei->bias + d.val < ei->start || ei->bias + d.val >= ei->end))
+            return -1;
         switch (d.tag) {
-        case DT_SYMTAB: di->symtab = ei->bias + d.val; break;
-        case DT_STRTAB: di->strtab = ei->bias + d.val; break;
-        case DT_STRSZ: di->strsz = d.val; break;
-        case DT_SONAME: di->soname = d.val; break;
-        case DT_GNU_HASH: di->gnu_hash = ei->bias + d.val; break;
-        case DT_HASH: di->hash = ei->bias + d.val; break;
-        default: break;
+        case DT_SYMTAB:
+            di->symtab = ei->bias + d.val;
+            break;
+        case DT_STRTAB:
+            di->strtab = ei->bias + d.val;
+            break;
+        case DT_STRSZ:
+            di->strsz = d.val;
+            break;
+        case DT_SYMENT:
+            if (d.val != sizeof(struct kclf_sym)) return -1;
+            break;
+        case DT_SONAME:
+            di->soname = d.val;
+            break;
+        case DT_GNU_HASH:
+            di->gnu_hash = ei->bias + d.val;
+            break;
+        case DT_HASH:
+            di->hash = ei->bias + d.val;
+            break;
+        default:
+            break;
         }
     }
-    if (!di->symtab || !di->strtab || !di->strsz) return -1;
+    if (off == limit || !di->symtab || !di->strtab || !di->strsz ||
+        !kclf_elf_range(ei, di->symtab, sizeof(struct kclf_sym)) || !kclf_elf_range(ei, di->strtab, di->strsz))
+        return -1;
     return 0;
 }
 
@@ -288,8 +313,12 @@ static int kclf_elf_symcount(const struct kclf_elf *ei, const struct kclf_dyninf
 
     if (di->hash) {
         /* DT_HASH: nbucket, nchain */
-        if (kclf_urds_u32(di->hash + 4, &n)) return -1;
-        if (n > KCLF_MAX_SYM) return -1;
+        u32 buckets;
+        if (!kclf_elf_range(ei, di->hash, 8) || kclf_urds_u32(di->hash, &buckets) || kclf_urds_u32(di->hash + 4, &n))
+            return -1;
+        if (!buckets || buckets > KCLF_MAX_SYM || n > KCLF_MAX_SYM ||
+            !kclf_elf_range(ei, di->hash, (2ULL + buckets + n) * 4))
+            return -1;
         *count = n;
         return 0;
     }
@@ -298,14 +327,16 @@ static int kclf_elf_symcount(const struct kclf_elf *ei, const struct kclf_dyninf
         u32 i, best = 0;
         u64 buckets, chain;
 
-        if (kclf_urds_u32(di->gnu_hash, &nbuckets) || kclf_urds_u32(di->gnu_hash + 4, &symoffset) ||
-            kclf_urds_u32(di->gnu_hash + 8, &bloom_size))
+        if (!kclf_elf_range(ei, di->gnu_hash, 16) || kclf_urds_u32(di->gnu_hash, &nbuckets) ||
+            kclf_urds_u32(di->gnu_hash + 4, &symoffset) || kclf_urds_u32(di->gnu_hash + 8, &bloom_size))
             return -1;
-        if (!nbuckets || nbuckets > 65536 || bloom_size > 4096) return -1;
+        if (!nbuckets || nbuckets > 65536 || !bloom_size || bloom_size > 4096 || symoffset >= KCLF_MAX_SYM) return -1;
+        if (!kclf_elf_range(ei, di->gnu_hash, 16ULL + (u64)bloom_size * 8 + (u64)nbuckets * 4)) return -1;
         buckets = di->gnu_hash + 16 + (u64)bloom_size * 8;
         for (i = 0; i < nbuckets; i++) {
             u32 v = 0;
             if (kclf_urds_u32(buckets + (u64)i * 4, &v)) return -1;
+            if (v >= KCLF_MAX_SYM) return -1;
             if (v > best) best = v;
         }
         if (!best) {
@@ -316,7 +347,8 @@ static int kclf_elf_symcount(const struct kclf_elf *ei, const struct kclf_dyninf
         for (;;) {
             u32 h = 0;
             if (best < symoffset) return -1;
-            if (kclf_urds_u32(chain + (u64)(best - symoffset) * 4, &h)) return -1;
+            u64 entry = chain + (u64)(best - symoffset) * 4;
+            if (!kclf_elf_range(ei, entry, 4) || kclf_urds_u32(entry, &h)) return -1;
             if (h & 1) break;
             if (++best >= KCLF_MAX_SYM) return -1;
         }
@@ -324,21 +356,19 @@ static int kclf_elf_symcount(const struct kclf_elf *ei, const struct kclf_dyninf
         return 0;
     }
     /* no hash table: bounded scan, the symbol table is followed by the string table */
-    *count = (u32)(ei->end > di->symtab ? (ei->end - di->symtab) / sizeof(struct kclf_sym) : 0);
-    if (*count > KCLF_MAX_SYM) *count = KCLF_MAX_SYM;
+    u64 limit = ei->end > di->symtab ? (ei->end - di->symtab) / sizeof(struct kclf_sym) : 0;
+    *count = limit > KCLF_MAX_SYM ? KCLF_MAX_SYM : (u32)limit;
     (void)n;
     return 0;
 }
 
-static int kclf_elf_lookup(const struct kclf_elf *ei, const struct kclf_dyninfo *di, const char *name,
-                           u64 *out_addr)
+static int kclf_elf_lookup(const struct kclf_elf *ei, const struct kclf_dyninfo *di, const char *name, u64 *out_addr)
 {
     u32 count = 0, i;
     size_t want = strlen(name);
 
     if (kclf_elf_symcount(ei, di, &count)) return -1;
-    if (!di->symtab || di->symtab >= KCLF_USER_MAX) return -1;
-    if (count && (u64)count > (KCLF_USER_MAX - di->symtab) / sizeof(struct kclf_sym)) return -1;
+    if (!kclf_elf_range(ei, di->symtab, (u64)count * sizeof(struct kclf_sym))) return -1;
     for (i = 1; i < count; i++) {
         struct kclf_sym sym;
         char buf[128];
@@ -346,12 +376,15 @@ static int kclf_elf_lookup(const struct kclf_elf *ei, const struct kclf_dyninfo 
 
         if (kclf_urds(di->symtab + (u64)i * sizeof(sym), &sym, sizeof(sym))) return -1;
         if (!sym.name || sym.name >= di->strsz) continue;
-        if (!sym.value || sym.shndx == 0) continue; /* undefined */
+        if (!sym.value || sym.value >= KCLF_USER_MAX - ei->bias || sym.shndx == 0 || (sym.info & 15) != 2)
+            continue; /* undefined */
         nameaddr = di->strtab + sym.name;
-        if (kclf_urd_strs(nameaddr, buf, (int)sizeof(buf))) continue;
+        if (di->strsz - sym.name <= want || want >= sizeof(buf)) continue;
+        if (kclf_urds(nameaddr, buf, (int)want + 1)) continue;
         buf[sizeof(buf) - 1] = 0;
         if (strncmp(buf, name, sizeof(buf)) != 0) continue;
         if (strlen(buf) != want) continue;
+        if ((sym.value & 3) || !kclf_elf_executable(ei, ei->bias + sym.value)) continue;
         *out_addr = ei->bias + sym.value;
         return 0;
     }
@@ -360,7 +393,8 @@ static int kclf_elf_lookup(const struct kclf_elf *ei, const struct kclf_dyninfo 
 
 static int kclf_elf_soname(const struct kclf_elf *ei, const struct kclf_dyninfo *di, char *buf, int len)
 {
-    if (!di->soname) return -1;
+    if (!di->soname || di->soname >= di->strsz) return -1;
+    if ((u64)len > di->strsz - di->soname) len = (int)(di->strsz - di->soname);
     return kclf_urd_strs(di->strtab + di->soname, buf, len);
 }
 
@@ -379,11 +413,18 @@ static int kclf_vma_at(struct mm_struct *mm, u64 addr, struct kclf_vma *out)
     struct vm_area_struct *vma;
     u64 start, end;
 
+    /* Snapshot only while locked. Drop the lock before GUP/user reads,
+     * otherwise faulting memory could recursively acquire mmap_lock. */
+    kclf_mmap_read_lock(mm);
     vma = kclf_ks.find_vma(mm, addr);
-    if (!vma) return -1;
-    start = *(u64 *)((char *)vma + kclf_vma_off_start);
-    end = *(u64 *)((char *)vma + kclf_vma_off_end);
-    if (end <= start || end > KCLF_USER_MAX) return -1;
+    if (!vma) {
+        kclf_mmap_read_unlock(mm);
+        return -1;
+    }
+    start = *(u64 *)((char *)vma + kclf_vma_start_off);
+    end = *(u64 *)((char *)vma + kclf_vma_end_off);
+    kclf_mmap_read_unlock(mm);
+    if (end <= start || end <= addr || end > KCLF_USER_MAX) return -1;
     out->start = start;
     out->end = end;
     return 0;
@@ -476,8 +517,8 @@ static long kclf_resolve(struct kclf_req *r)
         }
         r->ld.caller = dl.start;
     } else {
-        kclf_set_err(r, "resolve loader failed elf=%d dyn=%d son=%d ld=%d dl=%d libc=%d", nelf, ndyn, nson,
-                     have_ldr, have_dl, have_libc);
+        kclf_set_err(r, "resolve loader failed elf=%d dyn=%d son=%d ld=%d dl=%d libc=%d", nelf, ndyn, nson, have_ldr,
+                     have_dl, have_libc);
         return -ENOENT;
     }
 
@@ -494,8 +535,8 @@ static long kclf_resolve(struct kclf_req *r)
         kclf_set_err(r, "dlclose unavailable for unload mode");
         return -EOPNOTSUPP;
     }
-    if (have_dl && (r->ld.fn < dl.start || r->ld.fn >= dl.end) && have_ldr &&
-        (r->ld.fn < ldr.start || r->ld.fn >= ldr.end)) {
+    if (!(have_dl && r->ld.fn >= dl.start && r->ld.fn < dl.end) &&
+        !(have_ldr && r->ld.fn >= ldr.start && r->ld.fn < ldr.end)) {
         r->ld.fn = 0;
         return -ENOENT;
     }
@@ -516,9 +557,9 @@ int kclf_exec_init(void)
 static u32 kclf_movw(u32 hw, u32 chunk)
 {
     u32 insn = (hw == 0) ? 0xd2800000u : 0xf2800000u; /* movz / movk x19 */
-    insn += hw * 0x200000u;                           /* hw << 21 */
-    insn += (chunk & 0xffffu) * 32u;                  /* imm16 << 5 */
-    insn += 19u;                                      /* Rd = x19 */
+    insn += hw * 0x200000u; /* hw << 21 */
+    insn += (chunk & 0xffffu) * 32u; /* imm16 << 5 */
+    insn += 19u; /* Rd = x19 */
     return insn;
 }
 
@@ -564,6 +605,7 @@ static long kclf_check_library(const char *path)
     if (kclf_is_err(f)) return (long)(unsigned long)f;
     n = kclf_ks.kernel_read(f, hdr, sizeof(hdr), &pos);
     if (kclf_ks.fput) kclf_ks.fput(f);
+    if (n < 0) return n;
     if (n < (long)sizeof(hdr)) return -ENOEXEC;
     if (memcmp(hdr, kclf_elf_magic, 4)) return -ENOEXEC;
     if (hdr[4] != ELFCLASS64 || hdr[5] != ELFDATA2LSB) return -ENOEXEC;
@@ -579,11 +621,11 @@ long kclf_exec_prepare(struct kclf_req *r)
     u64 addr;
     u64 code_len;
     u64 ptr_off;
-    u8 pbuf[KCLF_P_SIZE];
+    u8 pbuf[KCLF_P_SIZE] __attribute__((aligned(8)));
     long rc;
     long mret;
 
-    if (!mm) return -ESRCH;
+    if (!mm || (u64)mm != r->mm) return -ESRCH;
     if (!kclf_page_size) return -EINVAL;
 
     rc = kclf_check_library(r->path);
@@ -598,7 +640,7 @@ long kclf_exec_prepare(struct kclf_req *r)
         return rc;
     }
 
-    len = (u64)(2 + KCLF_STACK_PAGES) * kclf_page_size;
+    len = (u64)(3 + KCLF_STACK_PAGES) * kclf_page_size;
     addr = kclf_ks.vm_mmap(0, 0, len, KCLF_PROT_READ | KCLF_PROT_WRITE, KCLF_MAP_PRIVATE | KCLF_MAP_ANONYMOUS, 0);
     if (!addr || kclf_is_err((void *)addr)) {
         kclf_set_err(r, "mmap failed 0x%llx", (unsigned long long)addr);
@@ -607,6 +649,7 @@ long kclf_exec_prepare(struct kclf_req *r)
 
     r->map_addr = addr;
     r->map_len = len;
+    if (!kclf_user_range(addr, len)) return -EFAULT;
     r->code_addr = addr;
     r->param_addr = addr + kclf_page_size;
     r->stack_top = addr + len;
@@ -656,15 +699,17 @@ long kclf_exec_prepare(struct kclf_req *r)
         rc = mret;
         goto fail;
     }
+    mret = raw_syscall3(__NR_mprotect, (long)(r->param_addr + kclf_page_size), (long)kclf_page_size, 0);
+    if (mret) {
+        kclf_set_err(r, "stack guard failed rc=%ld", mret);
+        rc = mret;
+        goto fail;
+    }
     flush_icache_all();
     return 0;
 
 fail:
-    if (r->map_addr) {
-        kclf_ks.vm_munmap(r->map_addr, r->map_len);
-        r->map_addr = 0;
-        r->map_len = 0;
-    }
+    /* Caller owns rollback and checked munmap/retry accounting. */
     return rc;
 }
 
@@ -702,41 +747,31 @@ static struct pt_regs *kclf_find_regs(void)
     u64 stack = (u64)get_stack(current);
     u64 top = stack + (u64)thread_size;
     struct pt_regs *regs;
-    u64 size;
+    int size = __atomic_load_n(&kclf_regs_size, __ATOMIC_ACQUIRE);
 
-    if (!stack || !top) return 0;
-
-    /*
-     * Do not depend on KernelPatch's _task_pt_reg export: older builds do not
-     * export it and the KPM would fail to load.  The frame is always the last
-     * sizeof(struct pt_regs) bytes below the thread stack top, so scan the
-     * sizes used by the supported kernels and validate every candidate.
-     */
-    for (size = 288; size <= 400; size += 8) {
-        regs = (struct pt_regs *)(top - size);
-        if (kclf_regs_sane(regs, top)) return regs;
-    }
-    return 0;
+    if (!stack || !top || size < 288 || size > 512 || (size & 15)) return 0;
+    regs = (struct pt_regs *)(top - (u64)size);
+    return kclf_regs_sane(regs, top) ? regs : 0;
 }
 
-/* syscalls that are known not to be issued from inside the allocator or the
- * linker critical sections; used to avoid a recursive dlopen deadlock */
+/* Heuristic only: syscall numbers cannot prove that a userspace lock is not
+ * held. Use an application-controlled idle point for reliable loading. */
 static int kclf_syscall_safe(s32 nr)
 {
     switch (nr) {
-    case 22:  /* epoll_pwait */
-    case 29:  /* ioctl */
-    case 35:  /* unlinkat */
-    case 61:  /* getdents64 */
-    case 62:  /* lseek */
-    case 63:  /* read */
-    case 64:  /* write */
-    case 65:  /* readv */
-    case 66:  /* writev */
-    case 73:  /* ppoll */
-    case 79:  /* newfstatat */
-    case 80:  /* fstat */
-    case 82:  /* fsync */
+    case 22: /* epoll_pwait */
+    case 29: /* ioctl */
+    case 35: /* unlinkat */
+    case 61: /* getdents64 */
+    case 62: /* lseek */
+    case 63: /* read */
+    case 64: /* write */
+    case 65: /* readv */
+    case 66: /* writev */
+    case 73: /* ppoll */
+    case 79: /* newfstatat */
+    case 80: /* fstat */
+    case 82: /* fsync */
     case 101: /* nanosleep */
     case 115: /* clock_nanosleep */
     case 124: /* sched_yield */
@@ -769,20 +804,30 @@ int kclf_exec_hijack(struct kclf_req *r)
         kclf_set_err(r, "no pt_regs frame at return boundary");
         return -EFAULT;
     }
-    if (regs->pstate & PSR_MODE32_BIT) return -EOPNOTSUPP;
+    if (regs->pstate & PSR_MODE32_BIT) {
+        kclf_set_err(r, "32-bit target unsupported");
+        return -EOPNOTSUPP;
+    }
+    tif = __atomic_load_n(&current_thread_info()->flags, __ATOMIC_RELAXED);
+    /* FPSIMD is preserved by the trampoline, but SVE/SME scalable state is
+     * not. Reject it even with force. Real pending signals are never ignored. */
+    if ((tif & _TIF_SVE) || (kver >= VERSION(5, 19, 0) && (tif & (1UL << TIF_SME)))) {
+        kclf_set_err(r, "SVE/SME target state unsupported");
+        return -EOPNOTSUPP;
+    }
+    if (tif & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL)) return -EAGAIN;
+
+    /* A tracer or seccomp filter can consume/alter the completion syscall.
+     * Do not redirect a thread unless the return channel is under our control. */
+    if (tif & (_TIF_SECCOMP | _TIF_SYSCALL_TRACE | _TIF_SYSCALL_EMU | _TIF_SINGLESTEP | _TIF_UPROBE)) {
+        kclf_set_err(r, "seccomp/traced target unsupported");
+        return -EOPNOTSUPP;
+    }
 
     if (!(r->flags & KCLF_F_FORCE)) {
         /* never call the loader from inside the loader itself */
         if (r->ld.linker_base && regs->pc >= r->ld.linker_base && regs->pc < r->ld.linker_end) return -EAGAIN;
         if (regs->syscallno >= 0 && !kclf_syscall_safe(regs->syscallno)) return -EAGAIN;
-        /*
-         * A signal that really needs delivery would build its frame around the
-         * hijacked context. The flag we raised ourselves in order to unblock the
-         * task is not such a signal, so it does not disqualify this boundary.
-         */
-        tif = current_thread_info()->flags;
-        if (tif & _TIF_NOTIFY_SIGNAL) return -EAGAIN;
-        if ((tif & _TIF_SIGPENDING) && !r->woke) return -EAGAIN;
     }
 
     memcpy(&r->saved.regs[0], &regs->regs[0], 31 * sizeof(u64));
@@ -797,6 +842,7 @@ int kclf_exec_hijack(struct kclf_req *r)
      * file itself is restored verbatim on completion */
     regs->pc = r->code_addr + 4;
     regs->sp = r->stack_top;
+    regs->pstate &= ~(3UL << 10); /* clear BTI branch type for the new entry */
     /* the payload entry is not a syscall return; keep the restart machinery away */
     regs->syscallno = -1;
     return 0;
@@ -832,8 +878,9 @@ void kclf_exec_restore(struct kclf_req *r, struct pt_regs *regs)
      * sequence. Tell the two cases apart by looking at the instruction the
      * saved pc points to.
      */
+    regs->orig_x0 = r->saved_orig_x0;
     regs->syscallno = r->saved_syscallno;
-    if (r->saved_syscallno >= 0 && x0 >= -516 && x0 <= -512) {
+    if (r->saved_syscallno >= 0 && (x0 == -512 || x0 == -513 || x0 == -514 || x0 == -516)) {
         if (kclf_is_svc(r->saved.pc)) {
             /* already rewound: keep as is, re-executes the svc */
         } else if (kclf_is_svc(r->saved.pc - 4)) {
@@ -871,7 +918,7 @@ long kclf_exec_finish(struct kclf_req *r, int capture_err)
              * it as success when no VMA still covers the base. */
             struct mm_struct *mm = kclf_task_mm(current);
             struct kclf_vma check;
-            if (!mm || kclf_vma_at(mm, r->map_addr, &check)) rc = 0;
+            if (mm && (kclf_vma_at(mm, r->map_addr, &check) || check.start >= r->map_addr + r->map_len)) rc = 0;
         }
         if (!rc) {
             r->map_addr = 0;
@@ -882,92 +929,24 @@ long kclf_exec_finish(struct kclf_req *r, int capture_err)
 }
 
 /* ------------------------------------------------------------------ */
-/* diagnostics                                                          */
+/* diagnostics: no faulting ELF walk in ctl0 (older KP holds RCU there). */
 /* ------------------------------------------------------------------ */
 
 int kclf_exec_probe(char *out, int outlen)
 {
-    struct mm_struct *mm = kclf_task_mm(current);
-    struct kclf_elf ldr, dl, libc;
-    struct kclf_dyninfo di;
-    int have_ldr = 0, have_dl = 0, have_libc = 0;
-    u64 addr = 0x1000;
-    u32 nvma = 0;
-    u32 nelf = 0, ndyn = 0, nson = 0;
-    int i;
     int off = 0;
-    struct pt_regs *regs;
-    u64 stack_top;
-
-    if (!mm) return -ESRCH;
-    memset(&ldr, 0, sizeof(ldr));
-    memset(&dl, 0, sizeof(dl));
-    memset(&libc, 0, sizeof(libc));
-
-    for (i = 0; i < KCLF_MAX_VMA; i++) {
-        struct kclf_vma vma;
-        struct kclf_elf ei;
-        struct kclf_dyninfo d;
-        char soname[64];
-
-        if (addr >= KCLF_USER_MAX) break;
-        if (kclf_vma_at(mm, addr, &vma)) break;
-        if (vma.start > addr) addr = vma.start;
-        addr = vma.end;
-        nvma++;
-        if (kclf_elf_open(vma.start, &ei)) continue;
-        nelf++;
-        if (kclf_elf_dyninfo(&ei, &d)) continue;
-        ndyn++;
-        if (kclf_elf_soname(&ei, &d, soname, sizeof(soname))) continue;
-        nson++;
-        if (nson <= 10)
-            off += snprintf(out + off, outlen - off, "  vma %llx soname=%s\n", (unsigned long long)vma.start,
-                            soname);
-        if (!have_ldr && !strcmp(soname, "ld-android.so")) {
-            ldr = ei;
-            have_ldr = 1;
-        } else if (!have_dl && !strcmp(soname, "libdl.so")) {
-            dl = ei;
-            have_dl = 1;
-        } else if (!have_libc && !strcmp(soname, "libc.so")) {
-            libc = ei;
-            have_libc = 1;
-        }
-    }
-
-    off += snprintf(out + off, outlen - off, "vma scanned: %u elf=%u dyn=%u soname=%u\n", nvma, nelf, ndyn, nson);
-    off += snprintf(out + off, outlen - off, "linker(ld-android.so): %s [%llx-%llx]\n", have_ldr ? "yes" : "no",
-                    (unsigned long long)ldr.start, (unsigned long long)ldr.end);
-    off += snprintf(out + off, outlen - off, "libdl.so: %s [%llx-%llx]\n", have_dl ? "yes" : "no",
-                    (unsigned long long)dl.start, (unsigned long long)dl.end);
-    off += snprintf(out + off, outlen - off, "libc.so: %s [%llx-%llx]\n", have_libc ? "yes" : "no",
-                    (unsigned long long)libc.start, (unsigned long long)libc.end);
-
-    if (have_ldr && !kclf_elf_dyninfo(&ldr, &di)) {
-        u64 a = 0, b = 0;
-        if (!kclf_elf_lookup(&ldr, &di, "__loader_dlopen", &a))
-            off += snprintf(out + off, outlen - off, "__loader_dlopen: %llx\n", (unsigned long long)a);
-        else
-            off += snprintf(out + off, outlen - off, "__loader_dlopen: not found\n");
-        if (!kclf_elf_lookup(&ldr, &di, "__loader_dlerror", &b))
-            off += snprintf(out + off, outlen - off, "__loader_dlerror: %llx\n", (unsigned long long)b);
-    }
-    if (have_dl && !kclf_elf_dyninfo(&dl, &di)) {
-        u64 a = 0;
-        if (!kclf_elf_lookup(&dl, &di, "dlopen", &a))
-            off += snprintf(out + off, outlen - off, "dlopen: %llx\n", (unsigned long long)a);
-        else
-            off += snprintf(out + off, outlen - off, "dlopen: not found\n");
-    }
-
-    stack_top = (u64)get_stack(current) + (u64)thread_size;
-    regs = kclf_find_regs();
-    off += snprintf(out + off, outlen - off, "pt_regs: %s off=%lld sane=%d scno=%d\n", regs ? "ok" : "missing",
-                    regs ? (long long)(stack_top - (u64)regs) : -1LL, regs ? kclf_regs_sane(regs, stack_top) : 0,
-                    regs ? regs->syscallno : -999);
-    off += snprintf(out + off, outlen - off, "thread_size=%d page=%d wrapper=%d\n", thread_size, kclf_page_size,
-                    has_syscall_wrapper);
+    struct pt_regs *regs = kclf_find_regs();
+    off += kclf_scnprintf(out + off, outlen - off, "kernel=%x btf=%d mm_off=%d mmap_lock_off=%d vma=%d/%d\n", kver,
+                          kclf_btf_ok, kclf_mm_off, kclf_mmap_lock_off, kclf_vma_start_off, kclf_vma_end_off);
+    off += kclf_scnprintf(out + off, outlen - off, "pt_regs=%s size=%d thread_size=%d page=%d\n",
+                          regs ? "ok" : "unavailable", kclf_regs_size, thread_size, kclf_page_size);
+    off += kclf_scnprintf(out + off, outlen - off, "user_limit=%llx tbi=%d\n", (unsigned long long)kclf_user_limit,
+                          kclf_user_tbi);
+    off += kclf_scnprintf(out + off, outlen - off, "cancel=%s user_io=access_process_vm wake=%s quiescing=%d\n",
+                          kclf_ks.task_work_cancel_match ? "match" : "func",
+                          kver >= VERSION(5, 11, 0) ? "notify_signal" : "unsupported", kclf_unloading);
+    if (!kclf_regs_size)
+        off +=
+            kclf_scnprintf(out + off, outlen - off, "run a native getpid syscall to learn pt_regs before injection\n");
     return off;
 }
-

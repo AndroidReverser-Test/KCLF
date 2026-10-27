@@ -17,15 +17,19 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <link.h>
+#include <sys/prctl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 
 static int verbose;
+extern int kclf_test_fp_sleep(const struct timespec *ts);
 
 static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data)
 {
     (void)size;
     (void)data;
-    printf("phdr name=%s addr=%p phnum=%d\n", info->dlpi_name ? info->dlpi_name : "(null)",
-           (void *)info->dlpi_addr, info->dlpi_phnum);
+    printf("phdr name=%s addr=%p phnum=%d\n", info->dlpi_name ? info->dlpi_name : "(null)", (void *)info->dlpi_addr,
+           info->dlpi_phnum);
     return 0;
 }
 
@@ -41,6 +45,7 @@ int main(int argc, char **argv)
     const char *s;
     long sleep_ms = 20;
     long phdr_every = 0;
+    int test_fp = getenv("KCLF_TEST_FP") != NULL;
     struct timespec ts;
     struct timespec t0, t1;
 
@@ -69,6 +74,19 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
 
+    if (getenv("KCLF_TEST_SECCOMP")) {
+        /* Allow every syscall. KCLF must still reject the filtered thread,
+         * since it cannot safely prove arbitrary completion filters benign. */
+        struct sock_filter instructions[] = { BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW) };
+        struct sock_fprog program = { .len = 1, .filter = instructions };
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program)) {
+            perror("seccomp test setup");
+            return 4;
+        }
+        puts("seccomp-test-ready");
+        fflush(stdout);
+    }
+
     ts.tv_sec = sleep_ms / 1000;
     ts.tv_nsec = (sleep_ms % 1000) * 1000000L;
 
@@ -78,22 +96,26 @@ int main(int argc, char **argv)
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
         /* nanosleep is a real syscall: guarantees a kernel entry per loop */
-        rc = nanosleep(&ts, NULL);
+        rc = test_fp ? kclf_test_fp_sleep(&ts) : nanosleep(&ts, NULL);
+        if (test_fp && rc) {
+            printf("fp-state-failure mask=%d\n", rc);
+            return 3;
+        }
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        elapsed_us = (long long)(t1.tv_sec - t0.tv_sec) * 1000000LL +
-                     (t1.tv_nsec - t0.tv_nsec) / 1000;
-        if (verbose && (rc != 0 || elapsed_us < sleep_ms * 1000 - 2000 ||
-                        elapsed_us > sleep_ms * 1000 + 20000)) {
+        elapsed_us = (long long)(t1.tv_sec - t0.tv_sec) * 1000000LL + (t1.tv_nsec - t0.tv_nsec) / 1000;
+        if (verbose && (rc != 0 || elapsed_us < sleep_ms * 1000 - 2000 || elapsed_us > sleep_ms * 1000 + 20000)) {
             char buf[160];
             int n = snprintf(buf, sizeof(buf), "sleep anomaly i=%ld rc=%d errno=%d elapsed_us=%lld\n", i, rc,
                              rc ? errno : 0, elapsed_us);
-            if (write(1, buf, n) < 0) { /* ignore */ }
+            if (write(1, buf, n) < 0) { /* ignore */
+            }
         }
         if (phdr_every && (i % phdr_every) == 0 && i != 0) dump_phdr();
         if ((i % 25) == 0) {
             char buf[64];
             int n = snprintf(buf, sizeof(buf), "tick %ld\n", i);
-            if (write(1, buf, n) < 0) { /* ignore */ }
+            if (write(1, buf, n) < 0) { /* ignore */
+            }
         }
     }
     printf("kclf-target exit\n");

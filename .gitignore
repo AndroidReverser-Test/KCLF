@@ -1,0 +1,3 @@
+# Intermediate files only; this nested repository already tracks test binaries.
+*.o
+*.d

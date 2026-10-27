@@ -5,7 +5,7 @@
  * Layering follows kclf-design.md / kclf-shadow-design.md:
  *
  *   control plane   -> KPM ctl0 string ABI (superkey protected, kpatch)
- *   target manager  -> slot table keyed by tid + mm generation
+ *   target manager  -> slot table with pinned PID and mm identities
  *   request machine -> IDLE/ARMED/PREPARING/READY/RUNNING/DONE/FAILED
  *   execution       -> EL0 trampoline in a transient private mapping
  *   completion      -> private getpid trap consumed by the syscall hook
@@ -29,22 +29,22 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.1.0"
+#define KCLF_VER "1.2.0"
 
 #define KCLF_MAX_REQ 4
 #define KCLF_CODE_MAX 512 /* trampoline blob upper bound */
 
-/* mapping layout inside the target: [code page][param page][stack pages] */
+/* mapping layout: [RX code][RW parameter][PROT_NONE guard][RW stack] */
 #define KCLF_STACK_PAGES 8
 
 /* request states, only mutated by the owner of the request */
 enum kclf_state
 {
     KCLF_IDLE = 0,
-    KCLF_ARMED,     /* task_work queued, waiting for a kernel entry */
+    KCLF_ARMED, /* task_work queued, waiting for a kernel entry */
     KCLF_PREPARING, /* preparation running in the target context */
-    KCLF_READY,     /* payload mapped, return boundary work queued */
-    KCLF_RUNNING,   /* target EL0 is executing the trampoline */
+    KCLF_READY, /* payload mapped, return boundary work queued */
+    KCLF_RUNNING, /* target EL0 is executing the trampoline */
     KCLF_DONE,
     KCLF_FAILED,
     KCLF_CANCELLED,
@@ -61,8 +61,8 @@ enum kclf_stage
     KCLF_ST_RESTORE,
 };
 
-#define KCLF_F_FORCE 0x1  /* skip conservative safe point heuristics */
-#define KCLF_F_WAKE 0x4   /* force the target out of an interruptible sleep */
+#define KCLF_F_FORCE 0x1 /* skip conservative safe point heuristics */
+#define KCLF_F_WAKE 0x4 /* force the target out of an interruptible sleep */
 #define KCLF_F_UNLOAD 0x8 /* dlclose the payload after its constructors ran */
 
 /* saved EL0 register file: the part the kernel reloads on exception return */
@@ -76,10 +76,10 @@ struct kclf_regs
 
 struct kclf_loader
 {
-    u64 fn;      /* loader entry (dlopen / __loader_dlopen) */
+    u64 fn; /* loader entry (dlopen / __loader_dlopen) */
     u64 dlerror; /* dlerror / __loader_dlerror, 0 when unavailable */
     u64 dlclose; /* dlclose / __loader_dlclose, 0 when unavailable */
-    u64 caller;  /* caller address used for namespace selection */
+    u64 caller; /* caller address used for namespace selection */
     u64 linker_base;
     u64 linker_end;
     u64 libdl_base;
@@ -95,11 +95,10 @@ struct kclf_req
     int flags;
     u64 id;
     u64 cookie;
-    pid_t pid;  /* thread the work is armed on */
-    pid_t tgid; /* reporting */
-    u64 mm;     /* address space identity captured at attach */
-    u64 pgd;    /* second half of the generation check */
-    u64 task;   /* informational only, never dereferenced */
+    pid_t pid; /* thread the work is armed on */
+    struct pid *pid_ref; /* stable identity across PID reuse and namespaces */
+    u64 mm; /* pinned with get_task_mm until the slot is reclaimed */
+    u64 task; /* informational only, never dereferenced */
     char comm[16];
     char path[KCLF_PATH_MAX];
 
@@ -117,8 +116,7 @@ struct kclf_req
     u64 saved_orig_x0;
     s32 saved_syscallno;
     u32 saved_valid;
-    u32 woke; /* we raised the target's pending-signal flag to unblock it */
-    u32 retries;
+    u32 woke; /* TWA_SIGNAL requested; no synthetic pending signal */
 
     /* result */
     s64 handle;
@@ -135,36 +133,50 @@ struct kclf_req
     int completing;
     int finished;
     int cleanup_tries;
+    int pending; /* queued + executing task_work references; acquire/release */
     u64 run_task; /* task currently executing the payload */
 
     struct callback_head work_prepare;
     struct callback_head work_hijack;
     struct callback_head work_cleanup;
-    u8 codebuf[KCLF_CODE_MAX];
+    u8 codebuf[KCLF_CODE_MAX] __attribute__((aligned(4)));
 };
+
+static inline int kclf_state_load(const struct kclf_req *r)
+{
+    return __atomic_load_n(&r->state, __ATOMIC_ACQUIRE);
+}
+
+static inline void kclf_state_store(struct kclf_req *r, int state)
+{
+    __atomic_store_n(&r->state, state, __ATOMIC_RELEASE);
+}
 
 /* kernel functions that are not part of the exported KPM API */
 struct kclf_syms
 {
     int (*task_work_add)(struct task_struct *task, struct callback_head *work, int notify);
-    struct callback_head *(*task_work_cancel)(struct task_struct *task, struct callback_head *work);
-    void (*signal_wake_up_state)(struct task_struct *task, unsigned int state);
-    struct task_struct *(*find_task_by_vpid)(pid_t nr);
-    unsigned long (*vm_mmap)(void *file, unsigned long addr, unsigned long size, unsigned long prot,
-                             unsigned long flag, unsigned long offset);
+    struct callback_head *(*task_work_cancel_func)(struct task_struct *task, void (*func)(struct callback_head *));
+    struct callback_head *(*task_work_cancel_match)(struct task_struct *task,
+                                                    bool (*match)(struct callback_head *, void *), void *data);
+    struct pid *(*find_get_pid)(int nr);
+    struct task_struct *(*pid_task)(struct pid *pid, int type);
+    void (*put_pid)(struct pid *pid);
+    unsigned long (*vm_mmap)(void *file, unsigned long addr, unsigned long size, unsigned long prot, unsigned long flag,
+                             unsigned long offset);
     int (*vm_munmap)(unsigned long start, size_t len);
     struct vm_area_struct *(*find_vma)(struct mm_struct *mm, unsigned long addr);
-    unsigned long (*copy_from_user)(void *to, const void *from, unsigned long n);
-    unsigned long (*copy_to_user)(void *to, const void *from, unsigned long n);
-    int (*fault_in_pages_readable)(const void *uaddr, int size);
-    int (*access_process_vm)(struct task_struct *tsk, unsigned long addr, void *buf, int len,
-                             unsigned int gup_flags);
+    long (*copy_from_user_nofault)(void *to, const void *from, unsigned long n);
+    int (*access_process_vm)(struct task_struct *tsk, unsigned long addr, void *buf, int len, unsigned int gup_flags);
     struct file *(*filp_open)(const char *name, int flags, umode_t mode);
     long (*kernel_read)(struct file *file, void *buf, unsigned long count, loff_t *pos);
     void (*fput)(struct file *file);
-    void (*msleep)(unsigned int msecs);
     struct mm_struct *(*get_task_mm)(struct task_struct *task);
-    void (*mmput)(struct mm_struct *mm);
+    void (*mmput_async)(struct mm_struct *mm);
+    void (*mmap_read_lock)(struct mm_struct *mm);
+    void (*mmap_read_unlock)(struct mm_struct *mm);
+    void (*down_read)(void *sem);
+    void (*up_read)(void *sem);
 };
 
 extern struct kclf_syms kclf_ks;
@@ -172,6 +184,8 @@ extern struct kclf_req kclf_reqs[KCLF_MAX_REQ];
 extern volatile int kclf_unloading;
 extern volatile int kclf_loading_num;
 extern int kclf_page_size;
+extern u64 kclf_user_limit;
+extern int kclf_user_tbi;
 extern int kclf_ready;
 
 /* kclf.c */
@@ -189,26 +203,23 @@ long kclf_exec_finish(struct kclf_req *r, int capture_err);
 int kclf_exec_probe(char *out, int outlen);
 int kclf_exec_init(void);
 
+/* kclf_compat.c: runtime layout, no version-based structure guesses. */
+extern int kclf_regs_size;
+extern int kclf_vma_start_off, kclf_vma_end_off, kclf_mmap_lock_off;
+extern int kclf_btf_ok;
+unsigned long kclf_lookup(const char *name);
+int kclf_compat_init(void);
+void kclf_mmap_read_lock(struct mm_struct *mm);
+void kclf_mmap_read_unlock(struct mm_struct *mm);
+int kclf_scnprintf(char *out, int size, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+
 /* helpers shared between both halves */
 extern int kclf_mm_off;
-extern int kclf_pid_off;
 
 static inline struct mm_struct *kclf_task_mm(struct task_struct *task)
 {
     if (!task || kclf_mm_off <= 0) return 0;
-    return *(struct mm_struct **)((char *)task + kclf_mm_off);
-}
-
-static inline pid_t kclf_task_pid(struct task_struct *task)
-{
-    if (!task || kclf_pid_off <= 0) return -1;
-    return *(pid_t *)((char *)task + kclf_pid_off);
-}
-
-static inline u64 kclf_mm_pgd(struct mm_struct *mm)
-{
-    if (!mm || mm_struct_offset.pgd_offset <= 0) return 0;
-    return *(u64 *)((char *)mm + mm_struct_offset.pgd_offset);
+    return __atomic_load_n((struct mm_struct **)((char *)task + kclf_mm_off), __ATOMIC_ACQUIRE);
 }
 
 #endif

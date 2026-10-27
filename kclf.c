@@ -26,6 +26,7 @@
  *     security boundary.
  */
 #include <kclf_internal.h>
+#include <common.h>
 #include <log.h>
 #include <kputils.h>
 #include <pgtable.h>
@@ -47,61 +48,19 @@ struct kclf_req kclf_reqs[KCLF_MAX_REQ];
 volatile int kclf_unloading;
 volatile int kclf_loading_num;
 int kclf_page_size;
+u64 kclf_user_limit;
+int kclf_user_tbi;
 int kclf_ready;
 int kclf_mm_off = -1;
-int kclf_pid_off = -1;
 
 static u64 kclf_next_id = 1;
 static int kclf_hook_ok;
+static int kclf_control_busy;
 static void (*kclf_rcu_read_lock)(void);
 static void (*kclf_rcu_read_unlock)(void);
 static u64 (*kclf_ktime_get)(void);
 
-#define KCLF_SLOT_OFFSET(r) ((int)((r) - kclf_reqs))
-
-/*
- * KernelPatch probes task_struct_offset.mm_offset by looking for init_mm, which
- * is not always resolvable, so fall back to deriving it from get_task_mm().
- * kthreadd (mm == NULL, active_mm == init_mm) disambiguates the field from
- * active_mm when it is reachable.
- */
-static int kclf_probe_mm_offset(void)
-{
-    struct mm_struct *mm;
-    struct task_struct *kt;
-    u64 want;
-    int off, found = -1;
-
-    if (task_struct_offset.mm_offset > 0) return task_struct_offset.mm_offset;
-    if (!kclf_ks.get_task_mm || !kclf_ks.mmput || !kclf_ks.find_task_by_vpid) return -1;
-
-    mm = kclf_ks.get_task_mm(current);
-    if (!mm) return -1;
-    want = (u64)mm;
-
-    if (kclf_rcu_read_lock) kclf_rcu_read_lock();
-    kt = kclf_ks.find_task_by_vpid(2);
-    if (kclf_rcu_read_lock) {
-        for (off = 0; off + 8 <= 0x1800; off += 8) {
-            if (*(u64 *)((char *)current + off) != want) continue;
-            if (kt && *(u64 *)((char *)kt + off) == 0) {
-                found = off;
-                break;
-            }
-            if (found < 0) found = off;
-        }
-        kclf_rcu_read_unlock();
-    } else {
-        for (off = 0; off + 8 <= 0x1800; off += 8) {
-            if (*(u64 *)((char *)current + off) == want) {
-                found = off;
-                break;
-            }
-        }
-    }
-    kclf_ks.mmput(mm);
-    return found;
-}
+#define KCLF_SLOT_OFFSET(r) ((int)((r)-kclf_reqs))
 
 /* the module cannot link against the kernel's page_size symbol */
 static int kclf_detect_page_size(void)
@@ -110,38 +69,58 @@ static int kclf_detect_page_size(void)
     u64 tg0;
 
     asm volatile("mrs %0, tcr_el1" : "=r"(tcr));
+    unsigned int va_bits = 64 - (tcr & 63);
+    if (va_bits < 32 || va_bits > 52) return 0;
+    kclf_user_limit = 1ULL << va_bits;
+    kclf_user_tbi = !!(tcr & (1ULL << 37));
     tg0 = (tcr >> 14) & 3;
     if (tg0 == 0) return 4096;
     if (tg0 == 2) return 16384;
     if (tg0 == 1) return 65536;
-    return 4096;
+    return 0; /* reserved granule: fail closed */
 }
 
 static const char *kclf_state_name(int state)
 {
     switch (state) {
-    case KCLF_IDLE: return "idle";
-    case KCLF_ARMED: return "armed";
-    case KCLF_PREPARING: return "preparing";
-    case KCLF_READY: return "ready";
-    case KCLF_RUNNING: return "running";
-    case KCLF_DONE: return "done";
-    case KCLF_FAILED: return "failed";
-    case KCLF_CANCELLED: return "cancelled";
-    default: return "?";
+    case KCLF_IDLE:
+        return "idle";
+    case KCLF_ARMED:
+        return "armed";
+    case KCLF_PREPARING:
+        return "preparing";
+    case KCLF_READY:
+        return "ready";
+    case KCLF_RUNNING:
+        return "running";
+    case KCLF_DONE:
+        return "done";
+    case KCLF_FAILED:
+        return "failed";
+    case KCLF_CANCELLED:
+        return "cancelled";
+    default:
+        return "?";
     }
 }
 
 static const char *kclf_stage_name(int stage)
 {
     switch (stage) {
-    case KCLF_ST_NONE: return "-";
-    case KCLF_ST_QUEUE: return "queue";
-    case KCLF_ST_PREPARE: return "prepare";
-    case KCLF_ST_HIJACK: return "hijack";
-    case KCLF_ST_LOADER: return "loader";
-    case KCLF_ST_RESTORE: return "restore";
-    default: return "?";
+    case KCLF_ST_NONE:
+        return "-";
+    case KCLF_ST_QUEUE:
+        return "queue";
+    case KCLF_ST_PREPARE:
+        return "prepare";
+    case KCLF_ST_HIJACK:
+        return "hijack";
+    case KCLF_ST_LOADER:
+        return "loader";
+    case KCLF_ST_RESTORE:
+        return "restore";
+    default:
+        return "?";
     }
 }
 
@@ -164,7 +143,7 @@ void kclf_set_err(struct kclf_req *r, const char *fmt, ...)
 /* symbol resolution                                                    */
 /* ------------------------------------------------------------------ */
 
-/* plain name lookup; safe from any context (no symbol table walk) */
+/* Exact-name lookup; do not guess unrelated LTO/CFI symbol suffixes. */
 unsigned long kclf_lookup(const char *name)
 {
     return kallsyms_lookup_name(name);
@@ -176,60 +155,55 @@ int kclf_sym_lookup_all(void)
 
     memset(&kclf_ks, 0, sizeof(kclf_ks));
 
-#define KCLF_KS(field, symbol)                                    \
-    do {                                                          \
+#define KCLF_KS(field, symbol)                                      \
+    do {                                                            \
         kclf_ks.field = (typeof(kclf_ks.field))kclf_lookup(symbol); \
-        if (!kclf_ks.field && !missing) missing = symbol;         \
+        if (!kclf_ks.field && !missing) missing = symbol;           \
     } while (0)
 
     KCLF_KS(task_work_add, "task_work_add");
-    kclf_ks.task_work_cancel = (typeof(kclf_ks.task_work_cancel))kclf_lookup("task_work_cancel");
-    if (!kclf_ks.task_work_cancel)
-        kclf_ks.task_work_cancel = (typeof(kclf_ks.task_work_cancel))kclf_lookup("task_work_cancel_func");
-    if (!kclf_ks.task_work_cancel && !missing) missing = "task_work_cancel";
-    kclf_ks.signal_wake_up_state = (typeof(kclf_ks.signal_wake_up_state))kclf_lookup("signal_wake_up_state");
-    if (!kclf_ks.signal_wake_up_state)
-        kclf_ks.signal_wake_up_state = (typeof(kclf_ks.signal_wake_up_state))kclf_lookup("signal_wake_up");
-    KCLF_KS(find_task_by_vpid, "find_task_by_vpid");
+    /* Android backports changed task_work_cancel from func->pointer to
+     * object->bool. Prefer the unambiguous match/func APIs, not a version test. */
+    kclf_ks.task_work_cancel_match = (typeof(kclf_ks.task_work_cancel_match))kclf_lookup("task_work_cancel_match");
+    kclf_ks.task_work_cancel_func = (typeof(kclf_ks.task_work_cancel_func))kclf_lookup("task_work_cancel_func");
+    if (!kclf_ks.task_work_cancel_func && !kclf_ks.task_work_cancel_match)
+        kclf_ks.task_work_cancel_func = (typeof(kclf_ks.task_work_cancel_func))kclf_lookup("task_work_cancel");
+    if (!kclf_ks.task_work_cancel_func && !kclf_ks.task_work_cancel_match) missing = "task_work_cancel*";
+    KCLF_KS(find_get_pid, "find_get_pid");
+    KCLF_KS(pid_task, "pid_task");
+    KCLF_KS(put_pid, "put_pid");
     KCLF_KS(vm_mmap, "vm_mmap");
     KCLF_KS(vm_munmap, "vm_munmap");
     KCLF_KS(find_vma, "find_vma");
     KCLF_KS(filp_open, "filp_open");
     KCLF_KS(kernel_read, "kernel_read");
     KCLF_KS(fput, "fput");
-    kclf_ks.copy_from_user = (typeof(kclf_ks.copy_from_user))kclf_lookup("__arch_copy_from_user");
-    if (!kclf_ks.copy_from_user)
-        kclf_ks.copy_from_user = (typeof(kclf_ks.copy_from_user))kclf_lookup("_copy_from_user");
-    if (!kclf_ks.copy_from_user)
-        kclf_ks.copy_from_user = (typeof(kclf_ks.copy_from_user))kclf_lookup("copy_from_user_nofault");
-    if (!kclf_ks.copy_from_user) logkw("kclf: no user copy primitive\n");
-    kclf_ks.copy_to_user = (typeof(kclf_ks.copy_to_user))kclf_lookup("__arch_copy_to_user");
-    if (!kclf_ks.copy_to_user) kclf_ks.copy_to_user = (typeof(kclf_ks.copy_to_user))kclf_lookup("_copy_to_user");
-    kclf_ks.fault_in_pages_readable =
-        (typeof(kclf_ks.fault_in_pages_readable))kclf_lookup("fault_in_pages_readable");
-    kclf_ks.access_process_vm = (typeof(kclf_ks.access_process_vm))kclf_lookup("access_process_vm");
+    kclf_ks.copy_from_user_nofault = (typeof(kclf_ks.copy_from_user_nofault))kclf_lookup("copy_from_user_nofault");
+    KCLF_KS(access_process_vm, "access_process_vm");
+    KCLF_KS(get_task_mm, "get_task_mm");
+    KCLF_KS(mmput_async, "mmput_async");
 #undef KCLF_KS
 
     kclf_rcu_read_lock = (typeof(kclf_rcu_read_lock))kclf_lookup("__rcu_read_lock");
     kclf_rcu_read_unlock = (typeof(kclf_rcu_read_unlock))kclf_lookup("__rcu_read_unlock");
     kclf_ktime_get = (typeof(kclf_ktime_get))kclf_lookup("ktime_get");
-    kclf_ks.msleep = (typeof(kclf_ks.msleep))kclf_lookup("msleep");
-    kclf_ks.get_task_mm = (typeof(kclf_ks.get_task_mm))kclf_lookup("get_task_mm");
-    kclf_ks.mmput = (typeof(kclf_ks.mmput))kclf_lookup("mmput");
+    kclf_ks.down_read = (typeof(kclf_ks.down_read))kclf_lookup("down_read");
+    kclf_ks.up_read = (typeof(kclf_ks.up_read))kclf_lookup("up_read");
+    kclf_ks.mmap_read_lock = (typeof(kclf_ks.mmap_read_lock))kclf_lookup("mmap_read_lock");
+    kclf_ks.mmap_read_unlock = (typeof(kclf_ks.mmap_read_unlock))kclf_lookup("mmap_read_unlock");
 
     if (missing) {
         logke("kclf: kernel symbol missing: %s\n", missing);
         return -ENOENT;
     }
     if (!kclf_rcu_read_lock || !kclf_rcu_read_unlock) {
-        /* not fatal: task_work cancellation then falls back to a verified
-         * lookup only, see kclf_cancel_work() */
-        logkw("kclf: rcu primitives not resolvable\n");
+        logke("kclf: RCU accessor pair required for task lookup\n");
+        return -EOPNOTSUPP;
     }
     return 0;
 }
 
-/* task_work notify modes (enum task_work_notify_mode since 5.17) */
+/* RESUME=1 is also true for the old bool task_work_add ABI. */
 #define KCLF_TWA_RESUME 1
 #define KCLF_TWA_SIGNAL 2
 
@@ -239,27 +213,44 @@ int kclf_sym_lookup_all(void)
 
 static int kclf_task_alive(struct task_struct *task, struct kclf_req *r)
 {
-    if (!task) return 0;
+    if (!task || (u64)task != r->task) return 0;
     if ((u64)kclf_task_mm(task) != r->mm) return 0;
     return 1;
 }
 
-/* cancel a queued task_work of @r on the task identified by @r->pid */
-static void kclf_cancel_work(struct kclf_req *r, struct callback_head *work)
+static bool kclf_work_matches(struct callback_head *work, void *data)
+{
+    return work == data;
+}
+
+/* Only one active request per task; the old function-based cancellation is
+ * therefore unambiguous too. RCU protects lookup through cancellation. */
+static int kclf_cancel_work(struct kclf_req *r, struct callback_head *work)
 {
     struct task_struct *task;
+    struct callback_head *removed = 0;
 
-    if (!kclf_ks.task_work_cancel || !r->pid) return;
-
-    if (kclf_rcu_read_lock) {
-        kclf_rcu_read_lock();
-        task = kclf_ks.find_task_by_vpid(r->pid);
-        if (task) kclf_ks.task_work_cancel(task, work);
-        kclf_rcu_read_unlock();
-        return;
+    kclf_rcu_read_lock();
+    task = r->pid_ref ? kclf_ks.pid_task(r->pid_ref, 0) : 0;
+    if (task && (u64)task == r->task) {
+        if (kclf_ks.task_work_cancel_match)
+            removed = kclf_ks.task_work_cancel_match(task, kclf_work_matches, work);
+        else
+            removed = kclf_ks.task_work_cancel_func(task, work->func);
     }
-    task = kclf_ks.find_task_by_vpid(r->pid);
-    if (kclf_task_alive(task, r)) kclf_ks.task_work_cancel(task, work);
+    kclf_rcu_read_unlock();
+    if (removed != work) return 0; /* already detached/running is NOT cancelled */
+    __atomic_sub_fetch(&r->pending, 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static int kclf_queue_work(struct kclf_req *r, struct task_struct *task, struct callback_head *work, int notify)
+{
+    int rc;
+    __atomic_add_fetch(&r->pending, 1, __ATOMIC_ACQ_REL);
+    rc = kclf_ks.task_work_add(task, work, notify);
+    if (rc) __atomic_sub_fetch(&r->pending, 1, __ATOMIC_RELEASE);
+    return rc;
 }
 
 static void kclf_work_prepare(struct callback_head *head);
@@ -268,11 +259,24 @@ static void kclf_work_cleanup(struct callback_head *head);
 
 static void kclf_slot_reset(struct kclf_req *r)
 {
+    if (r->mm) kclf_ks.mmput_async((struct mm_struct *)r->mm);
+    if (r->pid_ref) kclf_ks.put_pid(r->pid_ref);
     memset(r, 0, sizeof(*r));
-    r->state = KCLF_IDLE;
+    kclf_state_store(r, KCLF_IDLE);
     r->work_prepare.func = kclf_work_prepare;
     r->work_hijack.func = kclf_work_hijack;
     r->work_cleanup.func = kclf_work_cleanup;
+}
+
+static int kclf_slot_reclaimable(struct kclf_req *r)
+{
+    int state;
+    if (!__atomic_load_n(&r->finished, __ATOMIC_ACQUIRE)) return 0;
+    state = kclf_state_load(r);
+    if (state != KCLF_DONE && state != KCLF_FAILED && state != KCLF_CANCELLED) return 0;
+    /* Completion must precede the FINAL reference check: RUNNING/0 can race
+     * newly queued cleanup publishing finished=1 while still in its callback. */
+    return !r->map_addr && !r->busy && !r->completing && !__atomic_load_n(&r->pending, __ATOMIC_ACQUIRE);
 }
 
 static struct kclf_req *kclf_slot_alloc(void)
@@ -282,10 +286,9 @@ static struct kclf_req *kclf_slot_alloc(void)
 
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
-        if (r->state == KCLF_IDLE) return r;
+        if (kclf_state_load(r) == KCLF_IDLE) return r;
         /* only reclaim slots whose target side resources are gone */
-        if (r->finished && !r->busy && !r->completing && !r->map_addr &&
-            (r->state == KCLF_DONE || r->state == KCLF_FAILED || r->state == KCLF_CANCELLED)) {
+        if (kclf_slot_reclaimable(r)) {
             if (!free_slot || r->j_done < free_slot->j_done) free_slot = r;
         }
     }
@@ -301,7 +304,7 @@ struct kclf_req *kclf_slot_by_task(struct task_struct *task)
     int i;
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
-        if (r->state == KCLF_RUNNING && r->run_task == (u64)task) return r;
+        if (kclf_state_load(r) == KCLF_RUNNING && r->run_task == (u64)task) return r;
     }
     return 0;
 }
@@ -316,14 +319,15 @@ static void kclf_free_user(struct kclf_req *r, int capture_err)
              * the transient mapping disappear. */
             kclf_set_err(r, "munmap failed rc=%ld", rc);
             r->cleanup_tries = 0;
-            kclf_ks.task_work_add(current, &r->work_cleanup, KCLF_TWA_RESUME);
+            if (kclf_queue_work(r, current, &r->work_cleanup, KCLF_TWA_RESUME))
+                kclf_set_err(r, "munmap failed; cleanup queue rejected");
             return;
         }
     } else {
         r->map_addr = 0;
         r->map_len = 0;
     }
-    r->finished = 1;
+    __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
 }
 
 void kclf_fail(struct kclf_req *r, int state, int stage, long err, const char *fmt, ...)
@@ -337,7 +341,7 @@ void kclf_fail(struct kclf_req *r, int state, int stage, long err, const char *f
         va_end(args);
     }
     if (!r->err[0]) snprintf(r->err, sizeof(r->err), "err %ld (0x%llx)", err, (unsigned long long)err);
-    r->state = state;
+    kclf_state_store(r, state);
     r->j_done = kclf_now();
 }
 
@@ -345,19 +349,25 @@ void kclf_fail(struct kclf_req *r, int state, int stage, long err, const char *f
 /* task_work callbacks (run inside the target task, mm == target mm)     */
 /* ------------------------------------------------------------------ */
 
-static void kclf_work_prepare(struct callback_head *head)
+static void kclf_work_prepare_body(struct callback_head *head)
 {
     struct kclf_req *r = local_container_of(head, struct kclf_req, work_prepare);
     struct mm_struct *mm;
     long rc;
 
-    if (kclf_unloading || r->state != KCLF_ARMED) return;
+    if (kclf_unloading || kclf_state_load(r) != KCLF_ARMED) {
+        kclf_fail(r, KCLF_CANCELLED, KCLF_ST_QUEUE, -ECANCELED, "quiescing");
+        __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+        return;
+    }
     r->busy = 1;
-    r->state = KCLF_PREPARING;
+    kclf_state_store(r, KCLF_PREPARING);
+    r->stage = KCLF_ST_PREPARE;
 
     mm = kclf_task_mm(current);
     if (!mm || (u64)mm != r->mm) {
         kclf_fail(r, KCLF_FAILED, KCLF_ST_PREPARE, -ESRCH, "target address space replaced");
+        __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
         r->busy = 0;
         return;
     }
@@ -371,8 +381,9 @@ static void kclf_work_prepare(struct callback_head *head)
     }
 
     r->j_ready = kclf_now();
-    r->state = KCLF_READY;
-    rc = kclf_ks.task_work_add(current, &r->work_hijack, KCLF_TWA_RESUME);
+    r->stage = KCLF_ST_HIJACK;
+    kclf_state_store(r, KCLF_READY);
+    rc = kclf_queue_work(r, current, &r->work_hijack, KCLF_TWA_RESUME);
     if (rc) {
         kclf_free_user(r, 0);
         kclf_fail(r, KCLF_FAILED, KCLF_ST_HIJACK, rc, "cannot arm return boundary work");
@@ -380,12 +391,16 @@ static void kclf_work_prepare(struct callback_head *head)
     r->busy = 0;
 }
 
-static void kclf_work_hijack(struct callback_head *head)
+static void kclf_work_hijack_body(struct callback_head *head)
 {
     struct kclf_req *r = local_container_of(head, struct kclf_req, work_hijack);
     int rc;
 
-    if (kclf_unloading || r->state != KCLF_READY) return;
+    if (kclf_unloading || kclf_state_load(r) != KCLF_READY) {
+        kclf_free_user(r, 0);
+        kclf_fail(r, KCLF_CANCELLED, KCLF_ST_HIJACK, -ECANCELED, "quiescing");
+        return;
+    }
     r->busy = 1;
 
     if ((u64)kclf_task_mm(current) != r->mm) {
@@ -397,35 +412,31 @@ static void kclf_work_hijack(struct callback_head *head)
 
     rc = kclf_exec_hijack(r);
     if (rc == -EAGAIN) {
-        if (++r->retries < 8) {
-            kclf_ks.task_work_add(current, &r->work_hijack, KCLF_TWA_RESUME);
-            r->busy = 0;
-            return;
-        }
+        /* Requeueing inside task_work_run repeats the SAME return boundary;
+         * it cannot find a different safe point. Fail and let the caller retry. */
         kclf_free_user(r, 0);
-        kclf_fail(r, KCLF_FAILED, KCLF_ST_HIJACK, rc,
-                  "no safe point in %u attempts (busy linker/allocator context); retry or use force",
-                  r->retries);
+        kclf_fail(r, KCLF_FAILED, KCLF_ST_HIJACK, rc, "unsafe return boundary; retry later");
         r->busy = 0;
         return;
     }
     if (rc) {
         kclf_free_user(r, 0);
-        kclf_fail(r, KCLF_FAILED, KCLF_ST_HIJACK, rc, rc == -EOPNOTSUPP ? "32-bit target unsupported" : "");
+        kclf_fail(r, KCLF_FAILED, KCLF_ST_HIJACK, rc, "");
         r->busy = 0;
         return;
     }
 
     r->run_task = (u64)current;
+    r->stage = KCLF_ST_LOADER;
     __atomic_add_fetch(&kclf_loading_num, 1, __ATOMIC_SEQ_CST);
-    r->state = KCLF_RUNNING;
+    kclf_state_store(r, KCLF_RUNNING);
     r->busy = 0;
 }
 
-static void kclf_work_cleanup(struct callback_head *head)
+static void kclf_work_cleanup_body(struct callback_head *head)
 {
     struct kclf_req *r = local_container_of(head, struct kclf_req, work_cleanup);
-    int st = r->state;
+    int st = kclf_state_load(r);
     s64 handle = r->handle;
     long rc = 0;
 
@@ -434,9 +445,10 @@ static void kclf_work_cleanup(struct callback_head *head)
         if (r->map_addr) {
             rc = kclf_exec_finish(r, 1);
             if (rc && ++r->cleanup_tries <= 8) {
-                kclf_ks.task_work_add(current, &r->work_cleanup, KCLF_TWA_RESUME);
-                r->busy = 0;
-                return;
+                if (!kclf_queue_work(r, current, &r->work_cleanup, KCLF_TWA_RESUME)) {
+                    r->busy = 0;
+                    return;
+                }
             }
             if (rc) kclf_set_err(r, "munmap failed rc=%ld after %d retries", rc, r->cleanup_tries);
         }
@@ -445,8 +457,7 @@ static void kclf_work_cleanup(struct callback_head *head)
         r->map_addr = 0;
         r->map_len = 0;
     }
-    r->finished = 1;
-    r->busy = 0;
+    __atomic_store_n(&r->finished, !r->map_addr, __ATOMIC_RELEASE);
 
     if (st == KCLF_RUNNING) {
         /* trampoline finished but the completion trap was not consumed */
@@ -459,6 +470,20 @@ static void kclf_work_cleanup(struct callback_head *head)
 }
 
 /* ------------------------------------------------------------------ */
+/* Callback references include detached-but-not-entered work. Controllers must
+ * never reset a slot until the final reference is released. */
+#define KCLF_WORK_WRAPPER(name)                                                      \
+    static void kclf_work_##name(struct callback_head *head)                         \
+    {                                                                                \
+        struct kclf_req *r = local_container_of(head, struct kclf_req, work_##name); \
+        kclf_work_##name##_body(head);                                               \
+        r->busy = 0;                                                                 \
+        __atomic_sub_fetch(&r->pending, 1, __ATOMIC_RELEASE);                        \
+    }
+KCLF_WORK_WRAPPER(prepare)
+KCLF_WORK_WRAPPER(hijack)
+KCLF_WORK_WRAPPER(cleanup)
+
 /* completion trap: getpid(cookie) is consumed here                     */
 /* ------------------------------------------------------------------ */
 
@@ -468,19 +493,29 @@ static void kclf_getpid_before(hook_fargs4_t *args, void *udata)
     struct kclf_req *r;
 
     (void)udata;
-    if (!kclf_loading_num || !has_syscall_wrapper) return;
+    if (!has_syscall_wrapper) return;
     regs = (struct pt_regs *)args->args[0];
     if (!regs) return;
+    /* Learn the actual frame from a syscall wrapper on non-BTF kernels. */
+    if (!kclf_regs_size) {
+        u64 top = (u64)get_stack(current) + (u64)thread_size;
+        u64 size = top - (u64)regs;
+        if (size >= 288 && size <= 512 && !(size & 15)) __atomic_store_n(&kclf_regs_size, (int)size, __ATOMIC_RELEASE);
+    }
+    if (!kclf_loading_num) return;
     r = kclf_slot_by_task(current);
-    if (!r || !r->saved_valid || r->state != KCLF_RUNNING) return;
+    if (!r || !r->saved_valid || kclf_state_load(r) != KCLF_RUNNING) return;
     if (regs->regs[0] != r->cookie) return;
     if (regs->regs[8] != KCLF_COMPLETION_NR) return;
+    extern const char kclf_tramp_start[], kclf_tramp_return[];
+    if ((u64)kclf_task_mm(current) != r->mm || regs->pc != r->code_addr + (u64)(kclf_tramp_return - kclf_tramp_start))
+        return;
     /* The trampoline passes the loader result in registers because its
      * parameter page has already been scrubbed. */
     r->handle = (s64)regs->regs[1];
     r->err_user = regs->regs[2];
     r->unload_rc = (s32)regs->regs[3];
-    if (r->flags & KCLF_F_UNLOAD) r->unloaded = (r->unload_rc == 0);
+    if (r->flags & KCLF_F_UNLOAD) r->unloaded = r->handle && (r->unload_rc == 0);
     r->completing = 1;
     args->skip_origin = 1;
     args->ret = 0;
@@ -505,10 +540,12 @@ static void kclf_getpid_after(hook_fargs4_t *args, void *udata)
     /* the wrapper writes its return value into x0 after this hook; hand it the
      * value the interrupted program must observe */
     args->ret = regs->regs[0];
-    r->state = KCLF_DONE;
+    kclf_state_store(r, KCLF_DONE);
+    r->stage = KCLF_ST_RESTORE;
     r->j_done = kclf_now();
     __atomic_sub_fetch(&kclf_loading_num, 1, __ATOMIC_SEQ_CST);
-    kclf_ks.task_work_add(current, &r->work_cleanup, KCLF_TWA_RESUME);
+    if (kclf_queue_work(r, current, &r->work_cleanup, KCLF_TWA_RESUME))
+        kclf_set_err(r, "cleanup queue rejected; mapping retained");
 }
 
 static int kclf_hook_install(void)
@@ -535,25 +572,27 @@ static int kclf_hook_install(void)
 static void kclf_status_line(char *out, int outlen, int *off, struct kclf_req *r)
 {
     int i = KCLF_SLOT_OFFSET(r);
-    *off += snprintf(out + *off, outlen - *off, "#%d id=%llu pid=%d(%s) state=%s stage=%s", i,
-                     (unsigned long long)r->id, r->pid, r->comm, kclf_state_name(r->state),
-                     kclf_stage_name(r->stage));
-    if (r->state == KCLF_DONE) {
-        *off += snprintf(out + *off, outlen - *off, " handle=%llx", (unsigned long long)r->handle);
-        if (r->ld.sym)
-            *off += snprintf(out + *off, outlen - *off, " via=%s", r->ld.sym);
+    *off += kclf_scnprintf(out + *off, outlen - *off, "#%d id=%llu pid=%d(%s) state=%s stage=%s", i,
+                           (unsigned long long)r->id, r->pid, r->comm, kclf_state_name(kclf_state_load(r)),
+                           kclf_stage_name(r->stage));
+    if (__atomic_load_n(&r->pending, __ATOMIC_ACQUIRE) || r->completing) {
+        *off += kclf_scnprintf(out + *off, outlen - *off, " pending=%d\n", r->pending);
+        return;
+    }
+    if (kclf_state_load(r) == KCLF_DONE) {
+        *off += kclf_scnprintf(out + *off, outlen - *off, " handle=%llx", (unsigned long long)r->handle);
+        if (r->ld.sym) *off += kclf_scnprintf(out + *off, outlen - *off, " via=%s", r->ld.sym);
         if (r->flags & KCLF_F_UNLOAD) {
-            *off += snprintf(out + *off, outlen - *off, " unload=%s rc=%d",
-                             r->unloaded ? "ok" : "failed", r->unload_rc);
-            if (r->ld.close_sym)
-                *off += snprintf(out + *off, outlen - *off, " by=%s", r->ld.close_sym);
+            *off += kclf_scnprintf(out + *off, outlen - *off, " unload=%s rc=%d", r->unloaded ? "ok" : "failed",
+                                   r->unload_rc);
+            if (r->ld.close_sym) *off += kclf_scnprintf(out + *off, outlen - *off, " by=%s", r->ld.close_sym);
         }
     }
     if (r->map_addr)
-        *off += snprintf(out + *off, outlen - *off, " map=%llx+%llu", (unsigned long long)r->map_addr,
-                         (unsigned long long)r->map_len);
-    if (r->err[0]) *off += snprintf(out + *off, outlen - *off, " err=\"%s\"", r->err);
-    *off += snprintf(out + *off, outlen - *off, "\n");
+        *off += kclf_scnprintf(out + *off, outlen - *off, " map=%llx+%llu", (unsigned long long)r->map_addr,
+                               (unsigned long long)r->map_len);
+    if (r->err[0]) *off += kclf_scnprintf(out + *off, outlen - *off, " err=\"%s\"", r->err);
+    *off += kclf_scnprintf(out + *off, outlen - *off, "\n");
 }
 
 static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *off)
@@ -565,79 +604,100 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
     struct kclf_req *r;
     struct task_struct *task;
     struct mm_struct *mm;
+    struct pid *pid_ref;
     u64 cookie;
     int rc;
 
     if (!kclf_hook_ok) {
-        *off += snprintf(out + *off, outlen - *off, "error: completion backend unavailable\n");
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: completion backend unavailable\n");
         return -EOPNOTSUPP;
     }
-    if (!kclf_ks.copy_from_user) {
-        *off += snprintf(out + *off, outlen - *off, "error: user copy primitive unavailable\n");
+    if (kclf_unloading) {
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: module quiescing\n");
+        return -ESHUTDOWN;
+    }
+    if (!kclf_ks.access_process_vm) {
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: user copy primitive unavailable\n");
         return -EOPNOTSUPP;
     }
     if (ntok < 3) {
-        *off += snprintf(out + *off, outlen - *off,
-                         "error: usage inject,<tid>,<path>[,force][,wake][,unload]\n");
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: usage inject,<tid>,<path>[,force][,wake][,unload]\n");
         return -EINVAL;
     }
     for (i = 0; tok[1][i]; i++) {
         if (tok[1][i] < '0' || tok[1][i] > '9') {
-            *off += snprintf(out + *off, outlen - *off, "error: bad tid\n");
+            *off += kclf_scnprintf(out + *off, outlen - *off, "error: bad tid\n");
             return -EINVAL;
         }
+        if (pid > (2147483647L - (tok[1][i] - '0')) / 10) return -ERANGE;
         pid = pid * 10 + (tok[1][i] - '0');
     }
     if (!pid) {
-        *off += snprintf(out + *off, outlen - *off, "error: bad tid\n");
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: bad tid\n");
         return -EINVAL;
     }
     path = tok[2];
     for (i = 3; i < ntok; i++) {
-        if (strstr(tok[i], "force")) flags |= KCLF_F_FORCE;
-        if (strstr(tok[i], "wake")) flags |= KCLF_F_WAKE;
-        if (strstr(tok[i], "unload")) flags |= KCLF_F_UNLOAD;
-        /* "resume" is accepted for compatibility: it is the default now */
+        if (!strcmp(tok[i], "force"))
+            flags |= KCLF_F_FORCE;
+        else if (!strcmp(tok[i], "wake"))
+            flags |= KCLF_F_WAKE;
+        else if (!strcmp(tok[i], "unload"))
+            flags |= KCLF_F_UNLOAD;
+        else if (strcmp(tok[i], "resume"))
+            return -EINVAL;
     }
+    /* 5.10 TWA_SIGNAL still uses JOBCTL_TASK_WORK + SIGPENDING. Our signal
+     * safety gate cannot distinguish it from a real signal. Use the dedicated
+     * notify-signal path (upstream 5.11+); conservatively reject older backports. */
+    if ((flags & KCLF_F_WAKE) && kver < VERSION(5, 11, 0)) return -EOPNOTSUPP;
     if (path[0] != '/') {
-        *off += snprintf(out + *off, outlen - *off, "error: path must be absolute\n");
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: path must be absolute\n");
         return -EINVAL;
     }
     if (strlen(path) >= KCLF_PATH_MAX) {
-        *off += snprintf(out + *off, outlen - *off, "error: path too long\n");
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: path too long\n");
         return -EINVAL;
     }
 
+    for (i = 0; i < KCLF_MAX_REQ; i++) {
+        struct kclf_req *q = &kclf_reqs[i];
+        if (kclf_state_load(q) != KCLF_IDLE && q->pid == pid &&
+            (!__atomic_load_n(&q->finished, __ATOMIC_ACQUIRE) || q->map_addr ||
+             __atomic_load_n(&q->pending, __ATOMIC_ACQUIRE))) {
+            *off += kclf_scnprintf(out + *off, outlen - *off, "error: task already has a request\n");
+            return -EBUSY;
+        }
+    }
     r = kclf_slot_alloc();
     if (!r) {
-        *off += snprintf(out + *off, outlen - *off, "error: no free request slot\n");
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: no free request slot\n");
         return -EBUSY;
     }
 
-    task = kclf_ks.find_task_by_vpid((pid_t)pid);
+    pid_ref = kclf_ks.find_get_pid((int)pid);
+    kclf_rcu_read_lock();
+    task = pid_ref ? kclf_ks.pid_task(pid_ref, 0) : 0;
     if (!task) {
-        *off += snprintf(out + *off, outlen - *off, "error: no such task\n");
+        kclf_rcu_read_unlock();
+        if (pid_ref) kclf_ks.put_pid(pid_ref);
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: no such task\n");
         kclf_slot_reset(r);
         return -ESRCH;
     }
-    mm = kclf_task_mm(task);
+    mm = kclf_ks.get_task_mm(task);
     if (!mm) {
-        *off += snprintf(out + *off, outlen - *off, "error: kernel thread\n");
+        kclf_rcu_read_unlock();
+        kclf_ks.put_pid(pid_ref);
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: kernel thread\n");
         kclf_slot_reset(r);
         return -EINVAL;
     }
-    if (!thread_size) {
-        *off += snprintf(out + *off, outlen - *off, "error: thread size unknown\n");
-        kclf_slot_reset(r);
-        return -EINVAL;
-    }
-
     kclf_slot_reset(r);
     r->id = __atomic_fetch_add(&kclf_next_id, 1, __ATOMIC_SEQ_CST);
     r->pid = (pid_t)pid;
-    r->tgid = (pid_t)pid;
+    r->pid_ref = pid_ref;
     r->mm = (u64)mm;
-    r->pgd = kclf_mm_pgd(mm);
     r->task = (u64)task;
     r->flags = flags;
     r->stage = KCLF_ST_QUEUE;
@@ -646,74 +706,41 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
     cookie = get_random_u64();
     r->cookie = cookie ? cookie : 0x6b636c66deadbeefULL;
     r->j_queued = kclf_now();
-    r->state = KCLF_ARMED;
+    kclf_state_store(r, KCLF_ARMED);
 
-    /*
-     * Default is TWA_RESUME: the request is picked up at the next return to
-     * user mode without touching the target's signal state, waking it, or
-     * restarting an interrupted syscall.  A target blocked in an interruptible
-     * sleep only processes it when that sleep ends; the "wake" flag opts back
-     * into the old signal-assisted path when low latency matters more than
-     * leaving the target's timing alone.
-     */
-    r->woke = 0;
-    if ((flags & KCLF_F_WAKE) && kclf_ks.signal_wake_up_state) {
-        kclf_ks.signal_wake_up_state(task, 0);
-        r->woke = 1;
-    }
-
-    rc = kclf_ks.task_work_add(task, &r->work_prepare,
-                               r->woke ? KCLF_TWA_SIGNAL : KCLF_TWA_RESUME);
+    /* Queue before notification; never synthesize TIF_SIGPENDING. */
+    r->woke = !!(flags & KCLF_F_WAKE);
+    rc = kclf_queue_work(r, task, &r->work_prepare, r->woke ? KCLF_TWA_SIGNAL : KCLF_TWA_RESUME);
+    kclf_rcu_read_unlock();
     if (rc) {
-        *off += snprintf(out + *off, outlen - *off, "error: queue failed %d\n", rc);
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: queue failed %d\n", rc);
         kclf_fail(r, KCLF_FAILED, KCLF_ST_QUEUE, rc, "task_work_add failed");
+        __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
         return rc;
     }
 
-    *off += snprintf(out + *off, outlen - *off, "queued id=%llu tid=%d comm=%s path=%s mode=%s%s%s\n",
-                     (unsigned long long)r->id, r->pid, r->comm, r->path,
-                     (flags & KCLF_F_FORCE) ? "force" : "safe", (flags & KCLF_F_WAKE) ? ",wake" : "",
-                     (flags & KCLF_F_UNLOAD) ? ",unload" : "");
+    *off += kclf_scnprintf(out + *off, outlen - *off, "queued id=%llu tid=%d comm=%s path=%s mode=%s%s%s\n",
+                           (unsigned long long)r->id, r->pid, r->comm, r->path,
+                           (flags & KCLF_F_FORCE) ? "force" : "safe", (flags & KCLF_F_WAKE) ? ",wake" : "",
+                           (flags & KCLF_F_UNLOAD) ? ",unload" : "");
     return 0;
 }
 
 static long kclf_cmd_cancel(char *tok[], int ntok, char *out, int outlen, int *off)
 {
-    int idx = 0;
-    int i;
+    int idx;
     struct kclf_req *r;
 
-    if (ntok < 2) {
-        *off += snprintf(out + *off, outlen - *off, "error: usage cancel,<slot>\n");
-        return -EINVAL;
-    }
-    for (i = 0; tok[1][i]; i++) {
-        if (tok[1][i] < '0' || tok[1][i] > '9') {
-            *off += snprintf(out + *off, outlen - *off, "error: usage cancel,<slot>\n");
-            return -EINVAL;
-        }
-        idx = idx * 10 + (tok[1][i] - '0');
-    }
-    if (idx < 0 || idx >= KCLF_MAX_REQ) return -EINVAL;
+    if (ntok != 2 || tok[1][0] < '0' || tok[1][0] > '3' || tok[1][1]) return -EINVAL;
+    idx = tok[1][0] - '0';
     r = &kclf_reqs[idx];
-
-    if (r->state == KCLF_RUNNING) {
-        *off += snprintf(out + *off, outlen - *off, "error: request already in loader, not cancellable\n");
+    if (kclf_state_load(r) != KCLF_ARMED || !kclf_cancel_work(r, &r->work_prepare)) {
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: work already running or not armed\n");
         return -EBUSY;
     }
-    if (r->state == KCLF_IDLE) {
-        *off += snprintf(out + *off, outlen - *off, "error: idle slot\n");
-        return -EINVAL;
-    }
-    if (r->state == KCLF_ARMED || r->state == KCLF_READY) {
-        kclf_cancel_work(r, &r->work_prepare);
-        kclf_cancel_work(r, &r->work_hijack);
-    }
-    r->stage = KCLF_ST_HIJACK;
-    r->state = KCLF_CANCELLED;
-    r->j_done = kclf_now();
-    snprintf(r->err, sizeof(r->err), "cancelled by controller");
-    *off += snprintf(out + *off, outlen - *off, "cancelled #%d id=%llu\n", idx, (unsigned long long)r->id);
+    kclf_fail(r, KCLF_CANCELLED, KCLF_ST_QUEUE, -ECANCELED, "cancelled by controller");
+    __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+    *off += kclf_scnprintf(out + *off, outlen - *off, "cancelled #%d id=%llu\n", idx, (unsigned long long)r->id);
     return 0;
 }
 
@@ -722,13 +749,13 @@ static long kclf_cmd_status(char *out, int outlen, int *off)
     int i, n = 0;
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
-        if (r->state == KCLF_IDLE) continue;
+        if (kclf_state_load(r) == KCLF_IDLE) continue;
         kclf_status_line(out, outlen, off, r);
         n++;
     }
-    if (!n) *off += snprintf(out + *off, outlen - *off, "no requests\n");
-    *off += snprintf(out + *off, outlen - *off, "hook=%s loading=%d page=%d\n", kclf_hook_ok ? "getpid" : "none",
-                     kclf_loading_num, kclf_page_size);
+    if (!n) *off += kclf_scnprintf(out + *off, outlen - *off, "no requests\n");
+    *off += kclf_scnprintf(out + *off, outlen - *off, "hook=%s loading=%d page=%d\n", kclf_hook_ok ? "getpid" : "none",
+                           kclf_loading_num, kclf_page_size);
     return 0;
 }
 
@@ -737,61 +764,105 @@ static long kclf_cmd_reap(char *out, int outlen, int *off)
     int i;
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
-        struct task_struct *task = 0;
+        struct task_struct *task;
         int alive;
-
-        if (r->state == KCLF_IDLE || r->busy) continue;
-        if (r->state == KCLF_DONE || r->state == KCLF_FAILED || r->state == KCLF_CANCELLED) {
-            if (r->finished && !r->map_addr) {
-                kclf_slot_reset(r);
-                *off += snprintf(out + *off, outlen - *off, "reclaimed #%d\n", i);
-            } else if (r->map_addr) {
-                *off += snprintf(out + *off, outlen - *off, "cleanup incomplete #%d map=%llx len=%llu\n", i,
-                                 (unsigned long long)r->map_addr, (unsigned long long)r->map_len);
-            }
+        if (kclf_state_load(r) == KCLF_IDLE || __atomic_load_n(&r->pending, __ATOMIC_ACQUIRE) || r->completing)
             continue;
-        }
-        if (kclf_rcu_read_lock) {
-            kclf_rcu_read_lock();
-            task = kclf_ks.find_task_by_vpid(r->pid);
-            alive = kclf_task_alive(task, r);
-            kclf_rcu_read_unlock();
-        } else {
-            task = kclf_ks.find_task_by_vpid(r->pid);
-            alive = kclf_task_alive(task, r);
-        }
-        if (!alive) {
-            *off += snprintf(out + *off, outlen - *off, "target gone for #%d id=%llu\n", i,
-                             (unsigned long long)r->id);
+        kclf_rcu_read_lock();
+        task = r->pid_ref ? kclf_ks.pid_task(r->pid_ref, 0) : 0;
+        alive = kclf_task_alive(task, r);
+        kclf_rcu_read_unlock();
+        if (!alive && !__atomic_load_n(&r->finished, __ATOMIC_ACQUIRE)) {
+            if (__atomic_load_n(&r->pending, __ATOMIC_ACQUIRE) || r->completing) continue;
+            if (kclf_state_load(r) == KCLF_RUNNING) __atomic_sub_fetch(&kclf_loading_num, 1, __ATOMIC_SEQ_CST);
             kclf_fail(r, KCLF_FAILED, r->stage, -ESRCH, "target exited or exec'd");
-            r->map_addr = 0;
-            r->finished = 1;
+            if (r->map_addr) {
+                *off += kclf_scnprintf(out + *off, outlen - *off,
+                                       "orphaned map #%d %llx+%llu (released with old mm, not unmapped here)\n", i,
+                                       (unsigned long long)r->map_addr, (unsigned long long)r->map_len);
+                r->map_addr = r->map_len = 0;
+            }
+            __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+        }
+        if (kclf_slot_reclaimable(r)) {
+            kclf_slot_reset(r);
+            *off += kclf_scnprintf(out + *off, outlen - *off, "reclaimed #%d\n", i);
+        } else if (r->map_addr) {
+            *off += kclf_scnprintf(out + *off, outlen - *off, "cleanup incomplete #%d\n", i);
         }
     }
     return 0;
 }
 
+static int kclf_has_work(void)
+{
+    int i;
+    for (i = 0; i < KCLF_MAX_REQ; i++) {
+        struct kclf_req *r = &kclf_reqs[i];
+        if (kclf_state_load(r) != KCLF_IDLE && !kclf_slot_reclaimable(r)) return 1;
+    }
+    return 0;
+}
+
+static long kclf_cmd_quiesce(char *out, int outlen, int *off)
+{
+    int i, busy;
+    __atomic_store_n(&kclf_unloading, 1, __ATOMIC_RELEASE);
+    for (i = 0; i < KCLF_MAX_REQ; i++) {
+        struct kclf_req *r = &kclf_reqs[i];
+        if (kclf_state_load(r) == KCLF_ARMED && kclf_cancel_work(r, &r->work_prepare)) {
+            kclf_fail(r, KCLF_CANCELLED, KCLF_ST_QUEUE, -ECANCELED, "quiescing");
+            __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+        }
+    }
+    busy = kclf_has_work();
+    *off += kclf_scnprintf(out + *off, outlen - *off, "quiesce=%s; new requests disabled\n",
+                           busy ? "busy (wait/reap, DO NOT unload)" : "idle");
+    return busy ? -EBUSY : 0;
+}
+
 static long kclf_cmd_sym(char *out, int outlen, int *off)
 {
     static const char *const names[] = {
-        "__copy_from_user",       "copy_from_user",        "fault_in_pages_readable", "access_process_vm",
-        "_copy_from_user",        "__arch_copy_from_user", "__arch_copy_to_user",     "_copy_to_user",
-        "copy_from_user_nofault", "task_work_add",         "task_work_cancel",        "task_work_cancel_func",
-        "find_task_by_vpid",      "vm_mmap",               "vm_munmap",               "find_vma",
-        "filp_open",              "kernel_read",           "fput",                    "get_task_mm",
-        "mmput",                  "__rcu_read_lock",       "__rcu_read_unlock",       "ktime_get",
-        "msleep",                 "init_mm",               "init_task",               "page_offset_base",
+        "__copy_from_user",
+        "copy_from_user",
+        "fault_in_pages_readable",
+        "access_process_vm",
+        "_copy_from_user",
+        "__arch_copy_from_user",
+        "__arch_copy_to_user",
+        "_copy_to_user",
+        "copy_from_user_nofault",
+        "task_work_add",
+        "task_work_cancel",
+        "task_work_cancel_func",
+        "find_task_by_vpid",
+        "vm_mmap",
+        "vm_munmap",
+        "find_vma",
+        "filp_open",
+        "kernel_read",
+        "fput",
+        "get_task_mm",
+        "mmput",
+        "__rcu_read_lock",
+        "__rcu_read_unlock",
+        "ktime_get",
+        "msleep",
+        "init_mm",
+        "init_task",
+        "page_offset_base",
     };
     unsigned int i;
 
-    *off += snprintf(out + *off, outlen - *off, "copiers: from=%llx to=%llx\n",
-                     (unsigned long long)kclf_ks.copy_from_user, (unsigned long long)kclf_ks.copy_to_user);
+    *off += kclf_scnprintf(out + *off, outlen - *off, "user_io=access_process_vm nofault=%llx\n",
+                           (unsigned long long)kclf_ks.copy_from_user_nofault);
     for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         unsigned long a = kclf_lookup(names[i]);
-        *off += snprintf(out + *off, outlen - *off, "%-24s %llx\n", names[i], (unsigned long long)a);
+        *off += kclf_scnprintf(out + *off, outlen - *off, "%-24s %llx\n", names[i], (unsigned long long)a);
     }
-    *off += snprintf(out + *off, outlen - *off, "mm_off=%d stack_off=%d pid_off=%d tsize=%d\n", kclf_mm_off,
-                     stack_in_task_offset, task_struct_offset.pid_offset, thread_size);
+    *off += kclf_scnprintf(out + *off, outlen - *off, "mm_off=%d stack_off=%d pid_off=%d tsize=%d\n", kclf_mm_off,
+                           stack_in_task_offset, task_struct_offset.pid_offset, thread_size);
     return 0;
 }
 
@@ -809,33 +880,38 @@ static int kclf_tokenize(const char *args, char *buf, int buflen, char *tok[], i
     int n = 0;
     int len = 0;
 
-    while (args[len] && len < buflen - 1) {
+    while (len < buflen - 1 && args[len]) {
         char c = args[len];
         buf[len] = (c == ',' || c == '\t' || c == '\n') ? ' ' : c;
         len++;
     }
     buf[len] = 0;
+    if (args[len]) return -E2BIG;
 
-    for (int i = 0; i < len && n < maxtok;) {
-        while (buf[i] == ' ') buf[i++] = 0;
+    for (int i = 0; i < len;) {
+        while (buf[i] == ' ')
+            buf[i++] = 0;
         if (!buf[i]) break;
+        if (n == maxtok) return -E2BIG;
         tok[n++] = buf + i;
-        while (buf[i] && buf[i] != ' ') i++;
+        while (buf[i] && buf[i] != ' ')
+            i++;
     }
     return n;
 }
 
 static void kclf_usage(char *out, int outlen, int *off)
 {
-    *off += snprintf(out + *off, outlen - *off,
-                     "kclf " KCLF_VER " - no-ptrace library loading\n"
-                     "  probe                      resolve loader symbols, check the trap\n"
-                     "  inject,<tid>,<path>[,force][,wake][,unload]   queue a load request\n"
-                     "  status                     request table\n"
-                     "  cancel,<slot>              cancel a queued request\n"
-                     "  reap                       reclaim finished slots / dead targets\n"
-                     "  sym                        kernel symbol resolution dump\n"
-                     "  help                       this text\n");
+    *off += kclf_scnprintf(out + *off, outlen - *off,
+                           "kclf " KCLF_VER " - no-ptrace library loading\n"
+                           "  probe                      runtime compatibility diagnostics\n"
+                           "  inject,<tid>,<path>[,force][,wake][,unload]   queue a load request\n"
+                           "  status                     request table\n"
+                           "  cancel,<slot>              cancel a queued request\n"
+                           "  reap                       reclaim finished slots / dead targets\n"
+                           "  quiesce                    stop accepting loads; check drain before unload\n"
+                           "  sym                        kernel symbol resolution dump\n"
+                           "  help                       this text\n");
 }
 
 static long kclf_ctl0(const char *args, char *__user out_msg, int outlen)
@@ -848,18 +924,27 @@ static long kclf_ctl0(const char *args, char *__user out_msg, int outlen)
     long rc = 0;
 
     if (!args) return -EINVAL;
+    if (__atomic_exchange_n(&kclf_control_busy, 1, __ATOMIC_ACQUIRE)) return -EBUSY;
     out[0] = 0;
     ntok = kclf_tokenize(args, argv_buf, sizeof(argv_buf), tok, KCLF_MAX_TOK);
 
-    if (!ntok) {
+    if (ntok < 0) {
+        rc = ntok;
+        off = kclf_scnprintf(out, sizeof(out), "error: command too long or too many tokens\n");
+    } else if (!ntok) {
         kclf_usage(out, sizeof(out), &off);
+    } else if (ntok != 1 && strcmp(tok[0], "inject") && strcmp(tok[0], "cancel")) {
+        rc = -EINVAL;
+        off = kclf_scnprintf(out, sizeof(out), "error: unexpected arguments\n");
     } else if (!strcmp(tok[0], "probe")) {
         int n = kclf_exec_probe(out, sizeof(out) - 64);
         if (n > 0) off = n;
-        off += snprintf(out + off, sizeof(out) - off, "hook=%s syscall_wrapper=%d\n", kclf_hook_ok ? "getpid" : "none",
-                        has_syscall_wrapper);
+        off += kclf_scnprintf(out + off, sizeof(out) - off, "hook=%s syscall_wrapper=%d\n",
+                              kclf_hook_ok ? "getpid" : "none", has_syscall_wrapper);
     } else if (!strcmp(tok[0], "inject")) {
         rc = kclf_cmd_inject(tok, ntok, out, sizeof(out), &off);
+    } else if (!strcmp(tok[0], "quiesce")) {
+        rc = kclf_cmd_quiesce(out, sizeof(out), &off);
     } else if (!strcmp(tok[0], "status")) {
         rc = kclf_cmd_status(out, sizeof(out), &off);
     } else if (!strcmp(tok[0], "cancel")) {
@@ -877,8 +962,9 @@ static long kclf_ctl0(const char *args, char *__user out_msg, int outlen)
         if (off > outlen - 1) off = outlen - 1;
         if (off < 0) off = 0;
         out[off] = 0;
-        compat_copy_to_user(out_msg, out, off + 1);
+        if (compat_copy_to_user(out_msg, out, off + 1) != off + 1) rc = -EFAULT;
     }
+    __atomic_store_n(&kclf_control_busy, 0, __ATOMIC_RELEASE);
     return rc;
 }
 
@@ -894,7 +980,8 @@ static long kclf_init(const char *args, const char *event, void *reserved)
     (void)event;
     (void)reserved;
 
-    for (rc = 0; rc < KCLF_MAX_REQ; rc++) kclf_slot_reset(&kclf_reqs[rc]);
+    for (rc = 0; rc < KCLF_MAX_REQ; rc++)
+        kclf_slot_reset(&kclf_reqs[rc]);
     kclf_page_size = kclf_detect_page_size();
     if (!kclf_page_size || (kclf_page_size & (kclf_page_size - 1))) {
         logke("kclf: bad page size %d\n", kclf_page_size);
@@ -908,12 +995,8 @@ static long kclf_init(const char *args, const char *event, void *reserved)
     rc = kclf_sym_lookup_all();
     if (rc) return rc;
 
-    kclf_mm_off = kclf_probe_mm_offset();
-    if (kclf_mm_off <= 0) {
-        logke("kclf: cannot determine task_struct.mm offset\n");
-        return -EINVAL;
-    }
-    kclf_pid_off = task_struct_offset.pid_offset;
+    rc = kclf_compat_init();
+    if (rc) return rc;
     kclf_exec_init();
 
     rc = kclf_hook_install();
@@ -929,55 +1012,21 @@ static long kclf_init(const char *args, const char *event, void *reserved)
 static long kclf_exit(void *reserved)
 {
     int i;
-    int wait;
-
     (void)reserved;
+    /* Older KP loaders ignore this return value! On those loaders the
+     * controller MUST obtain quiesce=idle before requesting unload. There is
+     * no safe finite timeout for an arbitrary user constructor. */
+    if (__atomic_load_n(&kclf_control_busy, __ATOMIC_ACQUIRE) || kclf_has_work()) {
+        logke("kclf: unsafe unload refused; quiesce and drain first (requires KP exit-veto support)\n");
+        return -EBUSY;
+    }
     kclf_unloading = 1;
-
-    /* drop queued work: leaving a callback_head in a task_work list after the
-     * module text is freed would be an arbitrary call into freed memory */
-    for (i = 0; i < KCLF_MAX_REQ; i++) {
-        struct kclf_req *r = &kclf_reqs[i];
-        if (r->state == KCLF_IDLE) continue;
-        if (r->state == KCLF_ARMED) kclf_cancel_work(r, &r->work_prepare);
-        if (r->state == KCLF_READY) kclf_cancel_work(r, &r->work_hijack);
-        if (r->state == KCLF_PREPARING) r->state = KCLF_CANCELLED;
-    }
-
-    /* Let in-flight callbacks drain before the completion hook disappears.
-     * Removing the hook first would make a trampoline that is already running
-     * execute the real getpid and then spin forever at its final branch.  A
-     * request that still owns a transient map also has a cleanup callback
-     * pending, even after loading_num reached zero. */
-    for (wait = 0; wait < 3000; wait++) {
-        int busy = 0;
-        for (i = 0; i < KCLF_MAX_REQ; i++) {
-            struct kclf_req *r = &kclf_reqs[i];
-            if (r->busy || r->completing) busy = 1;
-            if (r->state != KCLF_IDLE && r->map_addr) busy = 1;
-        }
-        if (!busy && !kclf_loading_num) break;
-        if (kclf_ks.msleep)
-            kclf_ks.msleep(1);
-        else
-            break;
-    }
-    for (i = 0; i < KCLF_MAX_REQ; i++) {
-        struct kclf_req *r = &kclf_reqs[i];
-        if (r->state == KCLF_IDLE) continue;
-        /* A retry must not call into module text after it is freed.  If it did
-         * not run during the drain window, the transient map leaks until the
-         * target exits; that is safer than a use-after-free callback. */
-        kclf_cancel_work(r, &r->work_cleanup);
-    }
     if (kclf_hook_ok) {
         unhook_syscalln(KCLF_COMPLETION_NR, kclf_getpid_before, kclf_getpid_after);
         kclf_hook_ok = 0;
     }
-    for (i = 0; i < KCLF_MAX_REQ; i++) {
-        if (kclf_reqs[i].busy || kclf_reqs[i].completing)
-            logkw("kclf: unloaded with request %d still in flight\n", i);
-    }
+    for (i = 0; i < KCLF_MAX_REQ; i++)
+        kclf_slot_reset(&kclf_reqs[i]);
     kclf_ready = 0;
     return 0;
 }

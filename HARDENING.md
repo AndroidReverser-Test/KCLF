@@ -1,4 +1,8 @@
-# KCLF 可观测性收敛改动
+# KCLF 可观测性收敛改动（1.1 历史文档）
+
+> 版本说明（2026-10-28）：本文为历史记录；其中“整页擦除”、扫描 pt_regs、40 KB 映射和卸载超时等
+> 描述不适用于 1.2.0。当前参数仅擦已使用区，临时映射为 11 页，布局不再扫描猜测，卸载必须排空。
+> 当前实现和本轮实测见 [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)。
 
 日期：2026-10-27。对应源码：`kpms/kclf`，模块版本 `1.1.0`。本文记录针对
 [OBSERVABILITY_AUDIT.md](OBSERVABILITY_AUDIT.md) 所做修改、设备实测结果和仍然
