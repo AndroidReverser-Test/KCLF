@@ -19,6 +19,7 @@
 #include <uapi/asm-generic/unistd.h>
 #include <asm/thread_info.h>
 #include <asm/processor.h>
+#include "kclf_maps.h"
 
 /* values are kept local so the module does not depend on uapi stubs */
 #define KCLF_PROT_READ 0x1
@@ -411,26 +412,112 @@ struct kclf_vma
     u64 end;
 };
 
-static int kclf_vma_at(struct mm_struct *mm, u64 addr, struct kclf_vma *out)
+struct kclf_vma_iter
 {
-    struct vm_area_struct *vma;
-    u64 start, end;
+    struct mm_struct *mm;
+    struct file *file;
+    loff_t pos;
+    u64 addr;
+    u64 user_buffer;
+    int offset, used;
+    char buffer[512];
+};
 
-    /* Snapshot only while locked. Drop the lock before GUP/user reads,
-     * otherwise faulting memory could recursively acquire mmap_lock. */
-    kclf_mmap_read_lock(mm);
-    vma = kclf_ks.find_vma(mm, addr);
-    if (!vma) {
-        kclf_mmap_read_unlock(mm);
-        return -1;
+static long kclf_vma_iter_open(struct kclf_vma_iter *it, struct mm_struct *mm, u64 user_buffer)
+{
+    memset(it, 0, sizeof(*it));
+    it->mm = mm;
+    it->user_buffer = user_buffer;
+    if (!kclf_vma_direct) {
+        if (!kclf_ks.vfs_read) return -ENOSYS;
+        /* This callback is current in the target mount/PID namespace. procfs
+         * owns the VMA locking and handles both rb-tree and maple-tree kernels.
+         * Read it only in sleepable target callbacks, never in ctl0/hooks. */
+        it->file = kclf_ks.filp_open("/proc/thread-self/maps", KCLF_O_RDONLY, 0);
+        if (!it->file) return -ENOENT;
+        if (kclf_is_err(it->file)) {
+            long rc = (long)it->file;
+            it->file = 0;
+            return rc;
+        }
     }
-    start = *(u64 *)((char *)vma + kclf_vma_start_off);
-    end = *(u64 *)((char *)vma + kclf_vma_end_off);
-    kclf_mmap_read_unlock(mm);
-    if (end <= start || end <= addr || end > KCLF_USER_MAX) return -1;
-    out->start = start;
-    out->end = end;
     return 0;
+}
+
+static void kclf_vma_iter_close(struct kclf_vma_iter *it)
+{
+    if (it->file) kclf_ks.fput(it->file);
+    it->file = 0;
+}
+
+/* 1 = range, 0 = EOF, negative = error. Never conflate an I/O failure with
+ * an empty range when deciding whether a mapping has been reclaimed. */
+static long kclf_vma_next(struct kclf_vma_iter *it, struct kclf_vma *out)
+{
+    if (!it->file) {
+        struct vm_area_struct *vma;
+        kclf_mmap_read_lock(it->mm);
+        vma = kclf_ks.find_vma(it->mm, it->addr);
+        if (!vma) {
+            kclf_mmap_read_unlock(it->mm);
+            return 0;
+        }
+        out->start = *(u64 *)((char *)vma + kclf_vma_start_off);
+        out->end = *(u64 *)((char *)vma + kclf_vma_end_off);
+        kclf_mmap_read_unlock(it->mm);
+        if (out->end <= out->start || out->end <= it->addr || out->end > KCLF_USER_MAX) return -EFAULT;
+        it->addr = out->end;
+        return 1;
+    }
+    for (;;) {
+        char prefix[48];
+        unsigned int n = 0;
+        for (;;) {
+            char c;
+            if (it->offset == it->used) {
+                /* Some 5.10 procfs files only implement ->read, whereas
+                 * kernel_read requires ->read_iter. vfs_read accepts either;
+                 * give it real target memory, not a kernel pointer/set_fs.
+                 * The request's still-RW parameter page is scratch until the
+                 * loader has been resolved. No extra fd or mapping is leaked. */
+                long count = kclf_ks.vfs_read(it->file, (char *)it->user_buffer, sizeof(it->buffer), &it->pos);
+                if (count < 0) return count;
+                if (!count) {
+                    if (!n) return 0;
+                    break;
+                }
+                if (count > (long)sizeof(it->buffer)) return -EIO;
+                if (kclf_urds(it->user_buffer, it->buffer, (int)count)) return -EFAULT;
+                it->used = (int)count;
+                it->offset = 0;
+            }
+            c = it->buffer[it->offset++];
+            if (c == '\n') break;
+            if (n < sizeof(prefix) - 1) prefix[n++] = c;
+        }
+        prefix[n] = 0;
+        if (kclf_maps_range(prefix, KCLF_USER_MAX, &out->start, &out->end)) return -EINVAL;
+        if (out->end <= it->addr) continue;
+        it->addr = out->end;
+        return 1;
+    }
+}
+
+static long kclf_vma_at(struct mm_struct *mm, u64 addr, struct kclf_vma *out, u64 user_buffer)
+{
+    struct kclf_vma_iter it;
+    long rc = kclf_vma_iter_open(&it, mm, user_buffer);
+    int i;
+
+    if (rc) return rc;
+    it.addr = addr;
+    for (i = 0; i < KCLF_MAX_VMA; i++) {
+        rc = kclf_vma_next(&it, out);
+        if (rc <= 0 || out->end > addr) break;
+    }
+    kclf_vma_iter_close(&it);
+    if (i == KCLF_MAX_VMA) return -E2BIG;
+    return rc > 0 ? 0 : (rc ? rc : -ENOENT);
 }
 
 static long kclf_resolve(struct kclf_req *r)
@@ -440,7 +527,8 @@ static long kclf_resolve(struct kclf_req *r)
     struct kclf_dyninfo ldr_di, dl_di;
     int have_ldr = 0, have_dl = 0, have_libc = 0;
     int have_ldr_di = 0, have_dl_di = 0;
-    u64 addr = 0x1000;
+    struct kclf_vma_iter it;
+    long rc;
     int i;
     int nelf = 0, ndyn = 0, nson = 0;
 
@@ -448,6 +536,11 @@ static long kclf_resolve(struct kclf_req *r)
     memset(&ldr, 0, sizeof(ldr));
     memset(&dl, 0, sizeof(dl));
     memset(&libc, 0, sizeof(libc));
+    rc = kclf_vma_iter_open(&it, mm, r->param_addr);
+    if (rc) {
+        kclf_set_err(r, "open target maps failed rc=%ld", rc);
+        return rc;
+    }
 
     for (i = 0; i < KCLF_MAX_VMA; i++) {
         struct kclf_vma vma;
@@ -455,10 +548,8 @@ static long kclf_resolve(struct kclf_req *r)
         struct kclf_dyninfo di;
         char soname[64];
 
-        if (addr >= KCLF_USER_MAX) break;
-        if (kclf_vma_at(mm, addr, &vma)) break;
-        if (vma.start > addr) addr = vma.start;
-        addr = vma.end;
+        rc = kclf_vma_next(&it, &vma);
+        if (rc <= 0) break;
 
         /*
          * vm_flags is not at a stable offset across vendor kernels, so do not
@@ -487,6 +578,11 @@ static long kclf_resolve(struct kclf_req *r)
             have_libc = 1;
         }
         if (have_ldr && have_dl && have_libc) break;
+    }
+    kclf_vma_iter_close(&it);
+    if (rc < 0) {
+        kclf_set_err(r, "read target maps failed rc=%ld", rc);
+        return rc;
     }
 
     r->ld.linker_base = have_ldr ? ldr.start : 0;
@@ -637,12 +733,6 @@ long kclf_exec_prepare(struct kclf_req *r)
         return rc;
     }
 
-    rc = kclf_resolve(r);
-    if (rc) {
-        if (!r->err[0]) kclf_set_err(r, "resolve loader failed rc=%ld", rc);
-        return rc;
-    }
-
     len = (u64)(3 + KCLF_STACK_PAGES) * kclf_page_size;
     addr = kclf_ks.vm_mmap(0, 0, len, KCLF_PROT_READ | KCLF_PROT_WRITE, KCLF_MAP_PRIVATE | KCLF_MAP_ANONYMOUS, 0);
     if (!addr || kclf_is_err((void *)addr)) {
@@ -656,6 +746,12 @@ long kclf_exec_prepare(struct kclf_req *r)
     r->code_addr = addr;
     r->param_addr = addr + kclf_page_size;
     r->stack_top = addr + len;
+
+    rc = kclf_resolve(r);
+    if (rc) {
+        if (!r->err[0]) kclf_set_err(r, "resolve loader failed rc=%ld", rc);
+        return rc;
+    }
 
     code_len = (u64)(kclf_tramp_end - kclf_tramp_start);
     ptr_off = (u64)(kclf_tramp_ptr_slot - kclf_tramp_start);
@@ -772,9 +868,9 @@ static struct pt_regs *kclf_find_regs(void)
 static int kclf_syscall_safe(s32 nr)
 {
     switch (nr) {
-    case 7: /* poll */
+    case 7: /* fsetxattr (AArch64; retained legacy heuristic entry) */
     case 22: /* epoll_pwait */
-    case 23: /* select */
+    case 23: /* dup (AArch64; retained legacy heuristic entry) */
     case 29: /* ioctl (binder and most driver traffic) */
     case 35: /* unlinkat */
     case 61: /* getdents64 */
@@ -940,7 +1036,10 @@ long kclf_exec_finish(struct kclf_req *r, int capture_err)
              * it as success when no VMA still covers the base. */
             struct mm_struct *mm = kclf_task_mm(current);
             struct kclf_vma check;
-            if (mm && (kclf_vma_at(mm, r->map_addr, &check) || check.start >= r->map_addr + r->map_len)) rc = 0;
+            if (mm) {
+                long found = kclf_vma_at(mm, r->map_addr, &check, r->param_addr);
+                if (found == -ENOENT || (!found && check.start >= r->map_addr + r->map_len)) rc = 0;
+            }
         }
         if (!rc) {
             r->map_addr = 0;
@@ -964,9 +1063,11 @@ int kclf_exec_probe(char *out, int outlen)
                           regs ? "ok" : "unavailable", kclf_regs_size, thread_size, kclf_page_size);
     off += kclf_scnprintf(out + off, outlen - off, "user_limit=%llx tbi=%d\n", (unsigned long long)kclf_user_limit,
                           kclf_user_tbi);
+    off += kclf_scnprintf(out + off, outlen - off, "vma_backend=%s mm_access=%s\n",
+                          kclf_vma_direct ? "locked" : "proc_maps", kclf_mm_off > 0 ? "offset" : "get_task_mm");
     off += kclf_scnprintf(out + off, outlen - off, "cancel=%s user_io=access_process_vm wake=%s quiescing=%d\n",
                           kclf_ks.task_work_cancel_match ? "match" : "func",
-                          kver >= VERSION(5, 11, 0) ? "notify_signal" : "unsupported", kclf_unloading);
+                          kclf_wake_supported ? "task_work_signal" : "unsupported", kclf_unloading);
     if (!kclf_regs_size)
         off +=
             kclf_scnprintf(out + off, outlen - off, "run a native getpid syscall to learn pt_regs before injection\n");

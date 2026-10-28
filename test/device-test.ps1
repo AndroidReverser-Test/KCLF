@@ -176,9 +176,9 @@ try {
     Check ((Ctl 'status').Text -match 'no requests') 'all cancelled slots reusable'
 
     $Wake = Start-Target 'slow'
-    if ($Probe -match 'wake=notify_signal') {
+    if ($Probe -match 'wake=(notify_signal|task_work_signal)') {
         Inject $Wake ',wake,unload' | Out-Null
-        Check ((Await-State 'state=done' 4000) -match 'unload=ok') 'notify-signal wake mode completes'
+        Check ((Await-State 'state=done' 4000) -match 'unload=ok') 'task-work signal wake mode completes'
     } else {
         Check ((Ctl "inject,$Wake,$Remote/libkclf_payload.so,wake,unload" -AllowFailure).Code -ne 0) 'unsupported legacy wake mode explicitly rejected'
     }

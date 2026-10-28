@@ -1,5 +1,8 @@
 # KCLF 1.3.0：普通 app 注入、实现与兼容性审计
 
+> 历史版本记录。当前 1.3.1 的无 BTF / 5.10 适配和本次测试见
+> [COMPATIBILITY_1.3.1.md](COMPATIBILITY_1.3.1.md)。本文件的 6.1 测试不能当作新版已实测。
+
 日期：2026-10-28。范围：`kpms/kclf` 模块源码、stock KernelPatch 宿主、Pixel 6
 测试设备、自有 native 测试进程和一次性普通 app 测试 APK。
 

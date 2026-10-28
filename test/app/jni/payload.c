@@ -12,6 +12,9 @@
 #ifndef KCLF_APP_FILES
 #define KCLF_APP_FILES "/data/user/0/com.kclf.apptest/files"
 #endif
+#ifndef KCLF_APP_DEFAULT_HOLD_MS
+#define KCLF_APP_DEFAULT_HOLD_MS 0
+#endif
 
 __attribute__((constructor)) static void kclf_app_payload_init(void)
 {
@@ -22,9 +25,9 @@ __attribute__((constructor)) static void kclf_app_payload_init(void)
     const char *hold = getenv("KCLF_APP_HOLD_MS");
     int fd;
 
-    if (hold && *hold) {
+    {
         struct timespec ts;
-        long ms = strtol(hold, 0, 10);
+        long ms = hold && *hold ? strtol(hold, 0, 10) : KCLF_APP_DEFAULT_HOLD_MS;
         if (ms > 0) {
             ts.tv_sec = ms / 1000;
             ts.tv_nsec = (ms % 1000) * 1000000L;
@@ -42,4 +45,8 @@ __attribute__((constructor)) static void kclf_app_payload_init(void)
     }
     snprintf(buf, sizeof(buf), "KCLF_APP_PAYLOAD pid=%ld tid=%ld\n", pid, tid);
     if (write(1, buf, strlen(buf)) < 0) { /* ignore */ }
+#ifdef KCLF_APP_CLOBBER_FP
+    __asm__ volatile("movi v0.16b, #0\n\tmovi v31.16b, #0\n\t"
+                     "msr fpcr, xzr\n\tmsr fpsr, xzr" ::: "v0", "v31", "memory");
+#endif
 }

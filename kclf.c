@@ -174,11 +174,14 @@ int kclf_sym_lookup_all(void)
     KCLF_KS(put_pid, "put_pid");
     KCLF_KS(vm_mmap, "vm_mmap");
     KCLF_KS(vm_munmap, "vm_munmap");
-    KCLF_KS(find_vma, "find_vma");
+    kclf_ks.find_vma = (typeof(kclf_ks.find_vma))kclf_lookup("find_vma");
     KCLF_KS(filp_open, "filp_open");
     KCLF_KS(kernel_read, "kernel_read");
+    kclf_ks.vfs_read = (typeof(kclf_ks.vfs_read))kclf_lookup("vfs_read");
     KCLF_KS(fput, "fput");
     kclf_ks.copy_from_user_nofault = (typeof(kclf_ks.copy_from_user_nofault))kclf_lookup("copy_from_user_nofault");
+    if (!kclf_ks.copy_from_user_nofault)
+        kclf_ks.copy_from_user_nofault = (typeof(kclf_ks.copy_from_user_nofault))kclf_lookup("probe_user_read");
     KCLF_KS(access_process_vm, "access_process_vm");
     KCLF_KS(get_task_mm, "get_task_mm");
     KCLF_KS(mmput_async, "mmput_async");
@@ -665,10 +668,9 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
         else if (strcmp(tok[i], "resume"))
             return -EINVAL;
     }
-    /* 5.10 TWA_SIGNAL still uses JOBCTL_TASK_WORK + SIGPENDING. Our signal
-     * safety gate cannot distinguish it from a real signal. Use the dedicated
-     * notify-signal path (upstream 5.11+); conservatively reject older backports. */
-    if ((flags & KCLF_F_WAKE) && kver < VERSION(5, 11, 0)) return -EOPNOTSUPP;
+    /* 5.8-5.10 use JOBCTL_TASK_WORK; 5.11+ use NOTIFY_SIGNAL. Both execute
+     * task_work in target context. Pending signals are not a refusal. */
+    if ((flags & KCLF_F_WAKE) && !kclf_wake_supported) return -EOPNOTSUPP;
     if (path[0] != '/') {
         *off += kclf_scnprintf(out + *off, outlen - *off, "error: path must be absolute\n");
         return -EINVAL;

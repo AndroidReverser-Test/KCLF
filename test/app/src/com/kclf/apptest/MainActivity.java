@@ -10,9 +10,11 @@ import java.io.File;
 /**
  * Deliberately ordinary: a debuggable third-party app with the zygote seccomp
  * filter, a main thread parked in epoll_pwait, a binder pool and one thread
- * that loops in nanosleep. KCLF is tested against both blocking styles.
+ * that loops in Thread.sleep. Native probes add pipe read and nanosleep.
  */
 public final class MainActivity extends Activity {
+    private Thread sleeper;
+    private static native int startProbes();
     static {
         System.loadLibrary("kclfhost");
     }
@@ -21,11 +23,13 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         File files = getFilesDir();
+        int probeResult = startProbes();
+        if (probeResult != 0) throw new IllegalStateException("native probes: " + probeResult);
         Log.i("KCLFAPP", "created pid=" + Process.myPid() + " tid=" + Process.myTid()
                 + " files=" + files.getAbsolutePath()
                 + " libdir=" + getApplicationInfo().nativeLibraryDir);
 
-        Thread sleeper = new Thread(new Runnable() {
+        sleeper = new Thread(new Runnable() {
             @Override
             public void run() {
                 while (true) {
@@ -41,5 +45,11 @@ public final class MainActivity extends Activity {
 
         /* Returning to the main looper leaves the UI thread in epoll_pwait. */
         Log.i("KCLFAPP", "ready");
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (sleeper != null) sleeper.interrupt();
+        super.onDestroy();
     }
 }

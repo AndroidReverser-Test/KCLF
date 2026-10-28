@@ -5,7 +5,7 @@
  * Layering follows kclf-design.md / kclf-shadow-design.md:
  *
  *   control plane   -> KPM ctl0 string ABI (superkey protected, kpatch)
- *   target manager  -> slot table with pinned PID and mm identities
+ *   target manager  -> slot table with pinned PID and borrowed mm identities
  *   request machine -> IDLE/ARMED/PREPARING/READY/RUNNING/DONE/FAILED
  *   execution       -> EL0 trampoline in a transient private mapping
  *   completion      -> private getpid trap consumed by the syscall hook
@@ -29,7 +29,7 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.3.0"
+#define KCLF_VER "1.3.1"
 
 #define KCLF_MAX_REQ 4
 #define KCLF_CODE_MAX 512 /* trampoline blob upper bound */
@@ -97,7 +97,7 @@ struct kclf_req
     u64 cookie;
     pid_t pid; /* thread the work is armed on */
     struct pid *pid_ref; /* stable identity across PID reuse and namespaces */
-    u64 mm; /* pinned with get_task_mm until the slot is reclaimed */
+    u64 mm; /* identity only; never dereferenced after dropping the mm reference */
     u64 task; /* informational only, never dereferenced */
     char comm[16];
     char path[KCLF_PATH_MAX];
@@ -170,6 +170,7 @@ struct kclf_syms
     int (*access_process_vm)(struct task_struct *tsk, unsigned long addr, void *buf, int len, unsigned int gup_flags);
     struct file *(*filp_open)(const char *name, int flags, umode_t mode);
     long (*kernel_read)(struct file *file, void *buf, unsigned long count, loff_t *pos);
+    long (*vfs_read)(struct file *file, char *buf, unsigned long count, loff_t *pos);
     void (*fput)(struct file *file);
     struct mm_struct *(*get_task_mm)(struct task_struct *task);
     void (*mmput_async)(struct mm_struct *mm);
@@ -208,6 +209,8 @@ int kclf_exec_init(void);
 extern int kclf_regs_size;
 extern int kclf_vma_start_off, kclf_vma_end_off, kclf_mmap_lock_off;
 extern int kclf_btf_ok;
+extern int kclf_vma_direct;
+extern int kclf_wake_supported;
 unsigned long kclf_lookup(const char *name);
 int kclf_compat_init(void);
 void kclf_mmap_read_lock(struct mm_struct *mm);
@@ -217,10 +220,8 @@ int kclf_scnprintf(char *out, int size, const char *fmt, ...) __attribute__((for
 /* helpers shared between both halves */
 extern int kclf_mm_off;
 
-static inline struct mm_struct *kclf_task_mm(struct task_struct *task)
-{
-    if (!task || kclf_mm_off <= 0) return 0;
-    return __atomic_load_n((struct mm_struct **)((char *)task + kclf_mm_off), __ATOMIC_ACQUIRE);
-}
+/* Current's mm stays live during its callback. For another task the caller
+ * holds RCU and may only compare this borrowed identity, never dereference it. */
+struct mm_struct *kclf_task_mm(struct task_struct *task);
 
 #endif

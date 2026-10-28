@@ -6,7 +6,12 @@
 - 第三方包 `com.kclf.apptest`，debuggable，targetSdk 35；
 - 由 zygote fork，运行在 `untrusted_app` 域，带 zygote seccomp 过滤器；
 - 主线程回到 Looper 后阻塞在 `epoll_pwait`；
-- 有一个名为 `kclf-sleeper` 的 Java 线程每 50ms 做一次 `nanosleep`；
+- 有一个名为 `kclf-sleeper` 的 Java 线程每 50ms 做一次 `Thread.sleep`；
+  具体 syscall 由 ART 决定，本次设备实际为 futex；
+- `kclf-idle0`–`kclf-idle3` 阻塞于 pipe read，供四槽排队、取消、wake 和退出测试；
+- `kclf-fp` 在真实 nanosleep 两侧检查 q0/q8/q31、FPCR/FPSR；
+- 另外打包 `libkclfapp_fp.so`（故意改写 FP 状态）与 `libkclfapp_hold.so`
+  （构造函数等待两秒），用于寄存器恢复和 running 生命周期测试；
 - `lib/arm64-v8a/libkclfapp_payload.so` 随 APK 安装到
   `/data/app/~~.../com.kclf.apptest-.../lib/arm64/`，这正是 app linker
   namespace 允许的路径；
@@ -26,6 +31,31 @@ powershell -ExecutionPolicy Bypass -File kpms\kclf\test\app\build.ps1 `
 ```
 
 产物：`build/kclf-apptest/app.apk`。
+
+构建目录中的 `debug.keystore` 会复用，不再每次重建密钥，保证同一输出目录
+构建的 APK 能通过 `adb install -r -t` 更新而不丢数据。每次使用独立 work 目录，
+失败时保留编译诊断，不递归删除用户指定的输出目录。SO 使用 16K ELF 段对齐；
+这不等于已经在 16K 页设备实测。
+
+## 自动完整回归
+
+```powershell
+$KclfKey = Read-Host 'KernelPatch superkey'
+./kpms/kclf/test/app/device-test.ps1 -SuperKey $KclfKey -Serial '<SERIAL>' `
+  -Apk '<absolute APK path>' -Repeat 100
+```
+
+脚本安装测试 APK，测试普通应用主线程 / Java sleeper / Binder / native probe，
+校验 payload marker 的 PID/TID、FPSIMD、正常驻留、dlclose、缺失/截断 SO 错误恢复、
+四槽排队与取消、重复请求、连续加载卸载、完成未 reap / 排队中 / 构造函数中
+force-stop 后旧进程消失与新进程启动、RX/guard/临时映射完整回收，以及 busy quiesce / reload。
+最后核对 boot ID、SELinux、crash buffer 和内核告警，安全排空并卸载测试模块。
+
+每轮证据保存在 `build/kclf-app-<runid>/`。脚本不清空 logcat/dmesg、不修改
+SELinux/seccomp、不触碰其他 App；结束后保留测试 APK、marker 和最终测试进程。
+测试前不能已经加载同名 kclf，以免卸载用户原有模块。
+
+本次完整回归及 100 轮连续测试结果见 [当前审计](../../COMPATIBILITY_1.3.1.md)。
 
 ## 手工验证
 
@@ -56,8 +86,12 @@ adb shell run-as com.kclf.apptest cat /data/user/0/com.kclf.apptest/files/hit_<P
 
 ```sh
 adb shell am force-stop com.kclf.apptest
-adb shell am start -W -n com.kclf.apptest/.MainActivity   # 应在数百 ms 内 COLD 完成
+adb shell am start -W -n com.kclf.apptest/.MainActivity   # Status: ok，核对旧 PID 已消失、新 PID 不同
 ```
+
+本次设备可能在 `am start` 前由 ActivityManager 预先创建替代进程，从而报告
+`LaunchState: WARM`。这不等于旧进程没有退出；自动测试直接检查 `/proc/<旧PID>`
+消失和 PID 更换，不以 UI 启动分类代替进程生命周期验证。
 
 验证 `unload`：
 

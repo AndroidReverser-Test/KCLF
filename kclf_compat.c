@@ -9,9 +9,25 @@
 
 int kclf_regs_size;
 int kclf_btf_ok;
-int kclf_vma_start_off = 0;
-int kclf_vma_end_off = 8;
+int kclf_vma_start_off = -1;
+int kclf_vma_end_off = -1;
 int kclf_mmap_lock_off = -1;
+int kclf_vma_direct;
+int kclf_wake_supported;
+
+struct mm_struct *kclf_task_mm(struct task_struct *task)
+{
+    struct mm_struct *mm;
+
+    if (!task) return 0;
+    if (kclf_mm_off > 0)
+        return __atomic_load_n((struct mm_struct **)((char *)task + kclf_mm_off), __ATOMIC_ACQUIRE);
+    /* Older KP hosts do not discover task_struct.mm without BTF. Use the
+     * kernel accessor instead of scanning an unknown task allocation. */
+    mm = kclf_ks.get_task_mm(task);
+    if (mm) kclf_ks.mmput_async(mm);
+    return mm;
+}
 
 int kclf_scnprintf(char *out, int size, const char *fmt, ...)
 {
@@ -47,10 +63,13 @@ int kclf_compat_init(void)
     unsigned long end = kclf_lookup("__stop_BTF");
     struct kclf_btf b;
     struct mm_struct *mm;
-    int off;
+    int valid;
 
     /* Supported ABI family, not a promise for every vendor configuration. */
     if (kver < VERSION(5, 0, 0) || kver >= VERSION(7, 0, 0)) return -EOPNOTSUPP;
+    /* Upstream 5.8 already has the integer TWA_SIGNAL ABI. Older bool
+     * implementations only understand RESUME=1. Do not pass 2 to those. */
+    kclf_wake_supported = kver >= VERSION(5, 8, 0);
     if (start && end) {
         const struct kclf_btf_type *t;
         if (end <= start || end - start > 64 * 1024 * 1024 || kclf_btf_open(&b, (const void *)start, end - start))
@@ -58,42 +77,40 @@ int kclf_compat_init(void)
         kclf_mm_off = kclf_btf_member_range(&b, "task_struct", "mm", 8, 8);
         kclf_vma_start_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_start", 8, 8);
         kclf_vma_end_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_end", 8, 8);
-        if (kclf_mm_off <= 0 || kclf_vma_start_off < 0 || kclf_vma_end_off < 0 ||
-            kclf_vma_start_off == kclf_vma_end_off)
-            return -EOPNOTSUPP;
         t = kclf_btf_find(&b, "rw_semaphore", 0);
-        if (!t || t->size < 16 || t->size > 512) return -EOPNOTSUPP;
-        kclf_mmap_lock_off = kclf_btf_member_range(&b, "mm_struct", "mmap_lock", t->size, 8);
-        if (kclf_mmap_lock_off < 0) kclf_mmap_lock_off = kclf_btf_member_range(&b, "mm_struct", "mmap_sem", t->size, 8);
-        if (kclf_mmap_lock_off < 0) return -EOPNOTSUPP;
+        if (t && t->size >= 16 && t->size <= 512) {
+            kclf_mmap_lock_off = kclf_btf_member_range(&b, "mm_struct", "mmap_lock", t->size, 8);
+            if (kclf_mmap_lock_off < 0)
+                kclf_mmap_lock_off = kclf_btf_member_range(&b, "mm_struct", "mmap_sem", t->size, 8);
+        }
         t = kclf_btf_find(&b, "pt_regs", 0);
-        if (!t || t->size < 288 || t->size > 512 || (t->size & 15) ||
+        if (t && (t->size < 288 || t->size > 512 || (t->size & 15) ||
             kclf_btf_member_offset(&b, "pt_regs", "regs") != 0 || kclf_btf_member_offset(&b, "pt_regs", "sp") != 248 ||
             kclf_btf_member_offset(&b, "pt_regs", "pc") != 256 ||
             kclf_btf_member_offset(&b, "pt_regs", "pstate") != 264 ||
             kclf_btf_member_offset(&b, "pt_regs", "orig_x0") != 272 ||
-            kclf_btf_member_offset(&b, "pt_regs", "syscallno") != 280)
+            kclf_btf_member_offset(&b, "pt_regs", "syscallno") != 280))
             return -EOPNOTSUPP;
-        kclf_regs_size = t->size;
+        if (t) kclf_regs_size = t->size;
         kclf_btf_ok = 1;
     }
-    if (kclf_mm_off <= 0) kclf_mm_off = task_struct_offset.mm_offset;
-    if (kclf_mm_off <= 0 || kclf_mm_off > 0x4000 || (kclf_mm_off & 7)) return -EOPNOTSUPP;
-    /* Verify even KP-supplied offsets against an accessor, never blind-scan
-     * beyond an unknown task_struct allocation. */
+    /* Old hosts can export a shorter task_struct_offset table. Do not read
+     * newer fields from that host object: no BTF means accessor-only mm. */
+    if (kclf_mm_off <= 0 || kclf_mm_off > 0x4000 || (kclf_mm_off & 7)) kclf_mm_off = -1;
+    /* Cross-check a BTF-derived offset against the kernel's own accessor. */
     mm = kclf_ks.get_task_mm(current);
     if (!mm) return -ESRCH;
-    off = kclf_task_mm(current) == mm;
+    valid = kclf_mm_off > 0 && kclf_task_mm(current) == mm;
     kclf_ks.mmput_async(mm);
-    if (!off) return -EOPNOTSUPP;
+    if (!valid) kclf_mm_off = -1;
 
-    if (kclf_mmap_lock_off >= 0) {
-        if (!kclf_ks.down_read || !kclf_ks.up_read) return -EOPNOTSUPP;
-    } else if (!kclf_ks.mmap_read_lock || !kclf_ks.mmap_read_unlock) {
-        logke("kclf: no BTF mmap_lock offset or callable mmap_read_lock pair\n");
-        return -EOPNOTSUPP;
-    }
-    logki("kclf: kernel=%x btf=%d mm=%d mmap_lock=%d regs=%d\n", kver, kclf_btf_ok, kclf_mm_off, kclf_mmap_lock_off,
-          kclf_regs_size);
+    /* With no verified VMA/lock layout, procfs provides a kernel-locked VMA
+     * iterator. No mmap_sem offsets or rb-tree/maple-tree internals are guessed. */
+    kclf_vma_direct = kclf_btf_ok && kclf_vma_start_off >= 0 && kclf_vma_end_off >= 0 &&
+                      kclf_vma_start_off != kclf_vma_end_off && kclf_ks.find_vma &&
+                      ((kclf_mmap_lock_off >= 0 && kclf_ks.down_read && kclf_ks.up_read) ||
+                       (kclf_mmap_lock_off < 0 && kclf_ks.mmap_read_lock && kclf_ks.mmap_read_unlock));
+    logki("kclf: kernel=%x btf=%d mm=%d mmap_lock=%d regs=%d vma=%s\n", kver, kclf_btf_ok, kclf_mm_off,
+          kclf_mmap_lock_off, kclf_regs_size, kclf_vma_direct ? "locked" : "proc_maps");
     return 0;
 }

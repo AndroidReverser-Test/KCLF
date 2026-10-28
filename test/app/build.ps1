@@ -16,13 +16,17 @@ param(
     [string]$OutDir = ''
 )
 
-$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Stop'
 
 function Fail([string]$Message) { throw $Message }
 function Run([string]$Exe, [string[]]$ArgList, [string]$What) {
-    & $Exe @ArgList 2>&1 | Out-Null
-    $Code = $LASTEXITCODE
-    if ($Code -ne 0) { Fail "$What failed (rc=$Code): $Exe" }
+    $Saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $Output = & $Exe @ArgList 2>&1
+        $Code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $Saved }
+    if ($Code -ne 0) { Fail "$What failed (rc=$Code): $Exe`n$($Output -join "`n")" }
 }
 
 if (-not $SdkRoot) {
@@ -45,7 +49,8 @@ if (-not (Test-Path $AndroidJar)) { Fail "android.jar not found: $AndroidJar" }
 
 if (-not $BuildTools) {
     $BuildTools = Get-ChildItem (Join-Path $SdkRoot 'build-tools') -Directory |
-        Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName
+        Where-Object { $_.Name -match '^\d+(\.\d+){1,3}$' } |
+        Sort-Object { [version]$_.Name } | Select-Object -Last 1 -ExpandProperty FullName
     if (-not $BuildTools) { Fail "No build-tools under $SdkRoot\build-tools" }
 }
 $Aapt2 = Join-Path $BuildTools 'aapt2.exe'
@@ -58,7 +63,8 @@ foreach ($Tool in @($Aapt2, $D8, $ZipAlign, $ApkSigner)) {
 
 if (-not $NdkRoot) {
     $NdkRoot = Get-ChildItem (Join-Path $SdkRoot 'ndk') -Directory |
-        Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName
+        Where-Object { $_.Name -match '^\d+(\.\d+){1,3}$' } |
+        Sort-Object { [version]$_.Name } | Select-Object -Last 1 -ExpandProperty FullName
     if (-not $NdkRoot) { Fail "No NDK under $SdkRoot\ndk" }
 }
 $Clang = Join-Path $NdkRoot 'toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang.cmd'
@@ -69,8 +75,9 @@ if (-not $OutDir) {
 }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $OutDir = (Resolve-Path $OutDir).Path
-$Work = Join-Path $OutDir 'work'
-Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
+# A fresh staging directory avoids recursively deleting a user-selected path
+# (or following a stale work-directory junction). Keep failed-build evidence.
+$Work = Join-Path $OutDir ('work-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force (Join-Path $Work 'classes'), (Join-Path $Work 'dex'), (Join-Path $Work 'obj') | Out-Null
 
 Write-Host "SDK=$SdkRoot platform=$Platform build-tools=$BuildTools"
@@ -82,19 +89,30 @@ $ClassFiles = @(Get-ChildItem (Join-Path $Work 'classes') -Recurse -Filter *.cla
 Run $D8 (@('--lib', $AndroidJar, '--min-api', '26', '--output', (Join-Path $Work 'dex')) + $ClassFiles) 'd8'
 
 Run $Clang @('-Wall', '-Wextra', '-Werror', '-O2', '-shared', '-fPIC',
-    (Join-Path $PSScriptRoot 'jni\host.c'), '-o', (Join-Path $Work 'obj\libkclfhost.so')) 'host clang'
+    '-Wl,-z,max-page-size=16384', (Join-Path $PSScriptRoot 'jni\host.c'), (Join-Path $PSScriptRoot '..\fpsimd.S'),
+    '-o', (Join-Path $Work 'obj\libkclfhost.so')) 'host clang'
 Run $Clang @('-Wall', '-Wextra', '-Werror', '-O2', '-shared', '-fPIC',
-    (Join-Path $PSScriptRoot 'jni\payload.c'), '-o', (Join-Path $Work 'obj\libkclfapp_payload.so')) 'payload clang'
+    '-Wl,-z,max-page-size=16384', (Join-Path $PSScriptRoot 'jni\payload.c'), '-o', (Join-Path $Work 'obj\libkclfapp_payload.so')) 'payload clang'
+Run $Clang @('-Wall', '-Wextra', '-Werror', '-O2', '-shared', '-fPIC', '-DKCLF_APP_CLOBBER_FP=1',
+    '-Wl,-z,max-page-size=16384', (Join-Path $PSScriptRoot 'jni\payload.c'), '-o', (Join-Path $Work 'obj\libkclfapp_fp.so')) 'FP payload clang'
+Run $Clang @('-Wall', '-Wextra', '-Werror', '-O2', '-shared', '-fPIC', '-DKCLF_APP_DEFAULT_HOLD_MS=2000',
+    '-Wl,-z,max-page-size=16384', (Join-Path $PSScriptRoot 'jni\payload.c'), '-o', (Join-Path $Work 'obj\libkclfapp_hold.so')) 'hold payload clang'
 
-$KeyStore = Join-Path $Work 'debug.keystore'
-Run 'keytool' @('-genkeypair', '-keystore', $KeyStore, '-storepass', 'android', '-keypass', 'android',
-    '-alias', 'androiddebugkey', '-dname', 'CN=Android Debug,O=Android,C=US',
-    '-keyalg', 'RSA', '-validity', '10000') 'keytool'
+$KeyStore = Join-Path $OutDir 'debug.keystore'
+$LegacyKeyStore = Join-Path $OutDir 'work\debug.keystore'
+if (-not (Test-Path -LiteralPath $KeyStore)) {
+    if (Test-Path -LiteralPath $LegacyKeyStore) {
+        Copy-Item -LiteralPath $LegacyKeyStore -Destination $KeyStore
+    } else {
+        Run 'keytool' @('-genkeypair', '-keystore', $KeyStore, '-storepass', 'android', '-keypass', 'android',
+            '-alias', 'androiddebugkey', '-dname', 'CN=Android Debug,O=Android,C=US',
+            '-keyalg', 'RSA', '-validity', '10000') 'keytool'
+    }
+}
 
 $BaseApk = Join-Path $Work 'base.apk'
 $AlignedApk = Join-Path $Work 'aligned.apk'
 $FinalApk = Join-Path $OutDir 'app.apk'
-Remove-Item -Force $BaseApk, $AlignedApk, $FinalApk -ErrorAction SilentlyContinue
 Run $Aapt2 @('link', '--manifest', (Join-Path $PSScriptRoot 'AndroidManifest.xml'),
     '-I', $AndroidJar, '--min-sdk-version', '26', '--target-sdk-version', '35',
     '-o', $BaseApk) 'aapt2 link'
@@ -105,18 +123,21 @@ try {
     foreach ($Pair in @(
         @('classes.dex', (Join-Path $Work 'dex\classes.dex')),
         @('lib/arm64-v8a/libkclfhost.so', (Join-Path $Work 'obj\libkclfhost.so')),
+        @('lib/arm64-v8a/libkclfapp_fp.so', (Join-Path $Work 'obj\libkclfapp_fp.so')),
+        @('lib/arm64-v8a/libkclfapp_hold.so', (Join-Path $Work 'obj\libkclfapp_hold.so')),
         @('lib/arm64-v8a/libkclfapp_payload.so', (Join-Path $Work 'obj\libkclfapp_payload.so')))) {
         $Entry = $Zip.CreateEntry($Pair[0], [System.IO.Compression.CompressionLevel]::Optimal)
         $In = [System.IO.File]::OpenRead($Pair[1])
         try {
             $Out = $Entry.Open()
-            $In.CopyTo($Out)
-            $Out.Dispose()
+            try { $In.CopyTo($Out) } finally { $Out.Dispose() }
         } finally { $In.Dispose() }
     }
 } finally { $Zip.Dispose() }
 
 Run $ZipAlign @('-f', '4', $BaseApk, $AlignedApk) 'zipalign'
 Run $ApkSigner @('sign', '--ks', $KeyStore, '--ks-pass', 'pass:android', '--key-pass', 'pass:android',
-    '--out', $FinalApk, $AlignedApk) 'apksigner'
+    '--out', (Join-Path $Work 'signed.apk'), $AlignedApk) 'apksigner'
+Run $ApkSigner @('verify', (Join-Path $Work 'signed.apk')) 'apksigner verify'
+Copy-Item -LiteralPath (Join-Path $Work 'signed.apk') -Destination $FinalApk -Force
 Write-Host "built $FinalApk"

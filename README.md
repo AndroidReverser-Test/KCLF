@@ -1,4 +1,10 @@
-# KCLF 1.3.0
+# KCLF 1.3.1
+
+1.3.1 补齐无 BTF 的内核路径：`get_task_mm` accessor + 目标上下文 proc maps
+迭代器；开启 upstream 5.8–5.10 已有的 `TWA_SIGNAL`，兼容旧 procfs `read` ABI。
+当前 Android 12 / 5.10.66 / ARM64 / 4K 设备已完成普通 App 全流程与 native 回归。
+没有新增包名、UID、签名、授权名单等注入策略限制；原有架构/状态检查保持不变。
+完整变更、审计和验证边界见 [1.3.1 审计](COMPATIBILITY_1.3.1.md)。
 
 KCLF 是一个 ARM64 Android 的 KernelPatch 模块：在目标线程下一次返回用户态时重定向
 `pt_regs`，用一小段 EL0 trampoline 调用目标自己的动态链接器加载 SO，再通过 `getpid`
@@ -39,7 +45,9 @@ adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf sym
 ```
 
 `probe` 会打印内核版本、BTF 布局、`pt_regs` 大小、页大小、wake 能力和 hook 状态。
-不同厂商内核如果没有可验证的 BTF/结构偏移或必需符号，模块会拒绝加载，而不是猜偏移。
+有 BTF 时验证结构偏移；没有 BTF 时通过内核 accessor 和目标自身的
+`/proc/thread-self/maps` 读取，不猜结构偏移。无 BTF 的 `pt_regs` 大小由实际
+getpid wrapper 帧学习。必需符号/宿主能力仍需满足。
 
 ## 控制接口
 
@@ -63,7 +71,7 @@ adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf inject,<tid>,/path/to/lib.s
 | 选项 | 含义 |
 | --- | --- |
 | 默认（`resume`） | 用 `TWA_RESUME` 排队，等目标自然返回用户态；适合会周期性进内核的线程 |
-| `wake` | 用 `TWA_SIGNAL` 通知目标（5.11+），可打断 `epoll_pwait`/`futex`/`ioctl`/`nanosleep` 等阻塞；会改变被中断系统调用的时序 |
+| `wake` | 用 `TWA_SIGNAL` 通知目标（upstream 5.8+），可打断 `epoll_pwait`/`futex`/`ioctl`/`nanosleep` 等阻塞；会改变被中断系统调用的时序 |
 | `force` | 跳过 linker/系统调用白名单启发式；不绕过 32 位、SVE/SME、跟踪器等硬性拒绝 |
 | `unload` | 构造函数返回后调用 `__loader_dlclose`/`dlclose` |
 
@@ -83,8 +91,8 @@ adb shell ls /proc/<pid>/task
 ```
 
 主线程的 tid 等于 pid，通常阻塞在 `epoll_pwait` 的 Looper 中；注入主线程时使用
-`wake`。也可以选择 binder 线程（`ioctl`）、`kclf-sleeper` 这类周期性 `nanosleep`
-线程（默认 `resume` 即可）。
+`wake`。也可以选择 binder 线程（`ioctl`）、`kclf-sleeper` 这类周期性休眠
+线程（默认 `resume` 即可；Java `Thread.sleep` 的底层 syscall 由 ART 决定）。
 
 普通应用进程有两点与自有 native 测试进程不同：
 
@@ -135,9 +143,11 @@ adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf status
 
 ### 4. payload 约束
 
-构造函数在目标线程的 `dlopen` 内部执行，此时 linker 锁已被持有：
+构造函数在目标线程的 `dlopen` 内部执行。AOSP bionic 的 linker 使用递归锁，
+不能断言同线程再次 `dlopen`/`dlsym`/`dlclose` 必然自死锁；但是异步插入点的
+用户态锁、重入与跨线程等待仍未被框架证明安全。
+参见 [AOSP linker 锁实现](https://android.googlesource.com/platform/bionic/+/refs/heads/main/linker/dlfcn.cpp)。
 
-* 不要在构造函数里再次 `dlopen`/`dlsym`/`dlclose`（会自死锁）；
 * 不要依赖 JNI/Java 线程状态、不要调用 `JNIEnv`（注入线程不一定是 Java 线程）；
 * 不要长时间阻塞、不要在构造函数里等待其他线程；
 * payload 只能链接目标 app 命名空间可见的系统库；自包含的 native 代码最稳；
@@ -173,8 +183,8 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
    随最后使用者退出。
 9. **没有宿主 exit-veto**：卸载安全性依赖控制端先 `quiesce` 排空；模块 exit 的
    `-EBUSY` 在 stock 宿主上不会被尊重。
-10. **没有覆盖所有内核**：BTF/符号/结构布局必须可验证；5.x、其他 6.x、16K/64K 页
-    仅有源码适配，未在本设备矩阵外实测。
+10. **没有覆盖所有内核**：1.3.1 已在无 BTF 的 5.10.66 上实测；其他 5.x、6.x、
+    16K/64K 页仍需同一产物的真机回归。旧 1.3.0 的 6.1 记录不是 1.3.1 验收结果。
 
 ## 测试
 
@@ -193,6 +203,9 @@ $KclfKey = Read-Host 'KernelPatch superkey'
 
 ```sh
 python3 kpms/kclf/test/test_helpers.py
+python3 kpms/kclf/test/test_maps.py
+python3 kpms/kclf/test/test_compat.py
+# 可选：末尾传入保存的 vmlinux BTF 文件，验证其真实布局选择
 gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
   kpms/kclf/test/test_btf.c -o /tmp/kclf-test-btf
 /tmp/kclf-test-btf
@@ -200,6 +213,7 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 
 ## 文档
 
-- [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)：1.3.0 的实现、兼容性、设备结果与限制。
+- [COMPATIBILITY_1.3.1.md](COMPATIBILITY_1.3.1.md)：当前修改、设备测试、兼容矩阵与未验证项。
+- [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)：1.3.0 的历史实现、兼容性、设备结果与限制。
 - `IMPLEMENTATION.md`、`HARDENING.md`、`OBSERVABILITY_AUDIT.md`：历史版本资料，
   不代表 1.3.0；其中关于宿主补丁、seccomp 拒绝和默认行为的段落已过时。
