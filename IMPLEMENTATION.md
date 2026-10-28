@@ -3,6 +3,8 @@
 > 版本说明（2026-10-28）：以下保留 1.1 阶段的实现与历史测试记录，不再描述当前源码。
 > 1.2.0 的结构布局、取消 ABI、寄存器保护、11 页映射、卸载规则和设备结果见
 > [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)。下文“当前”均指当时版本。
+> 1.3.0 增加了普通 64 位 app 支持（seccomp、pending signal、VMA 上限、不长期持有 mm），
+> 并删除了全部 KernelPatch 宿主补丁；本文中依赖宿主排空/exit-veto 的段落已过时。
 
 本文描述 `kpms/kclf` 当前的实际实现（代码即事实），包括触发链、寄存器处理、
 用户态 trampoline ABI、错误模型、可观测性分析与已知限制。

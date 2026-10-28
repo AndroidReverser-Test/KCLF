@@ -75,8 +75,8 @@ int main(int argc, char **argv)
     }
 
     if (getenv("KCLF_TEST_SECCOMP")) {
-        /* Allow every syscall. KCLF must still reject the filtered thread,
-         * since it cannot safely prove arbitrary completion filters benign. */
+        /* Allow every syscall, including the getpid completion trap. KCLF must
+         * accept a seccomp-filtered target instead of refusing every app. */
         struct sock_filter instructions[] = { BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW) };
         struct sock_fprog program = { .len = 1, .filter = instructions };
         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program)) {

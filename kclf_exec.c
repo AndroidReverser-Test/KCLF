@@ -30,7 +30,10 @@
 #define KCLF_O_RDONLY 0
 
 #define KCLF_USER_MAX kclf_user_limit
-#define KCLF_MAX_VMA 2048
+/* Ordinary Android app processes routinely have well over two thousand VMAs
+ * (graphics, JIT, profile buffers, binder). The walk stops as soon as the
+ * linker, libdl and libc are known, so this is a safety bound, not a cost. */
+#define KCLF_MAX_VMA 16384
 #define KCLF_MAX_DYN 512
 #define KCLF_MAX_SYM 200000
 
@@ -737,7 +740,10 @@ static int kclf_regs_sane(struct pt_regs *regs, u64 stack_top)
 {
     if (!kclf_regs_basic(regs, stack_top)) return 0;
     if (regs->syscallno < -1 || regs->syscallno > 600) return 0;
-    if (regs->syscallno >= 0 && regs->syscallno != (s32)regs->regs[8]) return 0;
+    /* Do not require syscallno == regs[8]: when a real signal was delivered
+     * before task_work ran, the frame is a signal-handler entry and the
+     * register file no longer has a 1:1 syscall-number/x8 relationship. The
+     * frame address itself is exact (BTF-validated or learned from getpid). */
     return 1;
 }
 
@@ -755,12 +761,21 @@ static struct pt_regs *kclf_find_regs(void)
 }
 
 /* Heuristic only: syscall numbers cannot prove that a userspace lock is not
- * held. Use an application-controlled idle point for reliable loading. */
+ * held. Use an application-controlled idle point for reliable loading.
+ *
+ * The list is deliberately biased towards calls an application thread blocks
+ * in (epoll/ppoll/futex/ioctl/nanosleep/read) plus cheap metadata calls. That
+ * is what makes injecting an already running app practical: the return
+ * boundary we get after a "wake" is normally the interrupted blocking call.
+ * It does not make the payload safe to run at an arbitrary protocol point;
+ * see README for the app-side constraints. */
 static int kclf_syscall_safe(s32 nr)
 {
     switch (nr) {
+    case 7: /* poll */
     case 22: /* epoll_pwait */
-    case 29: /* ioctl */
+    case 23: /* select */
+    case 29: /* ioctl (binder and most driver traffic) */
     case 35: /* unlinkat */
     case 61: /* getdents64 */
     case 62: /* lseek */
@@ -768,14 +783,17 @@ static int kclf_syscall_safe(s32 nr)
     case 64: /* write */
     case 65: /* readv */
     case 66: /* writev */
+    case 72: /* pselect6 */
     case 73: /* ppoll */
     case 79: /* newfstatat */
     case 80: /* fstat */
     case 82: /* fsync */
+    case 98: /* futex (ART monitors, pthread mutexes, condvars) */
     case 101: /* nanosleep */
     case 115: /* clock_nanosleep */
     case 124: /* sched_yield */
     case 135: /* rt_sigprocmask */
+    case 137: /* rt_sigtimedwait */
     case 172: /* getpid */
     case 174: /* getuid */
     case 178: /* gettid */
@@ -788,6 +806,7 @@ static int kclf_syscall_safe(s32 nr)
     case 243: /* recvmmsg */
     case 269: /* sendmmsg */
     case 441: /* epoll_pwait2 */
+    case 449: /* futex_waitv */
         return 1;
     default:
         return 0;
@@ -810,17 +829,20 @@ int kclf_exec_hijack(struct kclf_req *r)
     }
     tif = __atomic_load_n(&current_thread_info()->flags, __ATOMIC_RELAXED);
     /* FPSIMD is preserved by the trampoline, but SVE/SME scalable state is
-     * not. Reject it even with force. Real pending signals are never ignored. */
+     * not. Reject it even with force. Real pending signals are handled by the
+     * exception return path; they are not ignored (see README). */
     if ((tif & _TIF_SVE) || (kver >= VERSION(5, 19, 0) && (tif & (1UL << TIF_SME)))) {
         kclf_set_err(r, "SVE/SME target state unsupported");
         return -EOPNOTSUPP;
     }
-    if (tif & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL)) return -EAGAIN;
 
-    /* A tracer or seccomp filter can consume/alter the completion syscall.
-     * Do not redirect a thread unless the return channel is under our control. */
-    if (tif & (_TIF_SECCOMP | _TIF_SYSCALL_TRACE | _TIF_SYSCALL_EMU | _TIF_SINGLESTEP | _TIF_UPROBE)) {
-        kclf_set_err(r, "seccomp/traced target unsupported");
+    /* A tracer or syscall emulator can consume/alter the completion syscall,
+     * so do not redirect a thread while one is attached. A seccomp filter is
+     * *not* a refusal: ordinary Android app processes always have the zygote
+     * filter installed, and its policy allows the completion syscall. A filter
+     * that kills/errno's that syscall is outside the supported contract. */
+    if (tif & (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_EMU | _TIF_SINGLESTEP | _TIF_UPROBE)) {
+        kclf_set_err(r, "traced/emulated target unsupported");
         return -EOPNOTSUPP;
     }
 

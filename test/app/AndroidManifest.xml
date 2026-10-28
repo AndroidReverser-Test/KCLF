@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Throwaway target for KCLF's ordinary-app tests. Not a product sample. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.kclf.apptest">
+
+    <application
+        android:label="KCLF AppTest"
+        android:debuggable="true"
+        android:extractNativeLibs="true"
+        android:hasCode="true">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

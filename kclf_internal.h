@@ -29,7 +29,7 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.2.0"
+#define KCLF_VER "1.3.0"
 
 #define KCLF_MAX_REQ 4
 #define KCLF_CODE_MAX 512 /* trampoline blob upper bound */
@@ -177,6 +177,7 @@ struct kclf_syms
     void (*mmap_read_unlock)(struct mm_struct *mm);
     void (*down_read)(void *sem);
     void (*up_read)(void *sem);
+    void (*msleep)(unsigned int msecs);
 };
 
 extern struct kclf_syms kclf_ks;

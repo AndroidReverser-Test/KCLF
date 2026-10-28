@@ -191,6 +191,7 @@ int kclf_sym_lookup_all(void)
     kclf_ks.up_read = (typeof(kclf_ks.up_read))kclf_lookup("up_read");
     kclf_ks.mmap_read_lock = (typeof(kclf_ks.mmap_read_lock))kclf_lookup("mmap_read_lock");
     kclf_ks.mmap_read_unlock = (typeof(kclf_ks.mmap_read_unlock))kclf_lookup("mmap_read_unlock");
+    kclf_ks.msleep = (typeof(kclf_ks.msleep))kclf_lookup("msleep");
 
     if (missing) {
         logke("kclf: kernel symbol missing: %s\n", missing);
@@ -259,7 +260,11 @@ static void kclf_work_cleanup(struct callback_head *head);
 
 static void kclf_slot_reset(struct kclf_req *r)
 {
-    if (r->mm) kclf_ks.mmput_async((struct mm_struct *)r->mm);
+    /* The target mm is deliberately NOT pinned for the request lifetime.
+     * Holding mm_users after the target exits defers exit_mmap(), which in
+     * turn defers binder VMA teardown and makes ActivityManager wait for a
+     * process that is already gone ("refused to die"). The (pinned) struct pid
+     * keeps the PID identity stable; callbacks verify current->mm instead. */
     if (r->pid_ref) kclf_ks.put_pid(r->pid_ref);
     memset(r, 0, sizeof(*r));
     kclf_state_store(r, KCLF_IDLE);
@@ -304,7 +309,18 @@ struct kclf_req *kclf_slot_by_task(struct task_struct *task)
     int i;
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
-        if (kclf_state_load(r) == KCLF_RUNNING && r->run_task == (u64)task) return r;
+        if (kclf_state_load(r) != KCLF_RUNNING || r->run_task != (u64)task) continue;
+        /* A reused task_struct address must not be mistaken for the thread
+         * that actually runs the trampoline: the pinned struct pid is the
+         * authoritative identity. */
+        if (r->pid_ref) {
+            struct task_struct *owner;
+            kclf_rcu_read_lock();
+            owner = kclf_ks.pid_task(r->pid_ref, 0);
+            kclf_rcu_read_unlock();
+            if (owner != task) continue;
+        }
+        return r;
     }
     return 0;
 }
@@ -575,6 +591,8 @@ static void kclf_status_line(char *out, int outlen, int *off, struct kclf_req *r
     *off += kclf_scnprintf(out + *off, outlen - *off, "#%d id=%llu pid=%d(%s) state=%s stage=%s", i,
                            (unsigned long long)r->id, r->pid, r->comm, kclf_state_name(kclf_state_load(r)),
                            kclf_stage_name(r->stage));
+    if (kclf_state_load(r) == KCLF_ARMED && r->j_queued && kclf_now() - r->j_queued > 1000000000ULL)
+        *off += kclf_scnprintf(out + *off, outlen - *off, " hint=blocked(use wake)");
     if (__atomic_load_n(&r->pending, __ATOMIC_ACQUIRE) || r->completing) {
         *off += kclf_scnprintf(out + *off, outlen - *off, " pending=%d\n", r->pending);
         return;
@@ -698,6 +716,9 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
     r->pid = (pid_t)pid;
     r->pid_ref = pid_ref;
     r->mm = (u64)mm;
+    /* Only the address-space identity is needed; release the temporary
+     * reference immediately so a later target exit is not held up. */
+    kclf_ks.mmput_async(mm);
     r->task = (u64)task;
     r->flags = flags;
     r->stage = KCLF_ST_QUEUE;
@@ -1009,21 +1030,55 @@ static long kclf_init(const char *args, const char *event, void *reserved)
     return 0;
 }
 
-static long kclf_exit(void *reserved)
+/* Module text is only safe to release when no callback can enter it and no
+ * trampoline is still executing. A leftover transient mapping (no callback)
+ * is a leak, not a use-after-free. */
+static int kclf_exit_unsafe(void)
 {
     int i;
-    (void)reserved;
-    /* Older KP loaders ignore this return value! On those loaders the
-     * controller MUST obtain quiesce=idle before requesting unload. There is
-     * no safe finite timeout for an arbitrary user constructor. */
-    if (__atomic_load_n(&kclf_control_busy, __ATOMIC_ACQUIRE) || kclf_has_work()) {
-        logke("kclf: unsafe unload refused; quiesce and drain first (requires KP exit-veto support)\n");
-        return -EBUSY;
+    for (i = 0; i < KCLF_MAX_REQ; i++) {
+        struct kclf_req *r = &kclf_reqs[i];
+        int st = kclf_state_load(r);
+        if (st == KCLF_IDLE) continue;
+        if (st == KCLF_RUNNING || st == KCLF_PREPARING || st == KCLF_READY) return 1;
+        if (r->busy || r->completing || __atomic_load_n(&r->pending, __ATOMIC_ACQUIRE)) return 1;
     }
+    return 0;
+}
+
+static long kclf_exit(void *reserved)
+{
+    int i, tries, unsafe;
+
+    (void)reserved;
+    /* The stock KernelPatch loader frees the module even if this callback
+     * returns an error, so the controller MUST obtain quiesce=idle first.
+     * What we can do here is cancel queued work and wait a bounded time for
+     * in-flight callbacks. The syscall hook is removed unconditionally: on a
+     * stock host the alternative is a global getpid hook pointing at freed
+     * module text. A task_work callback that is still queued cannot be fixed
+     * from here; quiesce/drain is the only safe path. */
     kclf_unloading = 1;
+    for (i = 0; i < KCLF_MAX_REQ; i++) {
+        struct kclf_req *r = &kclf_reqs[i];
+        if (kclf_state_load(r) == KCLF_ARMED && kclf_cancel_work(r, &r->work_prepare)) {
+            kclf_fail(r, KCLF_CANCELLED, KCLF_ST_QUEUE, -ECANCELED, "module unload");
+            __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+        }
+    }
+    for (tries = 0; tries < 200 && kclf_exit_unsafe(); tries++) {
+        if (!kclf_ks.msleep) break;
+        kclf_ks.msleep(10);
+    }
+    unsafe = __atomic_load_n(&kclf_control_busy, __ATOMIC_ACQUIRE) || kclf_exit_unsafe();
     if (kclf_hook_ok) {
         unhook_syscalln(KCLF_COMPLETION_NR, kclf_getpid_before, kclf_getpid_after);
         kclf_hook_ok = 0;
+    }
+    if (unsafe) {
+        logke("kclf: unload with live callbacks; hook removed, but stock KP frees module text. "
+              "Quiesce and drain before unload.\n");
+        return -EBUSY;
     }
     for (i = 0; i < KCLF_MAX_REQ; i++)
         kclf_slot_reset(&kclf_reqs[i]);

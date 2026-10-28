@@ -16,8 +16,17 @@ $Targets = [Collections.Generic.List[int]]::new()
 $Loaded = $false
 
 function Invoke-Adb([string[]]$Arguments, [switch]$AllowFailure) {
-    $Output = & $Adb -s $Serial @Arguments 2>&1
-    $Code = $LASTEXITCODE
+    # Windows PowerShell 5.1 turns native stderr into terminating errors when
+    # ErrorActionPreference is Stop; adb writes progress there. Keep the call
+    # non-terminating and decide from the exit code below.
+    $Saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $Output = & $Adb -s $Serial @Arguments 2>&1
+        $Code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $Saved
+    }
     $Text = ($Output | ForEach-Object { "$_" }) -join "`n"
     if ($Code -ne 0 -and -not $AllowFailure) { throw "adb rc=$Code : $Text" }
     return @{ Text = $Text; Code = $Code }
@@ -132,8 +141,8 @@ try {
     Start-Sleep -Milliseconds 200
     Check ((Root "cat $Remote/seccomp.log") -match 'seccomp-test-ready') 'isolated allow-all seccomp filter installed on test target only'
     Inject $Filtered | Out-Null
-    Check ((Await-State 'state=failed') -match 'seccomp/traced target unsupported') 'filtered target rejected with cleanup and no diversion'
-    Check ((Root "if [ -f $Remote/hit_$Filtered ]; then echo hit; else echo absent; fi") -eq 'absent') 'filtered target never ran constructor'
+    Check ((Await-State 'state=done') -match 'via=') 'seccomp-filtered target completes through its own policy'
+    Check ((Root "cat $Remote/hit_$Filtered") -match "pid=$Filtered ") 'seccomp-filtered constructor independently witnessed'
     Ctl 'reap' | Out-Null
 
     Inject $Normal '' "$Remote/missing.so" | Out-Null
@@ -188,7 +197,7 @@ try {
     Stop-Target $KilledLoader
     Start-Sleep -Milliseconds 500
     Ctl 'reap' | Out-Null
-    Check ((Ctl 'status').Text -match 'no requests[\s\S]*loading=0') 'target exits inside loader; loading count and mm reference reclaimed'
+    Check ((Ctl 'status').Text -match 'no requests[\s\S]*loading=0') 'target exits inside loader; loading count and request slot reclaimed'
 
     $Holding = Start-Target 'hold'
     Inject $Holding ',unload' | Out-Null

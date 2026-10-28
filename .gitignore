@@ -1,3 +1,10 @@
 # Intermediate files only; this nested repository already tracks test binaries.
 *.o
 *.d
+
+# test/app build products
+test/app/app.apk
+test/app/classes/
+test/app/dex/
+test/app/obj/
+test/app/*.keystore
