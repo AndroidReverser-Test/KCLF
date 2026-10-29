@@ -2,8 +2,12 @@
 #ifndef KCLF_MAPS_H
 #define KCLF_MAPS_H
 
+/* The maps line buffer is bounded; a longer line is consumed but its pathname
+ * suffix is truncated. Namespace selection only needs the stable prefix. */
+#define KCLF_MAPS_LINE 512
+#define KCLF_MAPS_PATH 256
+
 /* Portable parser for the address prefix of /proc/thread-self/maps.
- * Pathnames are deliberately ignored (including arbitrarily long names).
  * Caller supplies uint64_t and a NUL-terminated prefix. */
 static int kclf_maps_hex(const char **cursor, uint64_t *value)
 {
@@ -36,6 +40,26 @@ static int kclf_maps_range(const char *line, uint64_t limit, uint64_t *start, ui
         return -1;
     *start = first;
     *end = last;
+    return 0;
+}
+
+/* Extract the optional pathname from a maps line:
+ *   start-end perms offset dev inode [pathname]
+ * Anonymous mappings have no pathname. The result is always NUL-terminated and
+ * empty when the pathname is absent or does not start at '/'. */
+static int kclf_maps_path(const char *line, char *out, unsigned int capacity)
+{
+    unsigned int field, i;
+
+    if (!capacity) return -1;
+    out[0] = 0;
+    for (field = 0; field < 5; field++) {
+        while (*line && *line != ' ') line++;
+        while (*line == ' ') line++;
+    }
+    if (*line != '/') return 0;
+    for (i = 0; i + 1 < capacity && line[i]; i++) out[i] = line[i];
+    out[i] = 0;
     return 0;
 }
 #endif

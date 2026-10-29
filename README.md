@@ -1,6 +1,6 @@
-# KCLF 1.4.0
+# KCLF 1.4.1
 
-1.4.0 默认使用 **manual 手动 ELF 加载后端**：由模块完成文件快照、映射、符号解析、
+1.4.0 起默认使用 **manual 手动 ELF 加载后端**：由模块完成文件快照、映射、符号解析、
 重定位、权限/RELRO 和驻留生命周期管理，目标线程只执行 IFUNC resolver、构造/析构
 及必要的直接 syscall。框架不再依赖目标用户态的 `dlopen`、`dlsym`、`dlclose` 或
 `android_dlopen_ext`；payload 仍可正常导入和使用系统库。
@@ -9,6 +9,18 @@
 不支持的 ELF 特性会明确失败，不自动回退。旧后端通过 `,linker` 显式启用。
 使用方式、实现细节及兼容边界见 [手动加载说明](MANUAL_LOADER.md)。这不是完整 bionic
 linker 的替代品；导入 IFUNC 时仍需执行提供库中的 resolver，不能称为“零系统函数调用”。
+
+1.4.1 修复了真实 App 目标上的两个 manual 后端缺陷：
+
+* 同名 `DT_NEEDED`（典型是 Android 12 中四份 `libc++.so`）不再一律报
+  `ambiguous loaded SONAME`。提供库按映射路径确定加载来源，再按
+  “同路径/同目录/同 APEX/同分区/平台默认”选择；仍无法区分的不同来源会明确失败。
+* IFUNC 所需 `AT_HWCAP`/`AT_HWCAP2` 改由内核 `cpu_get_elf_hwcap()` 读取，不再
+  依赖非 dumpable App 读不到的 `/proc/thread-self/auxv`；旧 auxv 路径仅作后备。
+
+`/data/local/tmp/libtest.so` 注入 `com.miHoYo.Nap` 已实测通过，构造函数输出
+`Perfare : start dump.....`。这次实测、失败分析和 payload 侧的
+`/proc/self/mem` 限制见 [2026-10-29 libtest 实测](LIBTEST_NAP_20261029.md)。
 
 1.3.1 已补齐无 BTF 的内核路径：`get_task_mm` accessor + 目标上下文 proc maps
 迭代器；开启 upstream 5.8–5.10 已有的 `TWA_SIGNAL`，兼容旧 procfs `read` ABI。
@@ -220,8 +232,12 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
    `-EBUSY` 在 stock 宿主上不会被尊重。
 10. **手动加载不是完整动态链接器**：拒绝 payload TLS、payload IFUNC/IRELATIVE、
     textrel、GNU property 等未实现 ABI；不保证 C++ 异常展开、JNI 自动初始化和跨 DSO CFI。
-    不复现 linker namespace / 全局符号插入顺序。详见手动加载说明。
-11. **没有覆盖所有内核**：1.4.0 已在无 BTF 的 Android 12 / 5.10.66 / 4K 上实测；
+    依赖选择使用映射路径的来源启发式（同目录/APEX/分区/平台默认），不是对 bionic
+    namespace 与全局符号插入顺序的完整重建；同名不同来源且无法区分时明确失败。
+11. **不绕过 non-dumpable/ptrace 策略**：App 被系统标记为 non-dumpable 时，
+    `/proc/self/auxv`、`/proc/self/mem` 对 App 自身凭据也可能是 `EACCES`。框架用
+    内核 accessor 解决自己的 `AT_HWCAP` 需求，但不会替 payload 打开这些文件。
+12. **没有覆盖所有内核**：1.4.1 已在无 BTF 的 Android 12 / 5.10.66 / 4K 上实测；
     其他 5.x、6.x、16K/64K 页仍需同一产物的真机回归。历史版本结果不是当前版本验收。
 
 ## 测试
@@ -234,6 +250,11 @@ try {
   python kpms/kclf/test/manual-device-test.py --adb '<ADB>' --serial '<SERIAL>' --clang '<NDK clang>' --app
 } finally { Remove-Item Env:KCLF_SUPERKEY }
 ```
+
+用户提供 SO 的真实 App 实测（2026-10-29，manual 后端，`libtest.so` →
+`com.miHoYo.Nap`）的完整命令、Perfare 输出和失败分析见
+[LIBTEST_NAP_20261029.md](LIBTEST_NAP_20261029.md)；驱动和证据在
+`build/kclf-libtest-20261029-final/`。
 
 历史 native 回归已显式选择 `linker` 后端（默认返回点、wake、unload、seccomp、取消、目标退出、映射回收、
 reload/unload 等）：
@@ -270,6 +291,7 @@ python3 kpms/kclf/test/test_helpers.py
 python3 kpms/kclf/test/test_maps.py
 python3 kpms/kclf/test/test_compat.py
 python3 kpms/kclf/test/test_manual_elf.py
+python3 kpms/kclf/test/test_provider.py
 # 可选：末尾传入保存的 vmlinux BTF 文件，验证其真实布局选择
 gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
   kpms/kclf/test/test_btf.c -o /tmp/kclf-test-btf
@@ -278,7 +300,9 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 
 ## 文档
 
-- [MANUAL_LOADER.md](MANUAL_LOADER.md)：1.4.0 手动加载、边界、生命周期与验证记录。
+- [MANUAL_LOADER.md](MANUAL_LOADER.md)：1.4.1 手动加载、依赖来源选择、边界与验证记录。
+- [LIBTEST_NAP_20261029.md](LIBTEST_NAP_20261029.md)：libtest.so 注入
+  com.miHoYo.Nap 的实测、两个缺陷的根因、Perfare 输出与 payload 侧限制。
 - [COMPATIBILITY_1.3.1.md](COMPATIBILITY_1.3.1.md)：历史内核兼容修改、设备测试与未验证项。
 - [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)：1.3.0 的历史实现、兼容性、设备结果与限制。
 - `IMPLEMENTATION.md`、`HARDENING.md`、`OBSERVABILITY_AUDIT.md`：历史版本资料，

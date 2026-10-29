@@ -200,6 +200,9 @@ int kclf_sym_lookup_all(void)
     kclf_ks.mmap_read_lock = (typeof(kclf_ks.mmap_read_lock))kclf_lookup("mmap_read_lock");
     kclf_ks.mmap_read_unlock = (typeof(kclf_ks.mmap_read_unlock))kclf_lookup("mmap_read_unlock");
     kclf_ks.msleep = (typeof(kclf_ks.msleep))kclf_lookup("msleep");
+    /* Optional: older arm64 kernels may not expose the accessor symbols. */
+    kclf_ks.cpu_get_elf_hwcap = (typeof(kclf_ks.cpu_get_elf_hwcap))kclf_lookup("cpu_get_elf_hwcap");
+    kclf_ks.cpu_get_elf_hwcap2 = (typeof(kclf_ks.cpu_get_elf_hwcap2))kclf_lookup("cpu_get_elf_hwcap2");
 
     if (missing) {
         logke("kclf: kernel symbol missing: %s\n", missing);

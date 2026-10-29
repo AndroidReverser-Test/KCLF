@@ -410,6 +410,7 @@ struct kclf_vma
 {
     u64 start;
     u64 end;
+    char path[KCLF_MAPS_PATH];
 };
 
 struct kclf_vma_iter
@@ -423,12 +424,16 @@ struct kclf_vma_iter
     char buffer[512];
 };
 
-static long kclf_vma_iter_open(struct kclf_vma_iter *it, struct mm_struct *mm, u64 user_buffer)
+/* force_proc selects the procfs iterator even when the direct mm/VMA walker is
+ * available. The manual loader needs pathnames for namespace-aware dependency
+ * selection, and procfs is the only portable place to obtain them. */
+static long kclf_vma_iter_open(struct kclf_vma_iter *it, struct mm_struct *mm, u64 user_buffer,
+                               int force_proc)
 {
     memset(it, 0, sizeof(*it));
     it->mm = mm;
     it->user_buffer = user_buffer;
-    if (!kclf_vma_direct) {
+    if (force_proc || !kclf_vma_direct) {
         if (!kclf_ks.vfs_read) return -ENOSYS;
         /* This callback is current in the target mount/PID namespace. procfs
          * owns the VMA locking and handles both rb-tree and maple-tree kernels.
@@ -466,11 +471,12 @@ static long kclf_vma_next(struct kclf_vma_iter *it, struct kclf_vma *out)
         out->end = *(u64 *)((char *)vma + kclf_vma_end_off);
         kclf_mmap_read_unlock(it->mm);
         if (out->end <= out->start || out->end <= it->addr || out->end > KCLF_USER_MAX) return -EFAULT;
+        out->path[0] = 0;
         it->addr = out->end;
         return 1;
     }
     for (;;) {
-        char prefix[48];
+        char line[KCLF_MAPS_LINE];
         unsigned int n = 0;
         for (;;) {
             char c;
@@ -493,10 +499,11 @@ static long kclf_vma_next(struct kclf_vma_iter *it, struct kclf_vma *out)
             }
             c = it->buffer[it->offset++];
             if (c == '\n') break;
-            if (n < sizeof(prefix) - 1) prefix[n++] = c;
+            if (n < sizeof(line) - 1) line[n++] = c;
         }
-        prefix[n] = 0;
-        if (kclf_maps_range(prefix, KCLF_USER_MAX, &out->start, &out->end)) return -EINVAL;
+        line[n] = 0;
+        if (kclf_maps_range(line, KCLF_USER_MAX, &out->start, &out->end)) return -EINVAL;
+        if (kclf_maps_path(line, out->path, sizeof(out->path))) return -EINVAL;
         if (out->end <= it->addr) continue;
         it->addr = out->end;
         return 1;
@@ -506,7 +513,7 @@ static long kclf_vma_next(struct kclf_vma_iter *it, struct kclf_vma *out)
 static long kclf_vma_at(struct mm_struct *mm, u64 addr, struct kclf_vma *out, u64 user_buffer)
 {
     struct kclf_vma_iter it;
-    long rc = kclf_vma_iter_open(&it, mm, user_buffer);
+    long rc = kclf_vma_iter_open(&it, mm, user_buffer, 0);
     int i;
 
     if (rc) return rc;
@@ -520,16 +527,22 @@ static long kclf_vma_at(struct mm_struct *mm, u64 addr, struct kclf_vma *out, u6
     return rc > 0 ? 0 : (rc ? rc : -ENOENT);
 }
 
-int kclf_walk_vmas(u64 scratch, int (*visit)(u64, void *), void *context)
+int kclf_walk_vmas(u64 scratch, int (*visit)(u64, const char *, void *), void *context)
 {
     struct kclf_vma_iter it;
     struct kclf_vma vma;
-    int i, rc = (int)kclf_vma_iter_open(&it, kclf_task_mm(current), scratch);
+    struct mm_struct *mm = kclf_task_mm(current);
+    int i, rc;
+    if (!mm) return -ESRCH;
+    /* Pathnames come from procfs. The direct walker remains a fallback for
+     * kernels where the target's maps file cannot be opened. */
+    rc = (int)kclf_vma_iter_open(&it, mm, scratch, 1);
+    if (rc && kclf_vma_direct) rc = (int)kclf_vma_iter_open(&it, mm, scratch, 0);
     if (rc) return rc;
     for (i = 0; i < KCLF_MAX_VMA; i++) {
         rc = (int)kclf_vma_next(&it, &vma);
         if (rc <= 0) break;
-        rc = visit(vma.start, context);
+        rc = visit(vma.start, vma.path, context);
         if (rc) break;
     }
     kclf_vma_iter_close(&it);
@@ -552,7 +565,7 @@ static long kclf_resolve(struct kclf_req *r)
     memset(&ldr, 0, sizeof(ldr));
     memset(&dl, 0, sizeof(dl));
     memset(&libc, 0, sizeof(libc));
-    rc = kclf_vma_iter_open(&it, mm, r->param_addr);
+    rc = kclf_vma_iter_open(&it, mm, r->param_addr, 0);
     if (rc) {
         kclf_set_err(r, "open target maps failed rc=%ld", rc);
         return rc;
@@ -1093,6 +1106,12 @@ int kclf_exec_probe(char *out, int outlen)
     off += kclf_scnprintf(out + off, outlen - off, "cancel=%s user_io=access_process_vm wake=%s quiescing=%d\n",
                           kclf_ks.task_work_cancel_match ? "match" : "func",
                           kclf_wake_supported ? "task_work_signal" : "unsupported", kclf_unloading);
+    if (kclf_ks.cpu_get_elf_hwcap)
+        off += kclf_scnprintf(out + off, outlen - off, "hwcap=%llx hwcap2=%llx source=kernel\n",
+                              (unsigned long long)kclf_ks.cpu_get_elf_hwcap(),
+                              (unsigned long long)(kclf_ks.cpu_get_elf_hwcap2 ? kclf_ks.cpu_get_elf_hwcap2() : 0));
+    else
+        off += kclf_scnprintf(out + off, outlen - off, "hwcap=auxv-fallback (target must be dumpable)\n");
     if (!kclf_regs_size)
         off +=
             kclf_scnprintf(out + off, outlen - off, "run a native getpid syscall to learn pt_regs before injection\n");

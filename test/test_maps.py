@@ -80,14 +80,16 @@ int main(void) {
     strcpy(text, "1000-2000 r-xp 00000000 00:00 0 ");
     size_t n = strlen(text);
     memset(text + n, 'x', 3000); /* path longer than every buffer */
-    strcpy(text + n + 3000, "\n3000-4000 rw-p 0 00:00 0\n5000-6000 ---p 0 00:00 0"); /* no final newline */
+    strcpy(text + n + 3000, "\n3000-4000 rw-p 0 00:00 0 /system/lib64/libc.so\n5000-6000 ---p 0 00:00 0"); /* no final newline */
     const size_t chunks[] = {1, 2, 7, 31, 47, 48, 511, 512};
     for (unsigned int c = 0; c < sizeof(chunks) / sizeof(chunks[0]); c++) {
         chunk = chunks[c];
-        assert(!kclf_vma_iter_open(&it, &mm, (uintptr_t)scratch));
+        assert(!kclf_vma_iter_open(&it, &mm, (uintptr_t)scratch, 0));
         for (unsigned int i = 0; i < 3; i++) {
             assert(kclf_vma_next(&it, &v) == 1);
             assert(v.start == vmas[i].start && v.end == vmas[i].end);
+            if (i == 1) assert(!strcmp(v.path, "/system/lib64/libc.so"));
+            else assert(!v.path[0]);
         }
         assert(!kclf_vma_next(&it, &v));
         kclf_vma_iter_close(&it);
@@ -110,7 +112,7 @@ int main(void) {
     assert(opened == closed);
     puts("maps errors remain errors, never mistaken for successful reclamation: PASS");
     kclf_vma_direct = 1;
-    assert(!kclf_vma_iter_open(&it, &mm, 0));
+    assert(!kclf_vma_iter_open(&it, &mm, 0, 0));
     for (unsigned int i = 0; i < 3; i++) {
         assert(kclf_vma_next(&it, &v) == 1 && !locks);
         assert(v.start == vmas[i].start && v.end == vmas[i].end);

@@ -29,7 +29,7 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.4.0"
+#define KCLF_VER "1.4.1"
 
 #define KCLF_MAX_REQ 4
 #define KCLF_CODE_MAX 1024 /* trampoline blob upper bound */
@@ -193,6 +193,10 @@ struct kclf_syms
     void (*down_read)(void *sem);
     void (*up_read)(void *sem);
     void (*msleep)(unsigned int msecs);
+    /* AArch64 ELF_HWCAP accessors. The target may be non-dumpable, so its
+     * /proc/<pid>/auxv can be unreadable even from its own credentials. */
+    u64 (*cpu_get_elf_hwcap)(void);
+    u64 (*cpu_get_elf_hwcap2)(void);
 };
 
 extern struct kclf_syms kclf_ks;
@@ -220,7 +224,7 @@ int kclf_exec_probe(char *out, int outlen);
 int kclf_exec_init(void);
 int kclf_urds(u64 addr, void *buf, int len);
 int kclf_uwr(u64 addr, const void *buf, int len);
-int kclf_walk_vmas(u64 scratch, int (*visit)(u64, void *), void *context);
+int kclf_walk_vmas(u64 scratch, int (*visit)(u64, const char *, void *), void *context);
 /* 0 only when the process identity disappeared or demonstrably exec'd. */
 int kclf_process_mm_alive(struct pid *pid, u64 mm);
 

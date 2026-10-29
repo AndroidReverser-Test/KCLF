@@ -38,7 +38,11 @@ struct kclf_manual_image {
     u64 linker_base, linker_end;
 };
 
-struct km_provider { struct ke_object object; char name[KE_NAME]; };
+struct km_provider {
+    struct ke_object object;
+    char name[KE_NAME]; /* DT_SONAME */
+    char path[KCLF_PATH_MAX]; /* maps pathname: namespace/load-origin evidence */
+};
 struct km_context {
     struct kclf_req *r;
     struct ke_io io;
@@ -107,11 +111,12 @@ static int own_mapping(u64 mm, u64 address)
     return found;
 }
 
-static int collect(u64 address, void *context)
+static int collect(u64 address, const char *path, void *context)
 {
     struct km_context *c = context;
     struct ke_io quiet = c->io;
     struct ke_object *o = &c->candidate;
+    struct km_provider *provider;
     u32 magic;
     unsigned i;
     char name[KE_NAME];
@@ -124,8 +129,15 @@ static int collect(u64 address, void *context)
     if (ke_open(&quiet, address, o, 0) || !o->soname || ke_string(&quiet, o, o->soname, name)) return 0;
     for (i = 0; i < c->nproviders; i++) if (c->providers[i].object.bias == o->bias) return 0;
     if (c->nproviders == KM_PROVIDERS) { report(c, "provider scan limit exceeded", ""); return -E2BIG; }
-    memcpy(&c->providers[c->nproviders].object, o, sizeof(*o));
-    memcpy(c->providers[c->nproviders++].name, name, strlen(name) + 1);
+    provider = &c->providers[c->nproviders];
+    memset(provider, 0, sizeof(*provider));
+    memcpy(&provider->object, o, sizeof(*o));
+    memcpy(provider->name, name, strlen(name) + 1);
+    if (path && *path) {
+        strncpy(provider->path, path, sizeof(provider->path) - 1);
+        provider->path[sizeof(provider->path) - 1] = 0;
+    }
+    c->nproviders++;
     if (!strcmp(name, "ld-android.so")) {
         c->r->ld.linker_base = o->bias + o->low;
         c->r->ld.linker_end = o->bias + o->high;
@@ -133,19 +145,135 @@ static int collect(u64 address, void *context)
     return 0;
 }
 
-static int add_needed(struct km_context *c, const struct ke_object *o)
+/* Loaded providers are chosen with the same origin-first idea bionic uses for
+ * a namespace's local group. A plain global SONAME table cannot distinguish
+ * e.g. the four libc++.so copies that Android 12 keeps for different APEX
+ * namespaces; the mapping pathname identifies the load origin. */
+static int same_dir(const char *a, const char *b)
+{
+    const char *as = 0, *bs = 0, *p;
+    if (!a || !b || !*a || !*b) return 0;
+    for (p = a; *p; p++) if (*p == '/') as = p;
+    for (p = b; *p; p++) if (*p == '/') bs = p;
+    if (!as || !bs || as - a != bs - b) return 0;
+    return !memcmp(a, b, (size_t)(as - a));
+}
+
+static int same_apex(const char *a, const char *b)
+{
+    const char *ae, *be;
+    if (!a || !b || strncmp(a, "/apex/", 6) || strncmp(b, "/apex/", 6)) return 0;
+    a += 6; b += 6;
+    for (ae = a; *ae && *ae != '/'; ae++);
+    for (be = b; *be && *be != '/'; be++);
+    return ae - a == be - b && !memcmp(a, b, (size_t)(ae - a));
+}
+
+static int same_partition(const char *a, const char *b)
+{
+    const char *ae, *be;
+    if (!a || !b || *a != '/' || *b != '/') return 0;
+    /* APEX modules are separate namespaces even though they share /apex.
+     * /data is a filesystem root, not a shared load origin: /data/local/tmp
+     * must not be treated as related to an app's private library directory. */
+    if (!strncmp(a, "/apex/", 6) || !strncmp(b, "/apex/", 6)) return 0;
+    if (!strncmp(a, "/data/", 6) || !strncmp(b, "/data/", 6)) return 0;
+    for (ae = a + 1; *ae && *ae != '/'; ae++);
+    for (be = b + 1; *be && *be != '/'; be++);
+    return ae - a == be - b && !memcmp(a, b, (size_t)(ae - a));
+}
+
+static unsigned common_prefix(const char *a, const char *b)
+{
+    unsigned n = 0;
+    while (a[n] && a[n] == b[n] && n < 4095) n++;
+    return n;
+}
+
+static int vendor_origin(const char *path)
+{
+    return !strncmp(path, "/vendor/", 8) || !strncmp(path, "/odm/", 5);
+}
+
+/* Higher score means a closer load origin. The bands leave room for the
+ * common-prefix tie-breaker inside each class. */
+static int provider_score(const char *importer, const struct km_provider *p)
+{
+    if (!importer || !*importer || !p->path[0]) return 0;
+    if (!strcmp(importer, p->path)) return 1000000;
+    if (same_dir(importer, p->path)) return 800000;
+    if (same_apex(importer, p->path)) return 600000;
+    if (same_partition(importer, p->path)) return 400000;
+    /* Vendor/ODM namespaces normally link against the VNDK APEX, not the
+     * platform's /system copy of the same SONAME. */
+    if (vendor_origin(importer) && !strncmp(p->path, "/apex/com.android.vndk.", 23)) return 300000;
+    if (!strncmp(p->path, "/system/", 8) || !strncmp(p->path, "/system_ext/", 12) ||
+        !strncmp(p->path, "/product/", 9)) return 200000;
+    if (!strncmp(p->path, "/apex/com.android.runtime/", 26)) return 150000;
+    return (int)common_prefix(importer, p->path);
+}
+
+static int in_scope(const struct km_context *c, unsigned index)
+{
+    unsigned i;
+    for (i = 0; i < c->nscope; i++) if (c->scope[i] == index) return 1;
+    return 0;
+}
+
+static int select_provider(struct km_context *c, const char *importer, const char *name)
+{
+    int best = -1, best_score = -1, distinct = 0;
+    const char *best_path = 0;
+    unsigned j;
+    for (j = 0; j < c->nproviders; j++) {
+        const struct km_provider *p = &c->providers[j];
+        int score;
+        if (strcmp(p->name, name)) continue;
+        if (!p->path[0]) {
+            /* No mapping pathname (direct-VMA fallback). A single candidate
+             * is still unambiguous; multiple ones cannot be distinguished. */
+            if (best < 0) {
+                best = (int)j;
+                best_score = 0;
+                best_path = p->path;
+                distinct = 0;
+            } else if (best_score <= 0) {
+                distinct = 1;
+            }
+            continue;
+        }
+        score = provider_score(importer, p);
+        if (score > best_score) {
+            best = (int)j;
+            best_score = score;
+            best_path = p->path;
+            distinct = 0;
+        } else if (score == best_score) {
+            if (strcmp(best_path, p->path)) distinct = 1;
+            else if (!in_scope(c, (unsigned)best) && in_scope(c, j)) best = (int)j;
+        }
+    }
+    if (best < 0) {
+        report(c, "DT_NEEDED is not already loaded", name);
+        return -ENOENT;
+    }
+    if (distinct) {
+        report(c, "ambiguous loaded SONAME (no namespace match)", name);
+        return -EEXIST;
+    }
+    return best;
+}
+
+static int add_needed(struct km_context *c, const struct ke_object *o, const char *importer)
 {
     unsigned i, j;
     for (i = 0; i < o->nneeded; i++) {
         char name[KE_NAME];
-        int found = -1;
+        int found;
         if (ke_string(&c->io, o, o->needed[i], name)) return -ENOEXEC;
         if (!name[0]) return -ENOEXEC;
-        for (j = 0; j < c->nproviders; j++) if (!strcmp(c->providers[j].name, name)) {
-            if (found >= 0) { report(c, "ambiguous loaded SONAME", name); return -EEXIST; }
-            found = (int)j;
-        }
-        if (found < 0) { report(c, "DT_NEEDED is not already loaded", name); return -ENOENT; }
+        found = select_provider(c, importer, name);
+        if (found < 0) return found;
         for (j = 0; j < c->nscope; j++) if (c->scope[j] == (unsigned)found) break;
         if (j < c->nscope) continue;
         if (c->nscope == KM_SCOPE) return -E2BIG;
@@ -243,8 +371,22 @@ static int read_hwcap(struct km_context *c)
     loff_t pos = 0;
     unsigned i;
     int ended = 0, got_hwcap = 0, rc = 0;
+    /* AT_HWCAP is a CPU/kernel property, identical for every AArch64 process.
+     * Prefer the kernel accessors: Android marks app processes non-dumpable,
+     * which makes even /proc/thread-self/auxv root-owned and unreadable with
+     * the target's own credentials. */
+    if (kclf_ks.cpu_get_elf_hwcap) {
+        c->r->hwcap = kclf_ks.cpu_get_elf_hwcap();
+        c->r->hwcap2 = kclf_ks.cpu_get_elf_hwcap2 ? kclf_ks.cpu_get_elf_hwcap2() : 0;
+        return 0;
+    }
     f = kclf_ks.filp_open("/proc/thread-self/auxv", 0, 0);
-    if (!f || (unsigned long)f >= (unsigned long)-4095) return -ENOENT;
+    if (!f) { report(c, "cannot open target auxv", ""); return -ENOENT; }
+    if ((unsigned long)f >= (unsigned long)-4095) {
+        rc = (int)(long)f;
+        report(c, "cannot open target auxv (credentials/non-dumpable)", "");
+        return rc;
+    }
     for (i = 0; i < 128; i++) {
         u64 pair[2];
         /* The real target buffer also works with legacy procfs ->read. */
@@ -445,6 +587,7 @@ out:
 long kclf_manual_prepare(struct kclf_req *r)
 {
     struct km_context *c = 0;
+    const char *step = "initialization";
     int rc;
     unsigned i;
     if (!kclf_ks.vmalloc || !kclf_ks.vfree || !kclf_ks.vfs_llseek || !kclf_ks.get_task_pid) {
@@ -464,37 +607,50 @@ long kclf_manual_prepare(struct kclf_req *r)
         return 0;
     }
     c = allocate(sizeof(*c));
-    if (!c) return -ENOMEM;
+    if (!c) {
+        kclf_set_err(r, "manual: allocation of preparation context failed");
+        return -ENOMEM;
+    }
     c->r = r;
     c->io = (struct ke_io){c, kclf_user_limit, user_read, user_write, report, defer_ifunc};
-    if ((rc = read_snapshot(c)) || (rc = map_image(c))) goto out;
+    if ((rc = read_snapshot(c))) { step = "file snapshot"; goto out; }
+    if ((rc = map_image(c))) { step = "ELF mapping"; goto out; }
     r->image->nodelete = !!(c->object.flags1 & 8);
     if (r->image->nodelete && (r->flags & KCLF_F_UNLOAD)) {
-        report(c, "DT_FLAGS_1 NODELETE conflicts with unload", ""); rc = -EOPNOTSUPP; goto out;
+        report(c, "DT_FLAGS_1 NODELETE conflicts with unload", ""); rc = -EOPNOTSUPP; step = "NODELETE policy"; goto out;
     }
-    if ((rc = kclf_walk_vmas(r->param_addr, collect, c))) goto out;
+    if ((rc = kclf_walk_vmas(r->param_addr, collect, c))) { step = "target mapping scan"; goto out; }
     r->image->linker_base = r->ld.linker_base;
     r->image->linker_end = r->ld.linker_end;
-    if ((rc = add_needed(c, &c->object))) goto out;
-    /* Breadth-first DT_NEEDED closure, with stable order and cycle detection. */
-    for (i = 0; i < c->nscope; i++) if ((rc = add_needed(c, &c->providers[c->scope[i]].object))) goto out;
+    if ((rc = add_needed(c, &c->object, r->path))) { step = "payload dependency lookup"; goto out; }
+    /* Breadth-first DT_NEEDED closure, with stable order and cycle detection.
+     * Each edge is resolved using the importing library's load origin. */
+    for (i = 0; i < c->nscope; i++) {
+        const struct km_provider *p = &c->providers[c->scope[i]];
+        if ((rc = add_needed(c, &p->object, p->path))) { step = "transitive dependency lookup"; goto out; }
+    }
     c->values = allocate((unsigned long)c->object.symcount * sizeof(u64));
     c->resolved = allocate(c->object.symcount);
-    if (!c->values || !c->resolved) { rc = -ENOMEM; goto out; }
-    if ((rc = ke_relocate(&c->io, &c->object, resolve_import, c))) goto out;
-    if (r->ifunc_count && (rc = read_hwcap(c))) goto out;
-    if ((rc = prepare_calls(c)) || (rc = protect_image(c))) goto out;
+    if (!c->values || !c->resolved) { rc = -ENOMEM; step = "relocation table allocation"; goto out; }
+    if ((rc = ke_relocate(&c->io, &c->object, resolve_import, c))) { step = "symbol resolution/relocation"; goto out; }
+    if (r->ifunc_count && (rc = read_hwcap(c))) { step = "IFUNC HWCAP read"; goto out; }
+    if ((rc = prepare_calls(c))) { step = "initializer/finalizer validation"; goto out; }
+    if ((rc = protect_image(c))) { step = "segment protection/RELRO"; goto out; }
     {
         u64 offset = KCLF_P_SIZE + (r->init_count + r->fini_count) * 8;
         if (offset + r->ifunc_count * 24 + r->protect_count * 16 > (u64)kclf_page_size) {
-            rc = -E2BIG; report(c, "initializer/IFUNC metadata exceeds parameter page", ""); goto out;
+            rc = -E2BIG; report(c, "initializer/IFUNC metadata exceeds parameter page", ""); step = "call metadata"; goto out;
         }
-        if (r->ifunc_count && kclf_uwr(r->param_addr + offset, c->fixups, r->ifunc_count * 24)) { rc = -EFAULT; goto out; }
+        if (r->ifunc_count && kclf_uwr(r->param_addr + offset, c->fixups, r->ifunc_count * 24)) {
+            rc = -EFAULT; step = "IFUNC fixup export"; goto out;
+        }
         offset += r->ifunc_count * 24;
-        if (r->protect_count && kclf_uwr(r->param_addr + offset, c->protections, r->protect_count * 16)) rc = -EFAULT;
+        if (r->protect_count && kclf_uwr(r->param_addr + offset, c->protections, r->protect_count * 16)) {
+            rc = -EFAULT; step = "RELRO metadata export"; goto out;
+        }
     }
 out:
-    if (rc && !r->err[0]) kclf_set_err(r, "manual: ELF preparation failed rc=%d", rc);
+    if (rc && !r->err[0]) kclf_set_err(r, "manual: %s failed rc=%d", step, rc);
     if (c->resolved) kclf_ks.vfree(c->resolved);
     if (c->values) kclf_ks.vfree(c->values);
     if (c->snapshot) kclf_ks.vfree(c->snapshot);
