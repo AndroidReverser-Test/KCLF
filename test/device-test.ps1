@@ -58,7 +58,7 @@ function Start-Target([string]$Mode) {
     return $TargetId
 }
 function Inject([int]$TargetId, [string]$Flags = '', [string]$Library = "$Remote/libkclf_payload.so") {
-    Ctl "inject,$TargetId,$Library$Flags"
+    Ctl "inject,$TargetId,$Library,linker$Flags"
 }
 function Await-State([string]$Expected, [int]$Milliseconds = 10000) {
     $Watch = [Diagnostics.Stopwatch]::StartNew()

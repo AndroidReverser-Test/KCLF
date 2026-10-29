@@ -29,10 +29,10 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.3.1"
+#define KCLF_VER "1.4.0"
 
 #define KCLF_MAX_REQ 4
-#define KCLF_CODE_MAX 512 /* trampoline blob upper bound */
+#define KCLF_CODE_MAX 1024 /* trampoline blob upper bound */
 
 /* mapping layout: [RX code][RW parameter][PROT_NONE guard][RW stack] */
 #define KCLF_STACK_PAGES 8
@@ -63,7 +63,11 @@ enum kclf_stage
 
 #define KCLF_F_FORCE 0x1 /* skip conservative safe point heuristics */
 #define KCLF_F_WAKE 0x4 /* force the target out of an interruptible sleep */
-#define KCLF_F_UNLOAD 0x8 /* dlclose the payload after its constructors ran */
+#define KCLF_F_UNLOAD 0x8 /* release after constructors (backend-specific) */
+#define KCLF_F_LINKER 0x10 /* explicit legacy bionic backend; manual is default */
+#define KCLF_F_RELEASE 0x20 /* release a manual image reference */
+
+struct kclf_manual_image;
 
 /* saved EL0 register file: the part the kernel reloads on exception return */
 struct kclf_regs
@@ -110,6 +114,12 @@ struct kclf_req
     u64 stack_top;
 
     struct kclf_loader ld;
+    struct kclf_manual_image *image; /* transaction; never the sole resident owner */
+    int image_action;
+    u64 image_id, image_addr, image_len;
+    u32 image_refs, init_count, fini_count;
+    u32 ifunc_count, protect_count;
+    u64 hwcap, hwcap2;
 
     /* saved context */
     struct kclf_regs saved;
@@ -162,6 +172,10 @@ struct kclf_syms
     struct pid *(*find_get_pid)(int nr);
     struct task_struct *(*pid_task)(struct pid *pid, int type);
     void (*put_pid)(struct pid *pid);
+    struct pid *(*get_task_pid)(struct task_struct *task, int type);
+    void *(*vmalloc)(unsigned long size);
+    void (*vfree)(const void *ptr);
+    loff_t (*vfs_llseek)(struct file *file, loff_t offset, int whence);
     unsigned long (*vm_mmap)(void *file, unsigned long addr, unsigned long size, unsigned long prot, unsigned long flag,
                              unsigned long offset);
     int (*vm_munmap)(unsigned long start, size_t len);
@@ -204,6 +218,21 @@ void kclf_exec_restore(struct kclf_req *r, struct pt_regs *regs);
 long kclf_exec_finish(struct kclf_req *r, int capture_err);
 int kclf_exec_probe(char *out, int outlen);
 int kclf_exec_init(void);
+int kclf_urds(u64 addr, void *buf, int len);
+int kclf_uwr(u64 addr, const void *buf, int len);
+int kclf_walk_vmas(u64 scratch, int (*visit)(u64, void *), void *context);
+/* 0 only when the process identity disappeared or demonstrably exec'd. */
+int kclf_process_mm_alive(struct pid *pid, u64 mm);
+
+/* manual backend: memory preparation in EL1, initializers exclusively in EL0 */
+long kclf_manual_prepare(struct kclf_req *r);
+void kclf_manual_params(struct kclf_req *r, u8 *params);
+long kclf_manual_finish(struct kclf_req *r);
+void kclf_manual_abandon(struct kclf_req *r);
+void kclf_manual_reap(void);
+int kclf_manual_status(char *out, int length, unsigned start);
+int kclf_manual_busy(void);
+int kclf_manual_shutdown(void);
 
 /* kclf_compat.c: runtime layout, no version-based structure guesses. */
 extern int kclf_regs_size;

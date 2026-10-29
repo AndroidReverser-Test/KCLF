@@ -154,7 +154,7 @@ static int kclf_urd(u64 addr, void *buf, int len)
     return kclf_ks.copy_from_user_nofault(buf, (const void *)addr, len) ? -EFAULT : 0;
 }
 
-static int kclf_urds(u64 addr, void *buf, int len)
+int kclf_urds(u64 addr, void *buf, int len)
 {
     if (kclf_user_tbi) addr &= 0x00ffffffffffffffULL;
     if (len < 0 || !kclf_user_range(addr, (u64)len)) return -EFAULT;
@@ -166,7 +166,7 @@ static int kclf_urds_u32(u64 addr, u32 *out)
     return kclf_urds(addr, out, sizeof(*out));
 }
 
-static int kclf_uwr(u64 addr, const void *buf, int len)
+int kclf_uwr(u64 addr, const void *buf, int len)
 {
     if (kclf_user_tbi) addr &= 0x00ffffffffffffffULL;
     if (!addr || len < 0 || (u64)len > KCLF_USER_MAX || addr > KCLF_USER_MAX - (u64)len) return -1;
@@ -520,6 +520,22 @@ static long kclf_vma_at(struct mm_struct *mm, u64 addr, struct kclf_vma *out, u6
     return rc > 0 ? 0 : (rc ? rc : -ENOENT);
 }
 
+int kclf_walk_vmas(u64 scratch, int (*visit)(u64, void *), void *context)
+{
+    struct kclf_vma_iter it;
+    struct kclf_vma vma;
+    int i, rc = (int)kclf_vma_iter_open(&it, kclf_task_mm(current), scratch);
+    if (rc) return rc;
+    for (i = 0; i < KCLF_MAX_VMA; i++) {
+        rc = (int)kclf_vma_next(&it, &vma);
+        if (rc <= 0) break;
+        rc = visit(vma.start, context);
+        if (rc) break;
+    }
+    kclf_vma_iter_close(&it);
+    return i == KCLF_MAX_VMA ? -E2BIG : rc;
+}
+
 static long kclf_resolve(struct kclf_req *r)
 {
     struct mm_struct *mm = kclf_task_mm(current);
@@ -727,10 +743,12 @@ long kclf_exec_prepare(struct kclf_req *r)
     if (!mm || (u64)mm != r->mm) return -ESRCH;
     if (!kclf_page_size) return -EINVAL;
 
-    rc = kclf_check_library(r->path);
-    if (rc) {
-        kclf_set_err(r, "open library failed rc=%ld", rc);
-        return rc;
+    if (r->flags & KCLF_F_LINKER) {
+        rc = kclf_check_library(r->path);
+        if (rc) {
+            kclf_set_err(r, "open library failed rc=%ld", rc);
+            return rc;
+        }
     }
 
     len = (u64)(3 + KCLF_STACK_PAGES) * kclf_page_size;
@@ -747,7 +765,7 @@ long kclf_exec_prepare(struct kclf_req *r)
     r->param_addr = addr + kclf_page_size;
     r->stack_top = addr + len;
 
-    rc = kclf_resolve(r);
+    rc = (r->flags & KCLF_F_LINKER) ? kclf_resolve(r) : kclf_manual_prepare(r);
     if (rc) {
         if (!r->err[0]) kclf_set_err(r, "resolve loader failed rc=%ld", rc);
         return rc;
@@ -783,7 +801,9 @@ long kclf_exec_prepare(struct kclf_req *r)
     *(u64 *)(pbuf + KCLF_P_COOKIE) = r->cookie;
     *(u32 *)(pbuf + KCLF_P_FLAGS) = KCLF_RTLD_NOW;
     *(u32 *)(pbuf + KCLF_P_UNLOAD) = (r->flags & KCLF_F_UNLOAD) ? 1 : 0;
+    *(u64 *)(pbuf + KCLF_P_USED) = KCLF_P_SIZE;
     strncpy((char *)pbuf + KCLF_P_PATH, r->path, KCLF_PATH_MAX - 1);
+    if (!(r->flags & KCLF_F_LINKER)) kclf_manual_params(r, pbuf);
 
     if (kclf_uwr(r->param_addr, pbuf, sizeof(pbuf))) {
         kclf_set_err(r, "copy parameters failed");
@@ -1023,7 +1043,12 @@ long kclf_exec_finish(struct kclf_req *r, int capture_err)
 {
     long rc = 0;
 
-    if (capture_err && r->err_user) {
+    if (!(r->flags & KCLF_F_LINKER)) {
+        rc = kclf_manual_finish(r);
+        if (rc) return rc;
+    }
+
+    if ((r->flags & KCLF_F_LINKER) && capture_err && r->err_user) {
         if (!kclf_urd_strs(r->err_user, r->err, sizeof(r->err))) {
             r->err[sizeof(r->err) - 1] = 0;
         }

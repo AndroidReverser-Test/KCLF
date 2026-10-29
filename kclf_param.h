@@ -26,7 +26,18 @@
 #define KCLF_P_UNLOAD 0x38 /* u32: call dlclose after a successful load    */
 #define KCLF_P_PATH 0x40 /* char[256]: library path in target namespace  */
 #define KCLF_P_ERRPTR 0x140 /* u64: dlerror() string, read by the kernel    */
-#define KCLF_P_SIZE 0x148
+#define KCLF_P_MANUAL 0x148 /* u32: manual initializer/finalizer dispatch */
+#define KCLF_P_INITV 0x150 /* u64: validated constructor vector */
+#define KCLF_P_INITN 0x158 /* u64: constructor count */
+#define KCLF_P_FINIV 0x160 /* u64: validated finalizer vector (already reversed) */
+#define KCLF_P_FININ 0x168 /* u64: finalizer count */
+#define KCLF_P_USED 0x170 /* u64: bytes to clear, including call vectors */
+#define KCLF_P_IFUNCV 0x178 /* resolver, destination, addend triples */
+#define KCLF_P_IFUNCN 0x180
+#define KCLF_P_IFARG 0x188 /* AArch64 __ifunc_arg_t: size, hwcap, hwcap2 */
+#define KCLF_P_PROTV 0x1a0 /* RELRO address,length pairs, applied after IFUNC */
+#define KCLF_P_PROTN 0x1a8
+#define KCLF_P_SIZE 0x1c0
 
 #define KCLF_PATH_MAX 256
 #define KCLF_ERR_MAX 256

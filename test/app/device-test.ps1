@@ -43,6 +43,8 @@ function Kpm([string[]]$Arguments, [switch]$AllowFailure) {
     return $Result
 }
 function Ctl([string]$Command, [switch]$AllowFailure) {
+    # This historical regression suite asserts bionic linker semantics.
+    if ($Command.StartsWith('inject,')) { $Command += ',linker' }
     Kpm @('ctl0', 'kclf', $Command) -AllowFailure:$AllowFailure
 }
 function Check([bool]$Condition, [string]$Message) {

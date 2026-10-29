@@ -1,13 +1,23 @@
-# KCLF 1.3.1
+# KCLF 1.4.0
 
-1.3.1 补齐无 BTF 的内核路径：`get_task_mm` accessor + 目标上下文 proc maps
+1.4.0 默认使用 **manual 手动 ELF 加载后端**：由模块完成文件快照、映射、符号解析、
+重定位、权限/RELRO 和驻留生命周期管理，目标线程只执行 IFUNC resolver、构造/析构
+及必要的直接 syscall。框架不再依赖目标用户态的 `dlopen`、`dlsym`、`dlclose` 或
+`android_dlopen_ext`；payload 仍可正常导入和使用系统库。
+
+前提是 payload 的全部 `DT_NEEDED`（包括传递依赖）已经加载且保持驻留。缺失依赖或
+不支持的 ELF 特性会明确失败，不自动回退。旧后端通过 `,linker` 显式启用。
+使用方式、实现细节及兼容边界见 [手动加载说明](MANUAL_LOADER.md)。这不是完整 bionic
+linker 的替代品；导入 IFUNC 时仍需执行提供库中的 resolver，不能称为“零系统函数调用”。
+
+1.3.1 已补齐无 BTF 的内核路径：`get_task_mm` accessor + 目标上下文 proc maps
 迭代器；开启 upstream 5.8–5.10 已有的 `TWA_SIGNAL`，兼容旧 procfs `read` ABI。
 当前 Android 12 / 5.10.66 / ARM64 / 4K 设备已完成普通 App 全流程与 native 回归。
 没有新增包名、UID、签名、授权名单等注入策略限制；原有架构/状态检查保持不变。
 完整变更、审计和验证边界见 [1.3.1 审计](COMPATIBILITY_1.3.1.md)。
 
 KCLF 是一个 ARM64 Android 的 KernelPatch 模块：在目标线程下一次返回用户态时重定向
-`pt_regs`，用一小段 EL0 trampoline 调用目标自己的动态链接器加载 SO，再通过 `getpid`
+`pt_regs`，用一小段 EL0 trampoline 执行所选后端的用户态步骤，再通过 `getpid`
 自陷把寄存器完整恢复。它不使用 ptrace、不暂停目标、不安装信号处理器。
 
 1.3.0 起支持**普通 64 位 Android 应用进程**：zygote fork 出来、带 seccomp 过滤器、
@@ -20,7 +30,8 @@ KCLF 是一个 ARM64 Android 的 KernelPatch 模块：在目标线程下一次�
 构建和运行时使用 stock KernelPatch；控制端仍是 `/data/local/tmp/kpatch`（superkey 保护）。
 
 stock 宿主在 `kpm unload` 时即使模块 exit 回调返回错误也会释放模块代码。因此卸载流程
-必须由控制端保证：先 `quiesce`，等 `status` 显示无活动请求且映射已回收，再 `unload`。
+必须由控制端保证：先 `quiesce`，用 `release` 排空手动驻留镜像，等临时映射和回调均已
+回收、再次 `quiesce` 返回 `idle`，再 `unload`。仅 `status` 显示 `no requests` 不够。
 模块自身会在 exit 里尝试取消排队 work、做有限等待并移除完成 hook，但无法替代控制端的
 排空，也无法保护已经排队的 task_work 回调。
 
@@ -53,7 +64,9 @@ getpid wrapper 帧学习。必需符号/宿主能力仍需满足。
 
 ```text
 probe
-inject,<tid>,<absolute-so-path>[,force][,wake][,unload]
+inject,<tid>,<absolute-so-path>[,manual|linker][,force][,wake][,unload]
+images[,cursor]
+release,<tid>,<image-id>[,wake][,force]
 status
 cancel,<slot>
 reap
@@ -70,10 +83,16 @@ adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf inject,<tid>,/path/to/lib.s
 
 | 选项 | 含义 |
 | --- | --- |
+| 默认（`manual`） | 自行加载 ELF，只解析已驻留依赖；不调用 bionic loader API |
+| `linker` | 显式使用旧版 `__loader_dlopen`/`dlopen` 后端 |
 | 默认（`resume`） | 用 `TWA_RESUME` 排队，等目标自然返回用户态；适合会周期性进内核的线程 |
 | `wake` | 用 `TWA_SIGNAL` 通知目标（upstream 5.8+），可打断 `epoll_pwait`/`futex`/`ioctl`/`nanosleep` 等阻塞；会改变被中断系统调用的时序 |
 | `force` | 跳过 linker/系统调用白名单启发式；不绕过 32 位、SVE/SME、跟踪器等硬性拒绝 |
-| `unload` | 构造函数返回后调用 `__loader_dlclose`/`dlclose` |
+| `unload` | manual：新镜像构造后析构并回收；linker：调用 `__loader_dlclose`/`dlclose` |
+
+手动驻留镜像由 `images` 单独列出；如有 `next=N`，继续执行 `images,N`。
+重复加载同一进程的同一完整路径只增加引用，不重跑构造函数。`release` 每次减少一个
+引用，最后一次运行析构并解除映射。`image=<十进制 ID>` 不是可传给 `dlclose` 的句柄。
 
 `status` 里如果请求长时间停在 `armed`，会显示 `hint=blocked(use wake)`：目标线程正在
 睡眠且默认 `resume` 不会主动唤醒它。此时取消后改用 `wake` 重试。
@@ -103,7 +122,11 @@ adb shell ls /proc/<pid>/task
 
 ### 2. 准备 payload 路径
 
-SO 必须同时满足：
+两种后端都要求目标上下文能够读取 SO，且设备策略允许所需的可执行映射。
+manual 额外要求依赖已加载；linker 额外要求通过 app linker namespace 的路径检查。
+手动模式使用匿名镜像，不会调用 linker，也不会绕过文件访问、SELinux 或 seccomp 检查。
+
+对于 **linker 后端**，SO 必须同时满足：
 
 1. 目标 app 的 UID 能读；
 2. 能通过 app linker namespace 的路径检查，并能被映射为可执行；
@@ -120,7 +143,7 @@ SO 必须同时满足：
 以 `android:extractNativeLibs="true"` 安装，会由系统解压到该目录并带上 `apk_data_file`
 标签，这是最省事的方式。
 
-`/data/local/tmp` 对普通 `untrusted_app` 通常不可用。设备实测：`prepare` 可以打开文件，
+旧 linker 后端实测 `/data/local/tmp` 对普通 `untrusted_app` 通常不可用：`prepare` 可以打开文件，
 但 linker 会以 `dlopen failed: ... Permission denied` 拒绝映射，请求会安全失败并清理。
 
 ### 3. 示例
@@ -138,31 +161,41 @@ adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf status
 成功后 `status` 类似：
 
 ```text
-#0 id=1 pid=7844(com.example.app) state=done stage=restore handle=... via=__loader_dlopen
+#0 id=1 pid=7844(com.example.app) state=done stage=restore handle=1 via=manual image=1 refs=1 resident=...+...
 ```
 
 ### 4. payload 约束
 
-构造函数在目标线程的 `dlopen` 内部执行。AOSP bionic 的 linker 使用递归锁，
+manual 的构造函数在目标线程直接执行，不持有 bionic loader 锁；这不意味着被打断的
+线程没有持有其他用户态锁。只支持不依赖 argc/argv/envp 参数的构造函数。
+
+只有 linker 后端的构造函数在 `dlopen` 内部执行。AOSP bionic 的 linker 使用递归锁，
 不能断言同线程再次 `dlopen`/`dlsym`/`dlclose` 必然自死锁；但是异步插入点的
 用户态锁、重入与跨线程等待仍未被框架证明安全。
 参见 [AOSP linker 锁实现](https://android.googlesource.com/platform/bionic/+/refs/heads/main/linker/dlfcn.cpp)。
 
 * 不要依赖 JNI/Java 线程状态、不要调用 `JNIEnv`（注入线程不一定是 Java 线程）；
 * 不要长时间阻塞、不要在构造函数里等待其他线程；
-* payload 只能链接目标 app 命名空间可见的系统库；自包含的 native 代码最稳；
+* manual 的导入从已加载 `DT_NEEDED` 闭包解析，依赖必须始终保持驻留；不要求 payload 无 libc 依赖；
+* linker 后端遵循目标 app 命名空间规则；
 * 需要后台线程时，自行保证线程生命周期与 `unload` 的竞态。
 
 ### 5. 卸载
 
 ```sh
 adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf quiesce
-# 等 status 中所有请求完成/回收，quiesce=idle
+adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf images
+# 按 images 列表选择同进程的存活线程，逐次释放所有引用
+adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf release,<tid>,<image-id>,wake
+# 等 status 中该请求完成后继续；按需用 images,<next> 翻页
 adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf reap
+adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf quiesce
+# 必须明确看到 quiesce=idle
 adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
 ```
 
-`quiesce` 之后模块不再接收新请求，但已经在 trampoline 里的请求仍会继续完成。
+`quiesce` 之后模块不再接收新注入，但仍接收 `release`，已经在 trampoline 里的请求也会
+继续完成。释放前必须由 payload 使用方停止后台线程和回调；引用计数不代表代码无人执行。
 在 stock 宿主上不能在 `running`/`preparing`/`ready` 或仍有 cleanup 回调时卸载。
 
 ## 限制
@@ -172,23 +205,37 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
    仍拒绝；ptrace 调试器、strace 等场景不支持。
 3. **seccomp 允许，但不是任意过滤器的保证**。标准 zygote app 策略允许完成用的
    `getpid`；若目标自己安装了杀死/拒绝 `getpid` 的过滤器，完成自陷无法到达，属于
-   不支持场景。框架不绕过、不修改目标的 seccomp 策略。
+   不支持场景。manual 的 IFUNC/RELRO 路径还可能执行 `mprotect` syscall。
+   框架不绕过、不修改目标的 seccomp 策略。
 4. **SVE/SME 状态仍拒绝**；FPSIMD（q0–q31、FPCR/FPSR）在 trampoline 中保存恢复。
 5. **注入是异步的**：目标线程可能停在任意内核返回点。安全点判断只是启发式，不能
    证明用户态锁未被持有；`force` 只用于排障。
 6. **不冻结进程**：其他线程仍可并发 `mmap`/`munmap`、修改 linker 状态或发信号。
-7. **不保证不可观测**：临时映射、loader 记录、构造函数副作用和时序都可被目标观察。
+7. **不保证不可观测**：临时/驻留映射、linker 模式的 loader 记录、构造函数副作用和
+   时序都可被目标观察；manual 不注册到 bionic 的 soinfo/调试/展开元数据。
 8. **目标退出时**：请求持有 `struct pid` 身份但不长期持有 `mm`，避免延后 `exit_mmap`
    导致 ActivityManager 收不到进程死亡；目标消失后由 `reap` 清槽，旧 mm 中的临时映射
    随最后使用者退出。
 9. **没有宿主 exit-veto**：卸载安全性依赖控制端先 `quiesce` 排空；模块 exit 的
    `-EBUSY` 在 stock 宿主上不会被尊重。
-10. **没有覆盖所有内核**：1.3.1 已在无 BTF 的 5.10.66 上实测；其他 5.x、6.x、
-    16K/64K 页仍需同一产物的真机回归。旧 1.3.0 的 6.1 记录不是 1.3.1 验收结果。
+10. **手动加载不是完整动态链接器**：拒绝 payload TLS、payload IFUNC/IRELATIVE、
+    textrel、GNU property 等未实现 ABI；不保证 C++ 异常展开、JNI 自动初始化和跨 DSO CFI。
+    不复现 linker namespace / 全局符号插入顺序。详见手动加载说明。
+11. **没有覆盖所有内核**：1.4.0 已在无 BTF 的 Android 12 / 5.10.66 / 4K 上实测；
+    其他 5.x、6.x、16K/64K 页仍需同一产物的真机回归。历史版本结果不是当前版本验收。
 
 ## 测试
 
-自有 native 目标（默认、wake、unload、seccomp、取消、目标退出、映射回收、
+默认 manual 后端（需要先构建 KPM；`--app` 仅使用已安装且停止的自有测试 App）：
+
+```powershell
+$env:KCLF_SUPERKEY = Read-Host 'KernelPatch superkey'
+try {
+  python kpms/kclf/test/manual-device-test.py --adb '<ADB>' --serial '<SERIAL>' --clang '<NDK clang>' --app
+} finally { Remove-Item Env:KCLF_SUPERKEY }
+```
+
+历史 native 回归已显式选择 `linker` 后端（默认返回点、wake、unload、seccomp、取消、目标退出、映射回收、
 reload/unload 等）：
 
 ```powershell
@@ -196,8 +243,25 @@ $KclfKey = Read-Host 'KernelPatch superkey'
 ./kpms/kclf/test/device-test.ps1 -SuperKey $KclfKey -Serial '<SERIAL>' -Adb '<ADB>'
 ```
 
-普通 app 测试需要先构建测试 APK，再运行 app 测试脚本；说明见
+历史 linker 普通 app 测试需要先构建测试 APK，再运行 app 测试脚本；说明见
 [test/app/README.md](test/app/README.md)。
+
+已安装的普通 ARM64 app 可以使用 `test/package-test.py` 做 linker 后端独立标记测试：
+
+```powershell
+$env:KCLF_SUPERKEY = Read-Host 'KernelPatch superkey'
+python kpms/kclf/test/package-test.py `
+  --package com.miHoYo.Nap --package com.yhhy.neon.mi `
+  --serial '<SERIAL>' `
+  --clang 'D:/androidSDK/ndk/27.0.12077973/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe'
+Remove-Item Env:KCLF_SUPERKEY
+```
+
+脚本要求选中的 App 测试前未运行，并且设备尚未加载 `kclf`。它会启动和停止这些
+App，在各自 native library 目录临时部署独立命名的测试 SO，验证主线程重复
+加载/卸载、Binder 线程、驻留、失败恢复和重启；最后删除测试 SO/标记并排空卸载
+KPM，恢复 App 停止状态。测试不清空 App 数据。证据保存在 `build/kclf-packages-*/`。
+本机两个目标包的完整结果见 [2026-10-28 App 实测](APP_INJECTION_TEST_20261028.md)。
 
 主机侧辅助函数测试（WSL/Linux，GCC + Python 3）：
 
@@ -205,6 +269,7 @@ $KclfKey = Read-Host 'KernelPatch superkey'
 python3 kpms/kclf/test/test_helpers.py
 python3 kpms/kclf/test/test_maps.py
 python3 kpms/kclf/test/test_compat.py
+python3 kpms/kclf/test/test_manual_elf.py
 # 可选：末尾传入保存的 vmlinux BTF 文件，验证其真实布局选择
 gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
   kpms/kclf/test/test_btf.c -o /tmp/kclf-test-btf
@@ -213,7 +278,8 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 
 ## 文档
 
-- [COMPATIBILITY_1.3.1.md](COMPATIBILITY_1.3.1.md)：当前修改、设备测试、兼容矩阵与未验证项。
+- [MANUAL_LOADER.md](MANUAL_LOADER.md)：1.4.0 手动加载、边界、生命周期与验证记录。
+- [COMPATIBILITY_1.3.1.md](COMPATIBILITY_1.3.1.md)：历史内核兼容修改、设备测试与未验证项。
 - [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)：1.3.0 的历史实现、兼容性、设备结果与限制。
 - `IMPLEMENTATION.md`、`HARDENING.md`、`OBSERVABILITY_AUDIT.md`：历史版本资料，
-  不代表 1.3.0；其中关于宿主补丁、seccomp 拒绝和默认行为的段落已过时。
+  不代表当前实现；其中关于宿主补丁、seccomp 拒绝和默认行为的段落已过时。

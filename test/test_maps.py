@@ -6,7 +6,7 @@ import tempfile
 
 MODULE = Path(__file__).resolve().parents[1]
 execution = (MODULE / "kclf_exec.c").read_text()
-iterator = execution[execution.index("struct kclf_vma\n"):execution.index("static long kclf_resolve(")]
+iterator = execution[execution.index("struct kclf_vma\n"):execution.index("int kclf_walk_vmas(")]
 PRELUDE = r'''
 #include <assert.h>
 #include <errno.h>

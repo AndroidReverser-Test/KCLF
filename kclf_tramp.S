@@ -59,6 +59,8 @@ kclf_tramp_ptr_slot:			/* patched: x19 = parameter block */
 	movk	x19, #0, lsl #16
 	movk	x19, #0, lsl #32
 	movk	x19, #0, lsl #48
+	ldr	w9, [x19, #KCLF_P_MANUAL]
+	cbnz	w9, .Lmanual
 
 	add	x0, x19, #KCLF_P_PATH
 	ldr	w1, [x19, #KCLF_P_FLAGS]
@@ -86,13 +88,80 @@ kclf_tramp_ptr_slot:			/* patched: x19 = parameter block */
 	b	4f
 3:
 	mov	x10, #0
+	b	4f
+
+.Lmanual:
+	/* No bionic loader API: imported IFUNC resolvers, then validated ELF calls.
+	 * x19-x21 are callee-saved; the interrupted values live in kernel pt_regs. */
+	ldr	x20, [x19, #KCLF_P_IFUNCV]
+	ldr	x21, [x19, #KCLF_P_IFUNCN]
+.Lifunc_next:
+	cbz	x21, .Lprotect_begin
+	ldr	x16, [x20]
+	ldr	x0, [x19, #(KCLF_P_IFARG + 8)]
+	mov	x9, #0x4000000000000000
+	orr	x0, x0, x9
+	add	x1, x19, #KCLF_P_IFARG
+	blr	x16
+	cbz	x0, .Lifunc_error
+	tst	x0, #3
+	b.ne	.Lifunc_error
+	ldr	x9, [x20, #8]
+	ldr	x10, [x20, #16]
+	add	x0, x0, x10
+	str	x0, [x9]
+	add	x20, x20, #24
+	sub	x21, x21, #1
+	b	.Lifunc_next
+.Lprotect_begin:
+	ldr	x20, [x19, #KCLF_P_PROTV]
+	ldr	x21, [x19, #KCLF_P_PROTN]
+.Lprotect_next:
+	cbz	x21, .Linit_begin
+	ldp	x0, x1, [x20], #16
+	mov	x2, #1
+	mov	x8, #226	/* __NR_mprotect, not libc mprotect/syscall */
+	svc	#0
+	cbnz	x0, .Lmanual_error
+	sub	x21, x21, #1
+	b	.Lprotect_next
+.Lifunc_error:
+	mov	x0, #-8	/* ENOEXEC: invalid resolver result */
+.Lmanual_error:
+	str	xzr, [x19, #KCLF_P_HANDLE]
+	mov	x10, x0
+	b	4f
+.Linit_begin:
+	ldr	x20, [x19, #KCLF_P_INITV]
+	ldr	x21, [x19, #KCLF_P_INITN]
+.Linit_next:
+	cbz	x21, .Lfini_begin
+	ldr	x16, [x20], #8
+	mov	x0, #0
+	mov	x1, #0
+	mov	x2, #0
+	blr	x16
+	sub	x21, x21, #1
+	b	.Linit_next
+.Lfini_begin:
+	ldr	x20, [x19, #KCLF_P_FINIV]
+	ldr	x21, [x19, #KCLF_P_FININ]
+.Lfini_next:
+	cbz	x21, .Lmanual_done
+	ldr	x16, [x20], #8
+	blr	x16
+	sub	x21, x21, #1
+	b	.Lfini_next
+.Lmanual_done:
+	mov	x10, #0
 4:
     /* keep results only in registers while the used parameter region is wiped */
 	ldr	x1, [x19, #KCLF_P_HANDLE]
 	ldr	x2, [x19, #KCLF_P_ERRPTR]
 	ldr	x9, [x19, #KCLF_P_COOKIE]
 	mov	x3, x19
-	add	x4, x19, #KCLF_P_SIZE
+	ldr	x4, [x19, #KCLF_P_USED]
+	add	x4, x19, x4
 5:
 	stp	xzr, xzr, [x3], #16
 	cmp	x3, x4

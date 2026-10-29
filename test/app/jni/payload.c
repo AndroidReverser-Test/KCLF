@@ -15,6 +15,9 @@
 #ifndef KCLF_APP_DEFAULT_HOLD_MS
 #define KCLF_APP_DEFAULT_HOLD_MS 0
 #endif
+#ifndef KCLF_APP_MARKER_PREFIX
+#define KCLF_APP_MARKER_PREFIX "hit_"
+#endif
 
 __attribute__((constructor)) static void kclf_app_payload_init(void)
 {
@@ -35,7 +38,7 @@ __attribute__((constructor)) static void kclf_app_payload_init(void)
         }
     }
 
-    snprintf(path, sizeof(path), KCLF_APP_FILES "/hit_%ld", pid);
+    snprintf(path, sizeof(path), KCLF_APP_FILES "/" KCLF_APP_MARKER_PREFIX "%ld", pid);
     fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
     if (fd >= 0) {
         int n = snprintf(buf, sizeof(buf), "pid=%ld tid=%ld marker=%p\n", pid, tid,
