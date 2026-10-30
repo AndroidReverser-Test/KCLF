@@ -1,20 +1,25 @@
-# KCLF 1.4.3
+# KCLF 1.5.0
 
-1.4.3 是防检测加固版本。它保留了 1.4.2 引入的“每次请求生成 EL0 程序”设计，并进一步
-移除了生成代码和临时映射里的固定锚点：
+当前普通 App 检测结论见 [检测点与稳定性评估](DETECTION_POINTS.md)。1.5.0 重写了完成
+路径：生成页中不再包含任何 `svc`，完成改为调用真实 libc `usleep()`/`open()` 包装函数，
+私有参数页布局每请求随机化，并优先借用被中断线程自己的栈。1.4.3 的 208 字节完成尾段
+事件判据因此不再适用；但这仍不是“不可检测”证明。
 
 * 生成程序不再嵌入固定的 `KCLFBAIL` 标记。EL0 恢复路径使用内核写入私有参数页的
   每请求随机 token，扫描匿名可执行内存找不到框架字面量。
-* manual 后端在 IFUNC 之后应用的 RELRO `mprotect` 系统调用号也不再是代码中的
-  立即数，而是和完成系统调用表一样用每请求 key 加密后从私有页读取。
-* 临时映射的四个块（RX 代码、ABI 参数页、私有参数页、`PROT_NONE` guard + 栈）
-  按随机顺序排列，块之间插入 0–2 页随机填充；代码页不再固定在区域起点，参数页
-  不再总是紧跟代码页，guard 位置和总大小也不再可预测。所有未被立即覆盖的页都用
-  随机数据填充，不再呈现“新映射的零页”形态。
-* 入口前的重启填充指令也改为随机且只写死临时寄存器，不再固定为 `b .+0`。
+* 1.5.0 删除生成页中的全部 `svc`：manual RELRO 的 `mprotect` 也调用 libc；完成候选
+  只通过 libc 的 `usleep(0)`（`nanosleep`）和 `open()`（`openat`）发出。
+* 私有参数页与 ABI 页改为独立随机块；私有页的保存寄存器、FPSIMD、cookie、函数表、
+  密钥、结果槽和 bail token 每个字段都有独立随机偏移；ABI 页完成前整页清零。
+* 完成调用前恢复 x19–x29 为原中断值，cookie 放在 seccomp BPF 不可见的 x6/x7；内核
+  hook 按 cookie 和候选 syscall 号消费，不再匹配代码页 PC。
+* 临时映射优先借用目标线程自己的栈；借用成功时 SP 和 `usleep` 的 timespec 指针都在
+  正常线程栈内；找不到 pt_regs 或栈空间不足时回退到专用临时栈。
+* 入口前的重启填充指令、寄存器角色、FPSIMD 槽位和恢复顺序继续随机化。
 
-1.4.2 已将 1.4.1 报告中的两个真机检测点（固定 548 字节跳板指纹、已知 payload 的
-ELF 头/加载段内容）改为不再命中；1.4.3 继续收紧静态标记和布局锚点。检测边界和
+1.4.2 已改变 1.4.1 两项检测规则所依赖的固定跳板/getpid 和 ELF 头锚点；当前测试
+只保留旧方法 B，旧方法 A 的完整实现已删除，不能把无事件当作它的重新实测。1.4.3
+继续收紧静态标记和部分布局锚点。检测边界和
 残余可观测面见 [1.4.2/1.4.3 加固报告](OBSERVABILITY_HARDENING_20261030.md) 与
 [1.4.2/1.4.3 进度](HARDENING_PROGRESS_20261030.md)。**本框架仍不承诺“不可检测”**。
 
@@ -47,10 +52,11 @@ linker 的替代品；导入 IFUNC 时仍需执行提供库中的 resolver，不
 完整变更、审计和验证边界见 [1.3.1 审计](COMPATIBILITY_1.3.1.md)。
 
 KCLF 是一个 ARM64 Android 的 KernelPatch 模块：在目标线程下一次返回用户态时重定向
-`pt_regs`，用一段按请求生成的 EL0 程序在目标进程里完成所选后端的用户态步骤，再通过
-候选池中随机选出的普通系统调用（`read`/`write`/`futex`/`clock_gettime`/`ioctl`/
-`epoll_pwait`/`nanosleep`/`sched_yield`）交回内核并恢复寄存器。它不使用 ptrace、
-不暂停目标、不安装信号处理器、不在注入路径上调用 `getpid`。
+`pt_regs`，用一段按请求生成的 EL0 程序在目标进程里完成所选后端的用户态步骤，再调用
+libc `usleep()` 或 `open()` 包装函数，由 libc 内部的 `nanosleep`/`openat` syscall
+交回内核并恢复寄存器。生成页本身不含 `svc`，完成现场 PC/LR 属于 libc，cookie 放在
+seccomp BPF 不可见的 x6/x7。它不使用 ptrace、不暂停目标、不安装信号处理器、不在注入
+路径上调用 `getpid`。
 
 1.3.0 起支持**普通 64 位 Android 应用进程**：zygote fork 出来、带 seccomp 过滤器、
 运行在 `untrusted_app` 域里的第三方应用可以直接作为目标；同时也仍然支持自有 native
@@ -238,20 +244,22 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
 1. **仅 64 位目标**。32 位 app 在 hijack 阶段以 `32-bit target unsupported` 拒绝。
 2. **不绕过调试/跟踪**。`TIF_SYSCALL_TRACE`、`SYSCALL_EMU`、`SINGLESTEP`、`UPROBE`
    仍拒绝；ptrace 调试器、strace 等场景不支持。
-3. **seccomp 允许，但不是任意过滤器的保证**。标准 zygote app 策略允许完成候选池
-   中的普通系统调用；若目标自己对所有候选安装 trap/kill 过滤器，完成自陷无法到达，
-   EL0 会走恢复路径返回，KPM 在目标下一次进入候选调用时回收临时映射并报告
-   `completion blocked`，不会挂死线程。manual 的 IFUNC/RELRO 路径还可能执行
-   `mprotect` syscall（系统调用号不在生成代码中）。框架不绕过、不修改目标的
-   seccomp 策略。
+3. **seccomp 允许，但不是任意过滤器的保证**。标准 zygote app 策略允许完成候选
+   `nanosleep`/`openat`；若一个候选被 TRAP，EL0 会尝试另一个候选，全部失败后走
+   bail 并报告 `completion blocked`。KILL_THREAD/KILL_PROCESS 或未处理的致命 SIGSYS
+   不可能这样恢复；应急路径的 `br x16` 在 BTI 强制设备上仍受目标 PC 是否为合法落点
+   约束。manual 的 IFUNC/RELRO 路径也通过 libc 调用 `mprotect`。框架不绕过、不修改
+   目标的 seccomp 策略。
 4. **SVE/SME 状态仍拒绝**；FPSIMD（q0–q31、FPCR/FPSR）在 EL0 程序中保存恢复。
 5. **注入是异步的**：目标线程可能停在任意内核返回点。安全点判断只是启发式，不能
    证明用户态锁未被持有；`force` 只用于排障。
 6. **不冻结进程**：其他线程仍可并发 `mmap`/`munmap`、修改 linker 状态或发信号。
 7. **不保证不可观测**：临时/驻留映射、linker 模式的 loader 记录、构造函数副作用和
-   时序都可被目标观察；manual 不注册到 bionic 的 soinfo/调试/展开元数据。1.4.2/1.4.3
-   消除了 1.4.1 报告中的固定跳板指纹、已知镜像 ELF 头锚点、固定 `KCLFBAIL` 字面量
-   和固定临时映射布局，但**不消除**“本进程可读的 payload 内容可被按内容扫描”这一事实；
+   时序都可被目标观察；manual 不注册到 bionic 的 soinfo/调试/展开元数据。1.5.0
+   消除了 1.4.3 的页内完成 `svc`、208 字节尾段、固定私有 ABI 和“私有页=ABI+页”关系，
+   并优先把 SP 放回线程栈；但仍保留匿名 RX 代码页、随机私有状态页、可读 payload 内容
+   和回退栈暴露面。遇到持续 trap 完成候选的 SIGSYS handler 时，hijack 可能无法取得
+   pt_regs，属于拒绝服务/未覆盖，不应写成检测阳性。
 8. **目标退出时**：请求持有 `struct pid` 身份但不长期持有 `mm`，避免延后 `exit_mmap`
    导致 ActivityManager 收不到进程死亡；目标消失后由 `reap` 清槽，旧 mm 中的临时映射
    随最后使用者退出。
@@ -264,8 +272,11 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
 11. **不绕过 non-dumpable/ptrace 策略**：App 被系统标记为 non-dumpable 时，
     `/proc/self/auxv`、`/proc/self/mem` 对 App 自身凭据也可能是 `EACCES`。框架用
     内核 accessor 解决自己的 `AT_HWCAP` 需求，但不会替 payload 打开这些文件。
-12. **没有覆盖所有内核**：1.4.3 已在无 BTF 的 Android 12 / 5.10.66 / 4K 上实测；
+12. **没有覆盖所有内核**：1.5.0 已在无 BTF 的 Android 12 / 5.10.66 / 4K 上实测；
     其他 5.x、6.x、16K/64K 页仍需同一产物的真机回归。历史版本结果不是当前版本验收。
+13. **借用栈有回退**：只有能找到 pt_regs、栈 VMA 足够大且距 guard 有余量时才借用
+    线程栈；否则回退到临时栈块，`status` 会显示 `stack=transient`。深栈、altstack
+    或找不到 syscall 帧的目标可能走回退路径。
 
 ## 测试
 
@@ -279,6 +290,32 @@ Remove-Item Env:KCLF_SUPERKEY
 ```
 
 说明与规则边界见 [test/observability/README.md](test/observability/README.md)。
+
+1.5.0 主机结构审计（生成页无 `svc`、1.4.3 尾段 0 命中、随机布局）：
+
+```sh
+gcc -std=c11 -O2 -Wall -Wextra -Werror -DKCLF_CODEGEN_HOST \
+  -fsanitize=address,undefined -g \
+  kpms/kclf/test/test_observability_signature.c kpms/kclf/kclf_codegen.c \
+  -o /tmp/kclf-signature-audit
+/tmp/kclf-signature-audit
+
+gcc -std=c11 -O2 -Wall -Wextra -Werror -DKCLF_CODEGEN_HOST \
+  kpms/kclf/test/test_codegen.c kpms/kclf/kclf_codegen.c -o /tmp/kclf-codegen
+/tmp/kclf-codegen 4096
+```
+
+真机 seccomp 现场探针：
+
+```powershell
+# 普通 native 进程；安装 openat SECCOMP_RET_TRAP，记录 SIGSYS 的 PC/LR/SP
+& '<NDK clang>' --target=aarch64-linux-android31 -O2 -fPIE -pie `
+  kpms/kclf/test/seccomp_probe.c -o build/seccomp_probe
+adb push build/seccomp_probe /data/local/tmp/kclf-v15-test/
+```
+
+注入后读取 `/data/local/tmp/kclf-seccomp.log`；1.5.0 的完成现场应为
+`in_libc=11 in_stack=1`（PC/LR 在 libc、SP 在线程栈），而不是匿名代码页。
 
 默认 manual 后端（需要先构建 KPM；`--app` 仅使用已安装且停止的自有测试 App）：
 
@@ -338,12 +375,16 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 
 ## 文档
 
+- [DETECTION_POINTS.md](DETECTION_POINTS.md)：当前 1.5.0 检测点、libc 完成路径、
+  主机 30,000 样本审计、真机 SIGSYS 现场与残余暴露。
+- [test/seccomp_probe.c](test/seccomp_probe.c)：真机 openat SIGSYS 现场探针（PC/LR/SP、
+  x6/x7 cookie）。
 - [MANUAL_LOADER.md](MANUAL_LOADER.md)：手动加载、依赖来源选择、随机 pad/ELF 头擦除、
   `keepelf`、边界与验证记录。
 - [OBSERVABILITY_HARDENING_20261030.md](OBSERVABILITY_HARDENING_20261030.md)：1.4.2/1.4.3
-  对 1.4.1 两个检测点的加固设计、真机验证与残余暴露。
+  对 1.4.1 两个检测点的加固设计、真机验证与残余暴露（历史）。
 - [HARDENING_PROGRESS_20261030.md](HARDENING_PROGRESS_20261030.md)：1.4.2/1.4.3
-  防检测改造的计划、逐项进度、验证和未完成事项。
+  防检测改造的计划、逐项进度、验证和未完成事项（历史）。
 - [OBSERVABILITY_REPORT.md](OBSERVABILITY_REPORT.md)：1.4.1 普通 App 可观测性报告，
   包含两项真机确认方法、正反例、检测副作用及被排除的方法；其方法 A/B 对 1.4.2+
   不再适用，保留作为历史基线。

@@ -238,8 +238,8 @@ def main():
         loaded = True
         probe = ctl("probe")
         save("probe.txt", probe)
-        check("pt_regs=ok" in probe and "hook=random" in probe and "pool=8" in probe,
-              "fresh KPM completion backend is ready (randomized pool)")
+        check("pt_regs=ok" in probe and "hook=libc" in probe and "pool=9" in probe,
+              "fresh KPM completion backend is ready (libc candidates)")
 
         for backend in ("manual", "linker"):
             for unload in (False, True):
@@ -333,8 +333,9 @@ def main():
             cases.append({"case": name, "pass": True, "pid": pid, "tid": tid})
             stop_app()
 
-        check(len(set(completions)) >= 2,
-              "completion syscall lists differ across injections: " + ",".join(sorted(set(completions))))
+        numbers = {nr for item in completions for nr in item.split(",")}
+        check({"101", "56"} <= numbers,
+              "completion candidates include both libc entries: " + ",".join(sorted(numbers)))
 
         pid, tid, libraries = start_app("plain")
         ctl(f"inject,{tid},{libraries}/libobsother.so,manual,wake")

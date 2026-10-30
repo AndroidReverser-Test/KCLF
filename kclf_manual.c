@@ -733,8 +733,6 @@ void kclf_manual_params(struct kclf_req *r, u8 *p)
     *(u64 *)(p + KCLF_P_IFARG + 16) = r->hwcap2;
     *(u64 *)(p + KCLF_P_PROTV) = *(u64 *)(p + KCLF_P_IFUNCV) + r->ifunc_count * 24;
     *(u64 *)(p + KCLF_P_PROTN) = r->protect_count;
-    *(u64 *)(p + KCLF_P_USED) = KCLF_P_SIZE + (r->init_count + r->fini_count) * 8 +
-                               r->ifunc_count * 24 + r->protect_count * 16;
 }
 
 long kclf_manual_finish(struct kclf_req *r)

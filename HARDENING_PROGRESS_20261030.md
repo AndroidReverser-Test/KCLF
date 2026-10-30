@@ -1,5 +1,11 @@
 # KCLF 1.4.2/1.4.3 防检测改造：计划与进度
 
+> **后续审计说明（2026-10-30）**：本文保留当时的改造与运行记录，不是当前检测验收。
+> 普通 App 检测结论以 [DETECTION_POINTS.md](DETECTION_POINTS.md) 为准：存在主机验证
+> 通过的 208 字节归一化尾段；完整 App 方案待验收。下文历史描述中的四块独立布局、
+> 10–25 页、TRAP/KILL 均可恢复等说法不准确；实际为三块（两页参数相邻）、10–26 页，
+> KILL 不能恢复。旧 A 检测器已删除，32 字节内容规则存在不同 ELF 同样命中的反例。
+
 文档日期：2026-10-30（Asia/Shanghai）。
 状态：**1.4.2 的随机跳板/完成池/布局/manual 镜像加固与 1.4.3 的静态标记清理已完成；
 真机回归通过；本节最后更新于 1.4.3。**
@@ -241,7 +247,7 @@ SELinux Enforcing；`/data/local/tmp/kpatch Test6666` 控制。
 1. ~~更新 `test/app/device-test.ps1` 的临时映射断言~~：已完成。断言改为从运行期
    `status` 读取 `map/code/guard`，再用 maps 验证：恰好一个 RX 页在随机 code
    偏移、恰好一个 `---p` 页在随机 guard 偏移、栈紧接 guard 之上、无 `rwxp`、
-   总大小 10–25 页。
+   历史记录写作总大小 10–25 页；本轮源码复核更正为 10–26 页，旧断言不证明覆盖了最大布局。
 2. ~~删除 `kclf_tramp.S`~~：已完成（`git rm` 并删除 `.o/.d`）。
 3. ~~更新 `README.md`~~：已完成（1.4.3、随机跳板/完成池/EL0 恢复/keepelf、
    seccomp 候选、检测边界、测试入口）。
@@ -268,11 +274,10 @@ SELinux Enforcing；`/data/local/tmp/kpatch Test6666` 控制。
    完成系统调用会真实执行一次，但参数设计为 EBADF/EFAULT/EINVAL，
    不触碰用户内存。若未来只面向新宿主，可恢复 `hook_syscalln_override`
    以获得“从不执行”语义。
-2. **完成候选被全部 trap**：目标 App 若对 `read/write/futex/clock_gettime/
-   ioctl/epoll_pwait/nanosleep/sched_yield` 全部安装 trap/kill，EL0 会走恢复
-   路径返回，不会挂死；KPM 在目标下一次候选调用时回收映射并报告
-   `completion blocked`。该场景下注入的构造函数已经执行，镜像按成功驻留
-   处理（handle/errptr/rc 由私有页带回）。
+2. **完成候选被阻断**：本轮勘误：只有调用返回错误，或 TRAP 被合适的 SIGSYS
+   handler 处理并返回，EL0 才可能继续重试及恢复；KILL/未处理的致命信号不能恢复。
+   在完成协议和后续清理均成立的恢复路径中，KPM 报告 `completion blocked`；这不
+   撤销构造函数行为，不抹除检测事件，也不保证透明恢复（x16 仍丢失）。
 3. **EL0 恢复路径**：`x16` 不恢复（IP0，ABI 调用者保存）；`pstate` 只恢复
    NZCV（其他位在跳板中未被修改）。这是应急路径，正常完成路径仍由内核
    `kclf_exec_restore()` 精确恢复完整 `pt_regs` 并处理 ERESTART。
@@ -341,8 +346,8 @@ powershell -ExecutionPolicy Bypass -File kpms/kclf/test/app/device-test.ps1 `
   - 延迟 RELRO 的 `mprotect` 系统调用号改为 `MPROT ^ NRKEY`，代码中无立即数。
   - 入口前的重启填充指令随机化（nop/movz/eor/add/orr），不再固定 `b .+0`。
 - `kclf_exec.c`：
-  - 临时映射的四个块随机排序，块间插入 0–2 页填充页；总大小 10–25 页。
-  - 新增 `kclf_fill_random()`；映射后先随机填充，参数页/私有页/栈页不再零填充。
+  - 本轮源码复核：实际为三个块（参数两页相邻）随机排序，四处 0–2 页填充；总大小 10–26 页。
+  - 新增 `kclf_fill_random()`；准备时随机填充，但完成前仍将 ABI 已用区清零。
   - `kclf_pick_completion()` 生成随机 `bail_token`；`kclf_export_completion()`
     写入 token、加密 mprotect 号并随机填充私有页尾部。
   - 参数页随机填充后显式清零 `KCLF_P_MANUAL`，修复 linker 请求被随机值送入

@@ -1,5 +1,15 @@
 # 防检测可观测性验证
 
+> 1.5.0 说明：本目录的 Android 夹具仍是 1.4.x 的旧规则回归，未跟随新的 libc 完成
+> 路径更新。1.5.0 的主机验证见 `test/test_observability_signature.c`，真机
+> SIGSYS 现场验证见 `test/seccomp_probe.c`；当前结论以
+> [1.5.0 检测点](../../DETECTION_POINTS.md) 为准。
+
+当前结论以 [1.5.0 检测点与稳定性评估](../../DETECTION_POINTS.md) 为准。此目录的
+Android 夹具仍是有限旧规则回归，**未实现新的 208 字节尾段/运行期 ABI 检测**。
+本轮主机验证器为 [test_observability_signature.c](../test_observability_signature.c)，
+结果索引为 [EVIDENCE_1_4_3_AUDIT_20261030.json](EVIDENCE_1_4_3_AUDIT_20261030.json)。
+
 对应 [1.4.1 可观测性报告](../../OBSERVABILITY_REPORT.md)、
 [1.4.2 加固报告](../../OBSERVABILITY_HARDENING_20261030.md) 和
 [1.4.2/1.4.3 进度](../../HARDENING_PROGRESS_20261030.md)。这是独立的、非 debuggable
@@ -7,18 +17,17 @@
 
 ## 规则
 
-夹具实现四条内容规则和一个 syscall guard：
+夹具实际实现四条内容规则和一个信息类 syscall guard：
 
-1. `KCLF_EXEC`（历史方法 A）：1.4.1 的完整 548 字节跳板指纹。1.4.2 起 EL0 程序
-   按请求生成，此规则不再产生阳性；代码保留用于确认旧规则确实失效。
-2. `KNOWN_MANUAL`（历史方法 B）：已知 payload 的 ELF 头位于匿名映射**起点**、
+1. `KNOWN_MANUAL`（历史方法 B）：已知 payload 的 ELF 头位于匿名映射**起点**、
    全部非可写 PT_LOAD 内容相同、至少一个代码段可执行且不在 linker 登记表。
    manual 后端默认擦除 ELF 头并增加随机前导 pad，此规则不再产生阳性。
-3. `KNOWN_HEADER`：更强的页级锚点，在任意可读匿名页中搜索已知 ELF 头。
+2. `KNOWN_HEADER`：在可读、非可写匿名区域搜索已知 ELF 头。
    默认 `hdr=scrubbed` 时必须为 0；`keepelf` 时预期出现（对照）。
-4. `RESIDUAL_TEXT`：不需要 ELF 元数据，在匿名可执行内存中搜索已知 `.text` 签名。
-   payload 驻留期预期出现：可读代码无法对拥有它的进程隐藏。这是如实记录的残余面。
-5. `RESIDUAL_TAG`：在匿名可执行内存中搜索 1.4.2 生成代码里的固定 `KCLFBAIL`
+3. `RESIDUAL_TEXT`：搜索参考 ELF 首个可执行 PT_LOAD 开头 32 字节。它证明内容
+   可读，但不是唯一身份签名：libobspayload.so 与 libobsother.so 的该片段相同，
+   历史“另一份 ELF”对照也报警，驱动的该负例断言却未检查此事件。
+4. `RESIDUAL_TAG`：在匿名可执行内存中搜索 1.4.2 生成代码里的固定 `KCLFBAIL`
    字面量。1.4.3 改为每请求随机 token，预期为 0。
 
 `SYS_TRAP` 对 `getpid/gettid/getuid/geteuid/getgid/getegid/getppid/getpgid/
@@ -26,6 +35,10 @@ sched_getscheduler/getpriority` 安装 `SECCOMP_RET_TRAP`，按 SIGSYS 现场 PC
 预采集的文件后端可执行映射分类为 `control`/`file`/`unexpected`。KCLF 1.4.2+ 不在
 注入路径上使用这些调用，因此 `kind=unexpected` 必须为 0。匿名 stub 的 100 次
 `getpid` 用于证明 guard 确实生效。
+
+该 guard 不覆盖 1.4.3 的 8 项实际完成候选；`unexpected=0` 不能排除按候选调用和
+instruction_pointer 检测。旧 `KCLF_EXEC` 完整 548 字节识别器已从当前 probe.c
+删除，run.py 仅残留基线无事件断言，不能声称当前仍实现并执行该检测。
 
 检测代码均在 App UID 下运行。控制端 root 只负责部署、发起注入、收集已经由 App
 产生的证据和清理。安全读取使用 `process_vm_readv(self)`，不依赖
@@ -54,7 +67,8 @@ try {
 
 测试包含普通基线（plain/guard/normal）、正常 dlopen、100 次普通 getpid API 调用、
 100 次匿名代码直接 getpid syscall、ELF 数据副本、另一份有效手动加载 ELF，以及
-manual/linker × resident/unload、`keepelf` 对照和完成候选列表随机性检查。
+manual 驻留/unload、linker 驻留、`keepelf` 对照和完成候选列表随机性检查。
+当前驱动跳过 linker+unload；观察线程也作为注入目标，100 ms 轮询无法保证捕获短暂映射。
 guard 通过 prctl 安装在线程 `kclf-observe` 上，只过滤该线程；没有测试 TSYNC。
 夹具不 fork；这一返回处理不能未经适配直接用于会 fork 的进程或已有 SIGSYS
 处理器的大型应用。

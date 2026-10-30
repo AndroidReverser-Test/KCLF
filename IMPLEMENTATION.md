@@ -1,5 +1,10 @@
 # KCLF KPM 实现说明（1.1 历史文档）
 
+> 1.5.0 结构变更（2026-10-30）：完成调用已从生成页内的 `svc` 改为调用真实 libc
+> `usleep()`/`open()`（RELRO 也调用 libc `mprotect`），私有参数页布局随机化并与 ABI
+> 页分离，优先借用目标线程栈。本文第 9/11 节的 trampoline/完成 trap 描述仅适用于
+> 1.4.3 及更早版本；当前实现与检测边界见 [DETECTION_POINTS.md](DETECTION_POINTS.md)。
+>
 > 版本说明（2026-10-28）：以下保留 1.1 阶段的实现与历史测试记录，不再描述当前源码。
 > 1.2.0 的结构布局、取消 ABI、寄存器保护、11 页映射、卸载规则和设备结果见
 > [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)。下文“当前”均指当时版本。

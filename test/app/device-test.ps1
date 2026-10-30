@@ -172,7 +172,7 @@ try {
     Check ((Kpm @('list')).Text -match '(?m)^kclf$') 'module really loaded (not just adb exit code)'
     $Loaded = $true
     $Probe = (Ctl 'probe').Text
-    Check ($Probe -match 'pt_regs=ok' -and $Probe -match 'hook=random') 'register layout and randomized completion hooks available'
+    Check ($Probe -match 'pt_regs=ok' -and $Probe -match 'hook=libc') 'register layout and libc completion hooks available'
 
     Log 'CASE: main thread, wake + unload'
     Inject-App $TargetId $TargetId ',wake,unload'

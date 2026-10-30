@@ -8,7 +8,8 @@
  *   target manager  -> slot table with pinned PID and borrowed mm identities
  *   request machine -> IDLE/ARMED/PREPARING/READY/RUNNING/DONE/FAILED
  *   execution       -> EL0 trampoline in a transient private mapping
- *   completion      -> private getpid trap consumed by the syscall hook
+ *   completion      -> real libc call (usleep/open) whose syscall is consumed
+ *                      by the kernel hook; no svc in the generated page
  */
 #ifndef _KCLF_INTERNAL_H_
 #define _KCLF_INTERNAL_H_
@@ -30,18 +31,22 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.4.3"
+#define KCLF_VER "1.5.0"
 
 #define KCLF_MAX_REQ 4
-#define KCLF_COMPL_MAX KCLF_PV_NRS_MAX
 
-/* mapping layout: one anonymous region whose four blocks (RX code, RW ABI
- * parameter page, RW private parameter page, PROT_NONE guard + RW stack) are
- * placed in a random order with random pad pages between them, so the code
- * page is not at the region base, the parameter pair is not always adjacent to
- * it, and the guard is not at a fixed offset.  Sizes are randomized too. */
+/* mapping layout: one anonymous region whose blocks (RX code, RW ABI
+ * parameter page, RW private parameter page and, only when the target's own
+ * stack cannot be borrowed, a PROT_NONE guard + RW stack) are placed in a
+ * random order with random pad pages between them.  The private page is
+ * therefore not adjacent to the ABI page.  Sizes are randomized too. */
 #define KCLF_MIN_STACK_PAGES 6
 #define KCLF_STACK_PAGES_SPAN 9
+#define KCLF_STACK_HEADROOM 0x100
+
+#if KCLF_STACK_SLOT + 16 > KCLF_STACK_HEADROOM
+#error "completion stack slot does not fit in the reserved headroom"
+#endif
 
 /* request states, only mutated by the owner of the request */
 enum kclf_state
@@ -119,13 +124,23 @@ struct kclf_req
     u64 code_addr;
     u64 guard_addr; /* PROT_NONE page below the transient stack */
     u64 param_addr;
-    u64 priv_addr; /* second parameter page: saved register file */
+    u64 priv_addr; /* separate page: saved register/FPSIMD file and keys */
     u64 stack_top;
+    u64 stack_ref_sp; /* user SP observed when stack_top was chosen */
     u64 entry_pc; /* where EL0 starts executing the generated program */
-    u64 compl_pc; /* resume PC of the completion syscall (svc + 4) */
     u64 bail_token; /* per-request EL0 recovery marker (never a fixed magic) */
-    u8 compl_nrs[KCLF_COMPL_MAX]; /* randomized completion syscall list */
+    u64 compl_fn[KCLF_COMPL_MAX]; /* resolved libc completion entries */
+    u64 compl_arg0[KCLF_COMPL_MAX]; /* matching harmless first argument */
+    u64 mprot_fn; /* resolved libc mprotect entry (manual RELRO) */
+    u64 compl_obs_pc; /* diagnostics: svc+4 observed by the completion hook */
+    u64 compl_obs_lr;
+    u64 compl_obs_sp;
+    u8 compl_nrs[KCLF_COMPL_MAX]; /* matching syscall numbers */
     u8 compl_count;
+    u8 stack_borrowed; /* stack_top points into the interrupted thread stack */
+    u8 stack_state; /* diagnostics: why borrowing succeeded/failed */
+    u32 priv_layout_ok;
+    struct kclf_priv_layout pl;
 
     struct kclf_loader ld;
     struct kclf_manual_image *image; /* transaction; never the sole resident owner */

@@ -531,22 +531,23 @@ KCLF_WORK_WRAPPER(cleanup)
 /* ------------------------------------------------------------------ */
 /* completion trap                                                      */
 /*                                                                      */
-/* The trampoline emits one svc site and walks a per-request randomized  */
-/* list of ordinary libc syscalls.  The kernel consumes the attempt whose */
-/* resume PC, cookie and syscall number match the armed request.  There   */
-/* is no fixed completion syscall (and no getpid): a detector that traps  */
-/* the cheap informational calls sees nothing, while trapping read/write/ */
-/* futex/ioctl would break the detector itself.                           */
+/* The generated program has no svc.  It calls a real libc entry          */
+/* (usleep()/open()) whose internal nanosleep/openat syscall carries the  */
+/* per-request cookie in x6/x7.  The kernel consumes the attempt whose    */
+/* scratch cookie and syscall number match the armed request; the PC and  */
+/* LR at that point belong to libc, so there is no anonymous-page         */
+/* completion address to recognize.  The remaining pool entries keep the  */
+/* EL0 bail token observable on ordinary target syscalls.                 */
 /* ------------------------------------------------------------------ */
 
 static void kclf_completion_bailed(struct kclf_req *r)
 {
     u64 handle = 0, errp = 0, rc = 0;
-    int ok;
+    int ok = r->priv_layout_ok;
 
-    ok = !kclf_urd(r->priv_addr + KCLF_PV_HANDLE, &handle, 8);
-    ok = ok && !kclf_urd(r->priv_addr + KCLF_PV_ERRPTR, &errp, 8);
-    ok = ok && !kclf_urd(r->priv_addr + KCLF_PV_RC, &rc, 8);
+    ok = ok && !kclf_urd(r->priv_addr + r->pl.handle, &handle, 8);
+    ok = ok && !kclf_urd(r->priv_addr + r->pl.errptr, &errp, 8);
+    ok = ok && !kclf_urd(r->priv_addr + r->pl.rc, &rc, 8);
 
     if (ok) {
         /* The payload really ran; EL0 already restored the register file. */
@@ -574,7 +575,7 @@ static void kclf_completion_before(hook_fargs4_t *args, void *udata)
 {
     struct pt_regs *regs;
     struct kclf_req *r;
-    u64 bail = 0;
+    u64 bail = 0, handle = 0, errp = 0, rcval = 0;
     int i;
 
     (void)udata;
@@ -590,27 +591,32 @@ static void kclf_completion_before(hook_fargs4_t *args, void *udata)
     if (!kclf_loading_num) return;
     r = kclf_slot_by_task(current);
     if (!r || !r->saved_valid || kclf_state_load(r) != KCLF_RUNNING) return;
+    if (!r->priv_layout_ok) return;
 
-    if (regs->pc != r->compl_pc) {
-        /* Any syscall while the generated code is executing is the payload's
-         * own business.  Otherwise a later syscall of the same thread can
-         * reclaim a request whose completion was converted into a signal. */
-        if (regs->pc >= r->code_addr && regs->pc < r->code_addr + (u64)kclf_page_size) return;
-        if (r->priv_addr && !kclf_urd(r->priv_addr + KCLF_PV_BAIL, &bail, 8) && bail == r->bail_token)
+    /* The completion call passes the per-request cookie in the caller-saved
+     * x6/x7 scratch registers.  seccomp_data never exposes those, and the
+     * instruction pointer/link register at the svc belong to the libc wrapper
+     * that issued it, so the old "svc in the transient code page" anchor no
+     * longer exists.  Any other syscall while the generated program is running
+     * is the payload's own business; only the EL0 bail token is interesting. */
+    if (regs->regs[6] != r->cookie && regs->regs[7] != r->cookie) {
+        if (!kclf_urd(r->priv_addr + r->pl.bail, &bail, 8) && bail == r->bail_token)
             kclf_completion_bailed(r);
         return;
     }
-    if (regs->regs[0] != r->cookie) return;
     for (i = 0; i < r->compl_count; i++)
         if ((u8)regs->regs[8] == r->compl_nrs[i]) break;
     if (i == r->compl_count) return;
     if ((u64)kclf_task_mm(current) != r->mm) return;
-    /* The trampoline passes the loader result in registers because its
-     * parameter page has already been scrubbed. */
-    r->handle = (s64)regs->regs[1];
-    r->err_user = regs->regs[2];
-    r->unload_rc = (s32)regs->regs[3];
+    /* The trampoline passes the loader result in the private page because its
+     * ABI parameter page has already been scrubbed. */
+    if (!kclf_urd(r->priv_addr + r->pl.handle, &handle, 8)) r->handle = (s64)handle;
+    if (!kclf_urd(r->priv_addr + r->pl.errptr, &errp, 8)) r->err_user = errp;
+    if (!kclf_urd(r->priv_addr + r->pl.rc, &rcval, 8)) r->unload_rc = (s32)rcval;
     if (r->flags & KCLF_F_UNLOAD) r->unloaded = r->handle && (r->unload_rc == 0);
+    r->compl_obs_pc = regs->pc;
+    r->compl_obs_lr = regs->regs[30];
+    r->compl_obs_sp = regs->sp;
     r->completing = 1;
     args->skip_origin = 1;
     args->ret = 0;
@@ -667,7 +673,7 @@ static int kclf_hook_install(void)
         }
     }
     kclf_hook_ok = 1;
-    logki("kclf: completion hooks installed on %d randomized-pool syscalls\n", kclf_compl_pool_num);
+    logki("kclf: completion hooks installed on %d candidate/guard syscalls\n", kclf_compl_pool_num);
     return 0;
 }
 
@@ -699,6 +705,13 @@ static void kclf_status_line(char *out, int outlen, int *off, struct kclf_req *r
     }
     if (kclf_state_load(r) == KCLF_DONE) {
         *off += kclf_scnprintf(out + *off, outlen - *off, " handle=%llx", (unsigned long long)r->handle);
+        if (r->compl_obs_pc)
+            *off += kclf_scnprintf(out + *off, outlen - *off, " svc=%llx lr=%llx sp=%llx",
+                                   (unsigned long long)r->compl_obs_pc,
+                                   (unsigned long long)r->compl_obs_lr,
+                                   (unsigned long long)r->compl_obs_sp);
+        *off += kclf_scnprintf(out + *off, outlen - *off, " stack=%s/%u",
+                               r->stack_borrowed ? "task" : "transient", r->stack_state);
         if (r->ld.sym) *off += kclf_scnprintf(out + *off, outlen - *off, " via=%s", r->ld.sym);
         if (r->compl_count) {
             int k;
@@ -718,9 +731,10 @@ static void kclf_status_line(char *out, int outlen, int *off, struct kclf_req *r
         }
     }
     if (r->map_addr)
-        *off += kclf_scnprintf(out + *off, outlen - *off, " map=%llx+%llu code=%llx guard=%llx",
+        *off += kclf_scnprintf(out + *off, outlen - *off, " map=%llx+%llu code=%llx guard=%llx stack=%s/%u",
                                (unsigned long long)r->map_addr, (unsigned long long)r->map_len,
-                               (unsigned long long)r->code_addr, (unsigned long long)r->guard_addr);
+                               (unsigned long long)r->code_addr, (unsigned long long)r->guard_addr,
+                               r->stack_borrowed ? "task" : "transient", r->stack_state);
     if (r->err[0]) *off += kclf_scnprintf(out + *off, outlen - *off, " err=\"%s\"", r->err);
     *off += kclf_scnprintf(out + *off, outlen - *off, "\n");
 }
@@ -903,7 +917,7 @@ static long kclf_cmd_status(char *out, int outlen, int *off)
     }
     if (!n) *off += kclf_scnprintf(out + *off, outlen - *off, "no requests\n");
     *off += kclf_scnprintf(out + *off, outlen - *off, "hook=%s loading=%d page=%d\n",
-                           kclf_hook_ok ? "random" : "none", kclf_loading_num, kclf_page_size);
+                           kclf_hook_ok ? "libc" : "none", kclf_loading_num, kclf_page_size);
     return 0;
 }
 
@@ -1093,7 +1107,7 @@ static long kclf_ctl0(const char *args, char *__user out_msg, int outlen)
         int n = kclf_exec_probe(out, sizeof(out) - 64);
         if (n > 0) off = n;
         off += kclf_scnprintf(out + off, sizeof(out) - off, "hook=%s syscall_wrapper=%d pool=%d\n",
-                              kclf_hook_ok ? "random" : "none", has_syscall_wrapper, kclf_compl_pool_num);
+                              kclf_hook_ok ? "libc" : "none", has_syscall_wrapper, kclf_compl_pool_num);
     } else if (!strcmp(tok[0], "inject") || !strcmp(tok[0], "release")) {
         rc = kclf_cmd_inject(tok, ntok, out, sizeof(out), &off);
     } else if (!strcmp(tok[0], "images")) {
