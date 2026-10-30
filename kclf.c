@@ -528,13 +528,54 @@ KCLF_WORK_WRAPPER(prepare)
 KCLF_WORK_WRAPPER(hijack)
 KCLF_WORK_WRAPPER(cleanup)
 
-/* completion trap: getpid(cookie) is consumed here                     */
+/* ------------------------------------------------------------------ */
+/* completion trap                                                      */
+/*                                                                      */
+/* The trampoline emits one svc site and walks a per-request randomized  */
+/* list of ordinary libc syscalls.  The kernel consumes the attempt whose */
+/* resume PC, cookie and syscall number match the armed request.  There   */
+/* is no fixed completion syscall (and no getpid): a detector that traps  */
+/* the cheap informational calls sees nothing, while trapping read/write/ */
+/* futex/ioctl would break the detector itself.                           */
 /* ------------------------------------------------------------------ */
 
-static void kclf_getpid_before(hook_fargs4_t *args, void *udata)
+static void kclf_completion_bailed(struct kclf_req *r)
+{
+    u64 handle = 0, errp = 0, rc = 0;
+    int ok;
+
+    ok = !kclf_urd(r->priv_addr + KCLF_PV_HANDLE, &handle, 8);
+    ok = ok && !kclf_urd(r->priv_addr + KCLF_PV_ERRPTR, &errp, 8);
+    ok = ok && !kclf_urd(r->priv_addr + KCLF_PV_RC, &rc, 8);
+
+    if (ok) {
+        /* The payload really ran; EL0 already restored the register file. */
+        r->handle = (s64)handle;
+        r->err_user = errp;
+        r->unload_rc = (s32)rc;
+        if (r->flags & KCLF_F_UNLOAD) r->unloaded = r->handle && (r->unload_rc == 0);
+        r->stage = KCLF_ST_RESTORE;
+        r->j_done = kclf_now();
+        kclf_state_store(r, KCLF_DONE);
+        kclf_set_err(r, "completion blocked; EL0 restored the original register file");
+    } else {
+        kclf_fail(r, KCLF_FAILED, KCLF_ST_RESTORE, -EPROTO, "EL0 recovery metadata unreadable");
+    }
+    __atomic_sub_fetch(&kclf_loading_num, 1, __ATOMIC_SEQ_CST);
+    /* The recovery was noticed inside a syscall that may now block for a long
+     * time (e.g. epoll_pwait), so force the drain instead of waiting for the
+     * target to return on its own. */
+    if (kclf_queue_work(r, current, &r->work_cleanup,
+                        kclf_wake_supported ? KCLF_TWA_SIGNAL : KCLF_TWA_RESUME))
+        kclf_set_err(r, "cleanup queue rejected; mapping retained");
+}
+
+static void kclf_completion_before(hook_fargs4_t *args, void *udata)
 {
     struct pt_regs *regs;
     struct kclf_req *r;
+    u64 bail = 0;
+    int i;
 
     (void)udata;
     if (!has_syscall_wrapper) return;
@@ -549,11 +590,21 @@ static void kclf_getpid_before(hook_fargs4_t *args, void *udata)
     if (!kclf_loading_num) return;
     r = kclf_slot_by_task(current);
     if (!r || !r->saved_valid || kclf_state_load(r) != KCLF_RUNNING) return;
-    if (regs->regs[0] != r->cookie) return;
-    if (regs->regs[8] != KCLF_COMPLETION_NR) return;
-    extern const char kclf_tramp_start[], kclf_tramp_return[];
-    if ((u64)kclf_task_mm(current) != r->mm || regs->pc != r->code_addr + (u64)(kclf_tramp_return - kclf_tramp_start))
+
+    if (regs->pc != r->compl_pc) {
+        /* Any syscall while the generated code is executing is the payload's
+         * own business.  Otherwise a later syscall of the same thread can
+         * reclaim a request whose completion was converted into a signal. */
+        if (regs->pc >= r->code_addr && regs->pc < r->code_addr + (u64)kclf_page_size) return;
+        if (r->priv_addr && !kclf_urd(r->priv_addr + KCLF_PV_BAIL, &bail, 8) && bail == r->bail_token)
+            kclf_completion_bailed(r);
         return;
+    }
+    if (regs->regs[0] != r->cookie) return;
+    for (i = 0; i < r->compl_count; i++)
+        if ((u8)regs->regs[8] == r->compl_nrs[i]) break;
+    if (i == r->compl_count) return;
+    if ((u64)kclf_task_mm(current) != r->mm) return;
     /* The trampoline passes the loader result in registers because its
      * parameter page has already been scrubbed. */
     r->handle = (s64)regs->regs[1];
@@ -565,7 +616,7 @@ static void kclf_getpid_before(hook_fargs4_t *args, void *udata)
     args->ret = 0;
 }
 
-static void kclf_getpid_after(hook_fargs4_t *args, void *udata)
+static void kclf_completion_after(hook_fargs4_t *args, void *udata)
 {
     struct pt_regs *regs;
     struct kclf_req *r;
@@ -594,19 +645,40 @@ static void kclf_getpid_after(hook_fargs4_t *args, void *udata)
 
 static int kclf_hook_install(void)
 {
-    hook_err_t rc;
+    int i;
 
     if (!has_syscall_wrapper) {
         logkw("kclf: no syscall wrapper, completion backend unavailable\n");
         return 0;
     }
-    rc = hook_syscalln(KCLF_COMPLETION_NR, 0, kclf_getpid_before, kclf_getpid_after, 0);
-    if (rc) {
-        logke("kclf: hook getpid failed: %d\n", rc);
-        return rc;
+    /* hook_syscalln is part of the oldest supported host ABI.  Newer hosts
+     * honour skip_origin (the completion syscall is then never executed); on
+     * older ones the call runs to completion and the after hook overwrites its
+     * result with the restored register file.  Every pool syscall fails before
+     * touching target memory with the arguments the trampoline passes. */
+    for (i = 0; i < kclf_compl_pool_num; i++) {
+        hook_err_t rc = hook_syscalln(kclf_compl_pool[i], 0, kclf_completion_before, kclf_completion_after, 0);
+        if (rc) {
+            int j;
+            logke("kclf: hook syscall %d failed: %d\n", kclf_compl_pool[i], rc);
+            for (j = 0; j < i; j++)
+                unhook_syscalln(kclf_compl_pool[j], kclf_completion_before, kclf_completion_after);
+            return rc;
+        }
     }
     kclf_hook_ok = 1;
+    logki("kclf: completion hooks installed on %d randomized-pool syscalls\n", kclf_compl_pool_num);
     return 0;
+}
+
+static void kclf_hook_remove(void)
+{
+    int i;
+
+    if (!kclf_hook_ok) return;
+    for (i = 0; i < kclf_compl_pool_num; i++)
+        unhook_syscalln(kclf_compl_pool[i], kclf_completion_before, kclf_completion_after);
+    kclf_hook_ok = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -628,10 +700,17 @@ static void kclf_status_line(char *out, int outlen, int *off, struct kclf_req *r
     if (kclf_state_load(r) == KCLF_DONE) {
         *off += kclf_scnprintf(out + *off, outlen - *off, " handle=%llx", (unsigned long long)r->handle);
         if (r->ld.sym) *off += kclf_scnprintf(out + *off, outlen - *off, " via=%s", r->ld.sym);
+        if (r->compl_count) {
+            int k;
+            *off += kclf_scnprintf(out + *off, outlen - *off, " compl=");
+            for (k = 0; k < r->compl_count; k++)
+                *off += kclf_scnprintf(out + *off, outlen - *off, "%s%u", k ? "," : "", (unsigned)r->compl_nrs[k]);
+        }
         if (!(r->flags & KCLF_F_LINKER))
-            *off += kclf_scnprintf(out + *off, outlen - *off, " image=%llu refs=%u resident=%llx+%llu",
+            *off += kclf_scnprintf(out + *off, outlen - *off, " image=%llu refs=%u resident=%llx+%llu hdr=%s",
                                   (unsigned long long)r->image_id, r->image_refs,
-                                  (unsigned long long)r->image_addr, (unsigned long long)r->image_len);
+                                  (unsigned long long)r->image_addr, (unsigned long long)r->image_len,
+                                  r->image_hdr_kept ? "kept" : "scrubbed");
         if (r->flags & KCLF_F_UNLOAD) {
             *off += kclf_scnprintf(out + *off, outlen - *off, " unload=%s rc=%d", r->unloaded ? "ok" : "failed",
                                    r->unload_rc);
@@ -639,8 +718,9 @@ static void kclf_status_line(char *out, int outlen, int *off, struct kclf_req *r
         }
     }
     if (r->map_addr)
-        *off += kclf_scnprintf(out + *off, outlen - *off, " map=%llx+%llu", (unsigned long long)r->map_addr,
-                               (unsigned long long)r->map_len);
+        *off += kclf_scnprintf(out + *off, outlen - *off, " map=%llx+%llu code=%llx guard=%llx",
+                               (unsigned long long)r->map_addr, (unsigned long long)r->map_len,
+                               (unsigned long long)r->code_addr, (unsigned long long)r->guard_addr);
     if (r->err[0]) *off += kclf_scnprintf(out + *off, outlen - *off, " err=\"%s\"", r->err);
     *off += kclf_scnprintf(out + *off, outlen - *off, "\n");
 }
@@ -674,7 +754,7 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
         return -EOPNOTSUPP;
     }
     if (ntok < 3) {
-        *off += kclf_scnprintf(out + *off, outlen - *off, "error: inject,<tid>,<path>[,manual|linker][,force][,wake][,unload] or release,<tid>,<image-id>[,wake]\n");
+        *off += kclf_scnprintf(out + *off, outlen - *off, "error: inject,<tid>,<path>[,manual|linker][,force][,wake][,unload][,keepelf] or release,<tid>,<image-id>[,wake]\n");
         return -EINVAL;
     }
     for (i = 0; tok[1][i]; i++) {
@@ -697,6 +777,8 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
             flags |= KCLF_F_WAKE;
         else if (!strcmp(tok[i], "unload") && !release)
             flags |= KCLF_F_UNLOAD;
+        else if (!strcmp(tok[i], "keepelf") && !release)
+            flags |= KCLF_F_KEEPELF;
         else if ((!strcmp(tok[i], "manual") || !strcmp(tok[i], "linker")) && !release) {
             if (backend_seen++) return -EINVAL;
             if (!strcmp(tok[i], "linker")) flags |= KCLF_F_LINKER;
@@ -820,8 +902,8 @@ static long kclf_cmd_status(char *out, int outlen, int *off)
         n++;
     }
     if (!n) *off += kclf_scnprintf(out + *off, outlen - *off, "no requests\n");
-    *off += kclf_scnprintf(out + *off, outlen - *off, "hook=%s loading=%d page=%d\n", kclf_hook_ok ? "getpid" : "none",
-                           kclf_loading_num, kclf_page_size);
+    *off += kclf_scnprintf(out + *off, outlen - *off, "hook=%s loading=%d page=%d\n",
+                           kclf_hook_ok ? "random" : "none", kclf_loading_num, kclf_page_size);
     return 0;
 }
 
@@ -974,7 +1056,7 @@ static void kclf_usage(char *out, int outlen, int *off)
     *off += kclf_scnprintf(out + *off, outlen - *off,
                            "kclf " KCLF_VER " - no-ptrace library loading\n"
                            "  probe                      runtime compatibility diagnostics\n"
-                           "  inject,<tid>,<path>[,manual|linker][,force][,wake][,unload] (default manual)\n"
+                           "  inject,<tid>,<path>[,manual|linker][,force][,wake][,unload][,keepelf]\n"
                            "  images[,cursor]            list resident manual images (paged)\n"
                            "  release,<tid>,<image-id>[,wake][,force]   release one manual reference\n"
                            "  status                     request table\n"
@@ -1010,8 +1092,8 @@ static long kclf_ctl0(const char *args, char *__user out_msg, int outlen)
     } else if (!strcmp(tok[0], "probe")) {
         int n = kclf_exec_probe(out, sizeof(out) - 64);
         if (n > 0) off = n;
-        off += kclf_scnprintf(out + off, sizeof(out) - off, "hook=%s syscall_wrapper=%d\n",
-                              kclf_hook_ok ? "getpid" : "none", has_syscall_wrapper);
+        off += kclf_scnprintf(out + off, sizeof(out) - off, "hook=%s syscall_wrapper=%d pool=%d\n",
+                              kclf_hook_ok ? "random" : "none", has_syscall_wrapper, kclf_compl_pool_num);
     } else if (!strcmp(tok[0], "inject") || !strcmp(tok[0], "release")) {
         rc = kclf_cmd_inject(tok, ntok, out, sizeof(out), &off);
     } else if (!strcmp(tok[0], "images")) {
@@ -1117,8 +1199,8 @@ static long kclf_exit(void *reserved)
     /* The stock KernelPatch loader frees the module even if this callback
      * returns an error, so the controller MUST obtain quiesce=idle first.
      * What we can do here is cancel queued work and wait a bounded time for
-     * in-flight callbacks. The syscall hook is removed unconditionally: on a
-     * stock host the alternative is a global getpid hook pointing at freed
+     * in-flight callbacks. The syscall hooks are removed unconditionally: on a
+     * stock host the alternative is a global syscall hook pointing at freed
      * module text. A task_work callback that is still queued cannot be fixed
      * from here; quiesce/drain is the only safe path. */
     kclf_unloading = 1;
@@ -1134,10 +1216,7 @@ static long kclf_exit(void *reserved)
         kclf_ks.msleep(10);
     }
     unsafe = __atomic_load_n(&kclf_control_busy, __ATOMIC_ACQUIRE) || kclf_exit_unsafe();
-    if (kclf_hook_ok) {
-        unhook_syscalln(KCLF_COMPLETION_NR, kclf_getpid_before, kclf_getpid_after);
-        kclf_hook_ok = 0;
-    }
+    kclf_hook_remove();
     if (unsafe) {
         logke("kclf: unload with live callbacks; hook removed, but stock KP frees module text. "
               "Quiesce and drain before unload.\n");

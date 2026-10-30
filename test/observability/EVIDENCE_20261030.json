@@ -1,0 +1,221 @@
+{
+  "report_date": "2026-10-30",
+  "scope": "KCLF 1.4.1, Android 12/API31, ARM64/4096-byte pages, this fixture only",
+  "result": "passed",
+  "framework_commit": "894bbf43b3d31495d1e03b1e89949b15ac3c9b05",
+  "module_sha256": "8749c287f1243d433f26e6b0a6e86b32a7136860adc9c4369fe5db881ebd7f59",
+  "workspace_module_sha256": "8749c287f1243d433f26e6b0a6e86b32a7136860adc9c4369fe5db881ebd7f59",
+  "apk_sha256": "a54dcf75850ff303c96002012e7f45277dbca0d09dff2c3afb329475502be817",
+  "payload_sha256": "1aca043f7c8cdb3856495c6aaedfa9bd03d9dad01cfc6cacb66f5e62a452a651",
+  "trampoline_sha256": "8f85c51973162649380f1484b1925f10bcc753e740f9b5807cf742f1f1185632",
+  "trampoline_bytes": 548,
+  "device": {
+    "serial": "LVLNINYXKR4L6HAE",
+    "android": "12",
+    "sdk": "31",
+    "kernel": "Linux localhost 5.10.66-android12-9-00001-gd262b276948e-ab8291727 #1 SMP PREEMPT Fri Mar 11 03:13:00 UTC 2022 aarch64",
+    "selinux": "Enforcing",
+    "boot_id": "f8bd7440-027b-4e54-8dc2-03203987a01f"
+  },
+  "positive_exec_cases": [
+    {
+      "case": "guard-manual-resident-01",
+      "pass": true,
+      "pid": 26331,
+      "tid": 26354
+    },
+    {
+      "case": "guard-manual-resident-02",
+      "pass": true,
+      "pid": 26430,
+      "tid": 26453
+    },
+    {
+      "case": "guard-manual-resident-03",
+      "pass": true,
+      "pid": 26512,
+      "tid": 26535
+    },
+    {
+      "case": "guard-manual-resident-04",
+      "pass": true,
+      "pid": 26591,
+      "tid": 26614
+    },
+    {
+      "case": "guard-manual-resident-05",
+      "pass": true,
+      "pid": 26669,
+      "tid": 26692
+    },
+    {
+      "case": "guard-manual-unload-01",
+      "pass": true,
+      "pid": 26746,
+      "tid": 26769
+    },
+    {
+      "case": "guard-manual-unload-02",
+      "pass": true,
+      "pid": 26823,
+      "tid": 26846
+    },
+    {
+      "case": "guard-manual-unload-03",
+      "pass": true,
+      "pid": 26907,
+      "tid": 26936
+    },
+    {
+      "case": "guard-manual-unload-04",
+      "pass": true,
+      "pid": 26993,
+      "tid": 27017
+    },
+    {
+      "case": "guard-manual-unload-05",
+      "pass": true,
+      "pid": 27074,
+      "tid": 27097
+    },
+    {
+      "case": "guard-linker-resident-01",
+      "pass": true,
+      "pid": 27153,
+      "tid": 27176
+    },
+    {
+      "case": "guard-linker-resident-02",
+      "pass": true,
+      "pid": 27230,
+      "tid": 27253
+    },
+    {
+      "case": "guard-linker-resident-03",
+      "pass": true,
+      "pid": 27307,
+      "tid": 27330
+    },
+    {
+      "case": "guard-linker-resident-04",
+      "pass": true,
+      "pid": 27384,
+      "tid": 27407
+    },
+    {
+      "case": "guard-linker-resident-05",
+      "pass": true,
+      "pid": 27462,
+      "tid": 27485
+    },
+    {
+      "case": "guard-linker-unload-01",
+      "pass": true,
+      "pid": 27539,
+      "tid": 27562
+    },
+    {
+      "case": "guard-linker-unload-02",
+      "pass": true,
+      "pid": 27616,
+      "tid": 27639
+    },
+    {
+      "case": "guard-linker-unload-03",
+      "pass": true,
+      "pid": 27695,
+      "tid": 27718
+    },
+    {
+      "case": "guard-linker-unload-04",
+      "pass": true,
+      "pid": 27772,
+      "tid": 27795
+    },
+    {
+      "case": "guard-linker-unload-05",
+      "pass": true,
+      "pid": 27849,
+      "tid": 27872
+    }
+  ],
+  "positive_known_image_cases": [
+    {
+      "case": "known-manual-resident-01",
+      "pass": true,
+      "pid": 27926,
+      "tid": 27949
+    },
+    {
+      "case": "known-manual-resident-02",
+      "pass": true,
+      "pid": 27926,
+      "tid": 27949
+    },
+    {
+      "case": "known-manual-resident-03",
+      "pass": true,
+      "pid": 27926,
+      "tid": 27949
+    },
+    {
+      "case": "known-manual-resident-04",
+      "pass": true,
+      "pid": 27926,
+      "tid": 27949
+    },
+    {
+      "case": "known-manual-resident-05",
+      "pass": true,
+      "pid": 27926,
+      "tid": 27949
+    }
+  ],
+  "negative_cases": [
+    {
+      "case": "negative-plain",
+      "pass": true,
+      "pid": 25571,
+      "tid": 25659
+    },
+    {
+      "case": "negative-normal",
+      "pass": true,
+      "pid": 26123,
+      "tid": 26159
+    },
+    {
+      "case": "negative-guard",
+      "pass": true,
+      "pid": 26260,
+      "tid": 26284
+    },
+    {
+      "case": "negative-other-manual",
+      "pass": true,
+      "pid": 28121,
+      "tid": 28144
+    }
+  ],
+  "negative_guard_trace": "IDENTITY pid=26260 tid=26284 uid=10259 euid=10259 dumpable=0\r\nCapEff:\t0000000000000000\r\nNoNewPrivs:\t1\r\nSeccomp:\t2\r\nSELINUX u:r:untrusted_app:s0:c3,c257,c512,c768\r\nSELF_MEM readable=0 errno=13\r\nNEGATIVE normal_getpid=100 anonymous_getpid=100 elf_data=1 anonymous_rx=1 guard=1 traps=100 positives=0\r\nREFERENCE bytes=548 patch=92 completion=544\r\nREADY pid=26260 tid=26284 mode=guard library=/data/app/~~xtkLhwtnQ1DPbFpJCw-wnA==/com.kclf.obsprobe-caSGMSEWs3UzFeznYqD91g==/lib/arm64",
+  "first_exec_trace": "IDENTITY pid=26331 tid=26354 uid=10259 euid=10259 dumpable=0\r\nCapEff:\t0000000000000000\r\nNoNewPrivs:\t1\r\nSeccomp:\t2\r\nSELINUX u:r:untrusted_app:s0:c3,c257,c512,c768\r\nSELF_MEM readable=0 errno=13\r\nNEGATIVE normal_getpid=100 anonymous_getpid=100 elf_data=1 anonymous_rx=1 guard=1 traps=100 positives=0\r\nREFERENCE bytes=548 patch=92 completion=544\r\nREADY pid=26331 tid=26354 mode=guard library=/data/app/~~xtkLhwtnQ1DPbFpJCw-wnA==/com.kclf.obsprobe-caSGMSEWs3UzFeznYqD91g==/lib/arm64\r\nKCLF_EXEC pc=0000007338d0c220 base=0000007338d0c000 cookie=6e0146760d6db56a",
+  "five_image_cycles_trace": "IDENTITY pid=27926 tid=27949 uid=10259 euid=10259 dumpable=0\r\nCapEff:\t0000000000000000\r\nNoNewPrivs:\t0\r\nSeccomp:\t2\r\nSELINUX u:r:untrusted_app:s0:c3,c257,c512,c768\r\nSELF_MEM readable=0 errno=13\r\nNEGATIVE normal_getpid=100 anonymous_getpid=100 elf_data=1 anonymous_rx=1 guard=0 traps=0 positives=0\r\nREFERENCE bytes=548 patch=92 completion=544\r\nREADY pid=27926 tid=27949 mode=plain library=/data/app/~~xtkLhwtnQ1DPbFpJCw-wnA==/com.kclf.obsprobe-caSGMSEWs3UzFeznYqD91g==/lib/arm64\r\nKNOWN_MANUAL base=7338c08000 exact_readonly_loads=1 anonymous_loads=1 registered=0\r\nKNOWN_GONE\r\nKNOWN_MANUAL base=7338c08000 exact_readonly_loads=1 anonymous_loads=1 registered=0\r\nKNOWN_GONE\r\nKNOWN_MANUAL base=7338c08000 exact_readonly_loads=1 anonymous_loads=1 registered=0\r\nKNOWN_GONE\r\nKNOWN_MANUAL base=7338f24000 exact_readonly_loads=1 anonymous_loads=1 registered=0\r\nKNOWN_GONE\r\nKNOWN_MANUAL base=7338f24000 exact_readonly_loads=1 anonymous_loads=1 registered=0\r\nKNOWN_GONE",
+  "final_kpm_num": "0",
+  "test_app_uninstalled": true,
+  "boot_unchanged": true,
+  "selinux_unchanged": true,
+  "module_left_loaded": false,
+  "raw_evidence_directory": "../../../../build/kclf-observability-c38359af47ea",
+  "limitations": [
+    "Finite samples do not establish population-wide accuracy.",
+    "The guard covers the named fixture thread and exits its own process after confirmed execution.",
+    "Known-image positives identify the expected non-writable PT_LOAD contents in an executable anonymous image, not an unknown payload or the originating kernel module."
+  ],
+  "source_sha256": {
+    "AndroidManifest.xml": "47d963fb85922d903c2ecadc8a19efa2dfc3c0b6844095f64e07cc253fe27e17",
+    "MainActivity.java": "ed50a951187113e636771a8e313ed77754bfb2c3aa673ad8261da6e9511fa024",
+    "payload.c": "91fa0c213912af2329ea8e483623c8740083eb26610f87ef40ccd28a33a51155",
+    "probe.c": "75963f5a208bfcf7f471e8323e94fca85880dcc4c208e9c8ebd869f293143740",
+    "run.py": "d0a7720855b26e407685aa5efbfc2cbc7e65d738f6aaaebf32e9b15458e17cea"
+  }
+}

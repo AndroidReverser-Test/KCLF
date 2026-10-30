@@ -1,4 +1,4 @@
-# KCLF 1.4.1：手动加载后端
+# KCLF 1.4.3：手动加载后端
 
 ## 目标与结论
 
@@ -28,10 +28,10 @@
 | 组件 | 职责 |
 | --- | --- |
 | `kclf_elf.c` / `.h` | 与内核布局无关的有界 ELF64/AArch64 解析、哈希/版本符号查询、RELA/APS2/RELR 重定位 |
-| `kclf_manual.c` | 文件快照、匿名镜像、已加载依赖收集、ELF 调度、权限、引用计数和驻留镜像登记 |
-| `kclf_exec.c` | 选择后端、建立临时 trampoline/参数/guard/栈映射、改写及恢复寄存器、统一清理 |
-| `kclf_tramp.S` / `kclf_param.h` | 不含重定位的 EL0 代码和共享 ABI，IFUNC、延迟 RELRO、构造/析构、完成自陷 |
-| `kclf.c` / `kclf_internal.h` | 控制命令、请求状态、目标身份、quiesce/reap 和宿主交互 |
+| `kclf_manual.c` | 文件快照、匿名镜像（随机前导 pad）、已加载依赖收集、ELF 调度、权限、引用计数和驻留镜像登记 |
+| `kclf_exec.c` | 选择后端、建立随机化临时映射、改写及恢复寄存器、统一清理 |
+| `kclf_codegen.c` / `.h` | 每请求生成的 EL0 AArch64 程序（IFUNC、延迟 RELRO、构造/析构、随机完成候选）与共享 ABI |
+| `kclf_param.h` | 参数页布局；私有页保存寄存器、候选系统调用和恢复 token |
 
 加载顺序如下：
 
@@ -39,7 +39,8 @@
 2. 按 TGID 的 `struct pid` 身份和地址空间选择登记项。同一进程只允许一个活动手动
    镜像事务，争用返回错误，控制端可重试；不冻结其他线程。
 3. 以目标凭据打开 SO，读取有界文件快照。校验 ELF、各 PT_LOAD、偏移/长度/对齐，
-   分配匿名 RW 区，按段复制文件内容；BSS 由匿名页零填充。
+   分配匿名 RW 区（长度含 1–8 页随机前导 pad 和 ELF 对齐空洞），按段复制文件内容；
+   BSS 由匿名页零填充。
 4. 扫描目标 VMA 中的 ELF 动态元数据，同时读取 maps pathname，按 SONAME 建立提供库
    表。每条 `DT_NEEDED` 按导入库自身的来源选择提供库（完全相同路径 > 同目录 >
    同 APEX 模块 > 同分区 > 平台默认 `/system` > 默认 runtime APEX > 最长公共前缀），
@@ -49,12 +50,15 @@
    IFUNC 写入工作表，暂不执行。
 6. 验证并保存初始化/析构调用表，将空洞和对齐余量置为 `PROT_NONE`，按 PT_LOAD
    设置 R/RW/RX，禁止 W+X。无 IFUNC 时此处应用 RELRO；有 IFUNC 时延迟至其完成后。
+   默认擦除内存中的 ELF 头和程序头表（`keepelf` 可保留）；pad 与第一个 PT_LOAD
+   使用相同权限合并，使 ELF 头页位于某个 VMA 的中间而不是起点。
 7. 重定向到 EL0：保存全部 FPSIMD，执行提供库 IFUNC 并写入地址，用直接 `svc mprotect`
    应用延迟 RELRO，然后运行 `DT_INIT` 和正序 `DT_INIT_ARRAY`。IFUNC 的
    `AT_HWCAP`/`AT_HWCAP2` 在准备阶段从内核 `cpu_get_elf_hwcap()` accessor 读取；
    只有 accessor 不可用时才回退到目标 auxv。
-8. `unload` 新镜像时紧接着运行逆序 `DT_FINI_ARRAY` 和 `DT_FINI`。完成后通过
-   `getpid` 自陷恢复原始通用寄存器/PC/SP；统一清理回收临时区，并提交引用或解除镜像映射。
+8. `unload` 新镜像时紧接着运行逆序 `DT_FINI_ARRAY` 和 `DT_FINI`。完成后通过候选池
+   中随机选出的普通系统调用交回内核并恢复原始通用寄存器/PC/SP；统一清理回收临时区，
+   并提交引用或解除镜像映射。1.4.2 起注入路径不再使用 `getpid`。
 
 快照防止同次准备反复读取变化的文件，但不代表原子文件系统快照。调用方不要在加载期间
 修改文件。读取目标提供库也没有取得 bionic loader 锁，**提供库必须在整个准备及 payload
@@ -107,7 +111,7 @@ headers。目前支持：
 以下是 `kpatch <KEY> kpm ctl0 kclf` 的命令字符串；密钥不要写进脚本或文档：
 
 ```text
-inject,<tid>,/absolute/path/libpayload.so[,manual][,wake][,force][,unload]
+inject,<tid>,/absolute/path/libpayload.so[,manual][,wake][,force][,unload][,keepelf]
 inject,<tid>,/absolute/path/libpayload.so,linker[,wake][,force][,unload]
 status
 images[,cursor]
@@ -120,8 +124,13 @@ quiesce
 `manual` 是默认值。`status` 中成功加载会出现：
 
 ```text
-state=done ... via=manual image=12 refs=1 resident=<hex-base>+<decimal-size>
+state=done ... via=manual compl=64,22,113 image=12 refs=1 resident=<hex-base>+<decimal-size> hdr=scrubbed
 ```
+
+`compl=` 是该请求实际使用的随机完成候选（`read/write/futex/clock_gettime/ioctl/
+epoll_pwait/nanosleep/sched_yield` 的子集）；`hdr=scrubbed` 表示 ELF 头已擦除，
+`keepelf` 时为 `hdr=kept`。请求运行期间还会显示随机布局的
+`map=<base>+<len> code=<addr> guard=<addr>`。
 
 `image` 是十进制框架 ID，**不是 bionic handle**。请求表仅有4个槽；独立的32项
 镜像表在请求 `reap` 后仍保存驻留映像。`images` 输出有 `next=N` 时继续 `images,N`；
@@ -138,6 +147,11 @@ state=done ... via=manual image=12 refs=1 resident=<hex-base>+<decimal-size>
   才能排空模块。
 - 准备/重定位/安全点失败会回滚新映射；IFUNC/延迟 mprotect 返回可报告错误时，构造函数
   尚未执行，会安全回滚。resolver 异常、seccomp 杀进程等不会被当作普通返回值处理。
+- **ELF 头擦除**：manual 加载在映射后已经消费完头和程序头；本后端不会在运行期重新
+  读取它们。依赖 `__ehdr_start`/自身 ELF 头的 payload 需要显式 `keepelf`；此时页级
+  扫描仍能找到保留的头。
+- **随机 pad 与布局**：每次加载的镜像长度/基址不同，临时区域（代码、参数、私有页、
+  guard+栈）按随机顺序和随机填充页布置；不能假设固定页数、固定相对位置或单页起点。
 - 目标退出或 exec 后，由原 mm 释放映射，reap 只移除登记，不在控制进程 mm 中 munmap。
   不长期持有 `mm_users`，避免拖延进程地址空间和 Binder 的退出清理。
 - 已进入用户代码却没有可信完成结果时，不擅自卸载可能被回调/线程引用的镜像，登记为
@@ -157,6 +171,19 @@ state=done ... via=manual image=12 refs=1 resident=<hex-base>+<decimal-size>
 stock KernelPatch 不尊重模块 exit 的 `-EBUSY`，所以不能强行卸载。当无回调但仍有驻留
 镜像时被强制卸载，模块仅释放内核登记引用、报告 orphan，不从活进程背后强拆代码；
 这些镜像只能随目标退出回收。有在途回调时强卸载仍可能产生内核 use-after-free。
+
+## 1.4.2 / 1.4.3 防检测加固
+
+- 每次请求由 `kclf_codegen.c` 生成 EL0 程序：入口/完成偏移、十个寄存器角色、
+  FPSIMD 保存顺序和填充指令随机；完成系统调用从 8 个普通调用中随机选 2–3 个，
+  代码中没有字面系统调用号。
+- 1.4.3 去掉固定 `KCLFBAIL` 标记，EL0 恢复路径使用内核写入私有页的每请求随机
+  token；延迟 RELRO 的 `mprotect` 号也用同一 key 加密；入口前的重启填充指令随机化。
+- 临时映射的四个块（代码、ABI 参数、私有参数、guard+栈）随机排序并插入 0–2 页
+  随机填充；ABI 参数页、私有页未用部分和栈页随机填充。
+- manual 镜像增加 1–8 页随机前导 pad，并默认擦除 ELF 头/程序头。
+- 以上修改不改变加载、重定位、构造/析构和引用计数语义；检测边界和残余可观测面
+  见 [加固报告](OBSERVABILITY_HARDENING_20261030.md)。
 
 ## 验证与可复现性
 

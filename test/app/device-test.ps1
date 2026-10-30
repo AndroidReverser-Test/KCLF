@@ -172,7 +172,7 @@ try {
     Check ((Kpm @('list')).Text -match '(?m)^kclf$') 'module really loaded (not just adb exit code)'
     $Loaded = $true
     $Probe = (Ctl 'probe').Text
-    Check ($Probe -match 'pt_regs=ok' -and $Probe -match 'hook=getpid') 'register layout and completion hook available'
+    Check ($Probe -match 'pt_regs=ok' -and $Probe -match 'hook=random') 'register layout and randomized completion hooks available'
 
     Log 'CASE: main thread, wake + unload'
     Inject-App $TargetId $TargetId ',wake,unload'
@@ -263,17 +263,32 @@ try {
     Check ($Running -match 'map=([0-9a-f]+)\+(\d+)') 'app trampoline mapping observed'
     $MapStart = [Convert]::ToUInt64($Matches[1], 16)
     $MapSize = [UInt64]$Matches[2]
+    Check ($Running -match 'code=([0-9a-f]+) guard=([0-9a-f]+)') 'randomized code and guard positions reported'
+    $CodeStart = [Convert]::ToUInt64($Matches[1], 16)
+    $GuardStart = [Convert]::ToUInt64($Matches[2], 16)
     Check ($Probe -match 'page=(\d+)') 'page size reported'
     $PageSize = [UInt64]$Matches[1]
-    $GuardStart = ($MapStart + 2 * $PageSize).ToString('x')
-    $GuardEnd = ($MapStart + 3 * $PageSize).ToString('x')
-    $CodeStart = $MapStart.ToString('x')
-    $CodeEnd = ($MapStart + $PageSize).ToString('x')
+    $MapEnd = $MapStart + $MapSize
+    $CodeHex = $CodeStart.ToString('x')
+    $CodeEndHex = ($CodeStart + $PageSize).ToString('x')
+    $GuardHex = $GuardStart.ToString('x')
+    $GuardEndHex = ($GuardStart + $PageSize).ToString('x')
+    $StackHex = ($GuardStart + $PageSize).ToString('x')
     $Maps = Root "cat /proc/$TargetId/maps"
     $Maps | Set-Content -LiteralPath (Join-Path $Results 'maps-running.txt') -Encoding utf8
-    Check ($MapSize -eq 11 * $PageSize) 'app trampoline occupies eleven runtime-sized pages'
-    Check ($Maps -match "(?m)^$GuardStart-$GuardEnd ---p ") 'app trampoline stack has the exact PROT_NONE guard'
-    Check ($Maps -match "(?m)^$CodeStart-$CodeEnd r-xp " -and $Maps -notmatch '(?m)^\S+ rwxp ') 'code is RX, no RWX mapping in app'
+    $Range = @($Maps -split "`n" | Where-Object {
+        if ($_ -match '^([0-9a-f]+)-([0-9a-f]+) ') {
+            $Begin = [Convert]::ToUInt64($Matches[1], 16)
+            $Begin -ge $MapStart -and $Begin -lt $MapEnd
+        }
+    })
+    Check ($MapSize -ge 10 * $PageSize -and $MapSize -le 25 * $PageSize) 'randomized transient region occupies 10..25 pages'
+    Check ($CodeStart -ge $MapStart -and $CodeStart + $PageSize -le $MapEnd -and
+           $GuardStart -ge $MapStart -and $GuardStart + $PageSize -le $MapEnd) 'code and guard lie inside the transient region'
+    Check (@($Range | Where-Object { $_ -match "^$CodeHex-$CodeEndHex r-xp " }).Count -eq 1) 'exactly one RX page at the reported random code offset'
+    Check (@($Range | Where-Object { $_ -match "^$GuardHex-$GuardEndHex ---p " }).Count -eq 1) 'PROT_NONE guard at the reported random position'
+    Check (@($Range | Where-Object { $_ -match "^$StackHex-\S+ rw-p " }).Count -eq 1) 'transient stack starts immediately above the guard'
+    Check ($Maps -notmatch '(?m)^\S+ rwxp ') 'no RWX mapping in app'
     $Quiet = Ctl 'quiesce' -AllowFailure
     Check ($Quiet.Code -ne 0 -and $Quiet.Text -match 'quiesce=busy') 'busy quiesce keeps app completion hook alive'
     Check ((Await-State 'state=done') -match 'unload=ok') 'app constructor completes and unloads during quiesce'

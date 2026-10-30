@@ -1,4 +1,22 @@
-# KCLF 1.4.1
+# KCLF 1.4.3
+
+1.4.3 是防检测加固版本。它保留了 1.4.2 引入的“每次请求生成 EL0 程序”设计，并进一步
+移除了生成代码和临时映射里的固定锚点：
+
+* 生成程序不再嵌入固定的 `KCLFBAIL` 标记。EL0 恢复路径使用内核写入私有参数页的
+  每请求随机 token，扫描匿名可执行内存找不到框架字面量。
+* manual 后端在 IFUNC 之后应用的 RELRO `mprotect` 系统调用号也不再是代码中的
+  立即数，而是和完成系统调用表一样用每请求 key 加密后从私有页读取。
+* 临时映射的四个块（RX 代码、ABI 参数页、私有参数页、`PROT_NONE` guard + 栈）
+  按随机顺序排列，块之间插入 0–2 页随机填充；代码页不再固定在区域起点，参数页
+  不再总是紧跟代码页，guard 位置和总大小也不再可预测。所有未被立即覆盖的页都用
+  随机数据填充，不再呈现“新映射的零页”形态。
+* 入口前的重启填充指令也改为随机且只写死临时寄存器，不再固定为 `b .+0`。
+
+1.4.2 已将 1.4.1 报告中的两个真机检测点（固定 548 字节跳板指纹、已知 payload 的
+ELF 头/加载段内容）改为不再命中；1.4.3 继续收紧静态标记和布局锚点。检测边界和
+残余可观测面见 [1.4.2/1.4.3 加固报告](OBSERVABILITY_HARDENING_20261030.md) 与
+[1.4.2/1.4.3 进度](HARDENING_PROGRESS_20261030.md)。**本框架仍不承诺“不可检测”**。
 
 1.4.0 起默认使用 **manual 手动 ELF 加载后端**：由模块完成文件快照、映射、符号解析、
 重定位、权限/RELRO 和驻留生命周期管理，目标线程只执行 IFUNC resolver、构造/析构
@@ -29,8 +47,10 @@ linker 的替代品；导入 IFUNC 时仍需执行提供库中的 resolver，不
 完整变更、审计和验证边界见 [1.3.1 审计](COMPATIBILITY_1.3.1.md)。
 
 KCLF 是一个 ARM64 Android 的 KernelPatch 模块：在目标线程下一次返回用户态时重定向
-`pt_regs`，用一小段 EL0 trampoline 执行所选后端的用户态步骤，再通过 `getpid`
-自陷把寄存器完整恢复。它不使用 ptrace、不暂停目标、不安装信号处理器。
+`pt_regs`，用一段按请求生成的 EL0 程序在目标进程里完成所选后端的用户态步骤，再通过
+候选池中随机选出的普通系统调用（`read`/`write`/`futex`/`clock_gettime`/`ioctl`/
+`epoll_pwait`/`nanosleep`/`sched_yield`）交回内核并恢复寄存器。它不使用 ptrace、
+不暂停目标、不安装信号处理器、不在注入路径上调用 `getpid`。
 
 1.3.0 起支持**普通 64 位 Android 应用进程**：zygote fork 出来、带 seccomp 过滤器、
 运行在 `untrusted_app` 域里的第三方应用可以直接作为目标；同时也仍然支持自有 native
@@ -67,10 +87,10 @@ adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf probe
 adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf sym
 ```
 
-`probe` 会打印内核版本、BTF 布局、`pt_regs` 大小、页大小、wake 能力和 hook 状态。
-有 BTF 时验证结构偏移；没有 BTF 时通过内核 accessor 和目标自身的
+`probe` 会打印内核版本、BTF 布局、`pt_regs` 大小、页大小、wake 能力、hook 状态和
+随机完成候选池大小。有 BTF 时验证结构偏移；没有 BTF 时通过内核 accessor 和目标自身的
 `/proc/thread-self/maps` 读取，不猜结构偏移。无 BTF 的 `pt_regs` 大小由实际
-getpid wrapper 帧学习。必需符号/宿主能力仍需满足。
+syscall wrapper 帧学习。必需符号/宿主能力仍需满足。
 
 ## 控制接口
 
@@ -101,6 +121,7 @@ adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf inject,<tid>,/path/to/lib.s
 | `wake` | 用 `TWA_SIGNAL` 通知目标（upstream 5.8+），可打断 `epoll_pwait`/`futex`/`ioctl`/`nanosleep` 等阻塞；会改变被中断系统调用的时序 |
 | `force` | 跳过 linker/系统调用白名单启发式；不绕过 32 位、SVE/SME、跟踪器等硬性拒绝 |
 | `unload` | manual：新镜像构造后析构并回收；linker：调用 `__loader_dlclose`/`dlclose` |
+| `keepelf` | manual：保留内存中的 ELF 头和程序头（默认擦除）；供运行期读取自身 `__ehdr_start` 的 payload 使用 |
 
 手动驻留镜像由 `images` 单独列出；如有 `next=N`，继续执行 `images,N`。
 重复加载同一进程的同一完整路径只增加引用，不重跑构造函数。`release` 每次减少一个
@@ -127,8 +148,10 @@ adb shell ls /proc/<pid>/task
 
 普通应用进程有两点与自有 native 测试进程不同：
 
-* **seccomp**：zygote 给每个 app 安装的过滤器允许 `getpid`，所以完成自陷可以工作；
-  1.3.0 不再因为 `TIF_SECCOMP` 拒绝普通 app。
+* **seccomp**：zygote 给每个 app 安装的过滤器允许完成候选池中的普通系统调用
+  （`read`/`write`/`futex`/`clock_gettime`/`ioctl`/`epoll_pwait`/`nanosleep`/
+  `sched_yield`）。框架已不再依赖 `getpid` 完成自陷；1.3.0 起不因为 `TIF_SECCOMP`
+  拒绝普通 app。
 * **VMA 很多**：app 常有 2000+ 个 VMA，扫描上限已提高，并会扫描到高地址的
   `/apex/.../linker64` 与 `libc.so`。
 
@@ -215,16 +238,20 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
 1. **仅 64 位目标**。32 位 app 在 hijack 阶段以 `32-bit target unsupported` 拒绝。
 2. **不绕过调试/跟踪**。`TIF_SYSCALL_TRACE`、`SYSCALL_EMU`、`SINGLESTEP`、`UPROBE`
    仍拒绝；ptrace 调试器、strace 等场景不支持。
-3. **seccomp 允许，但不是任意过滤器的保证**。标准 zygote app 策略允许完成用的
-   `getpid`；若目标自己安装了杀死/拒绝 `getpid` 的过滤器，完成自陷无法到达，属于
-   不支持场景。manual 的 IFUNC/RELRO 路径还可能执行 `mprotect` syscall。
-   框架不绕过、不修改目标的 seccomp 策略。
-4. **SVE/SME 状态仍拒绝**；FPSIMD（q0–q31、FPCR/FPSR）在 trampoline 中保存恢复。
+3. **seccomp 允许，但不是任意过滤器的保证**。标准 zygote app 策略允许完成候选池
+   中的普通系统调用；若目标自己对所有候选安装 trap/kill 过滤器，完成自陷无法到达，
+   EL0 会走恢复路径返回，KPM 在目标下一次进入候选调用时回收临时映射并报告
+   `completion blocked`，不会挂死线程。manual 的 IFUNC/RELRO 路径还可能执行
+   `mprotect` syscall（系统调用号不在生成代码中）。框架不绕过、不修改目标的
+   seccomp 策略。
+4. **SVE/SME 状态仍拒绝**；FPSIMD（q0–q31、FPCR/FPSR）在 EL0 程序中保存恢复。
 5. **注入是异步的**：目标线程可能停在任意内核返回点。安全点判断只是启发式，不能
    证明用户态锁未被持有；`force` 只用于排障。
 6. **不冻结进程**：其他线程仍可并发 `mmap`/`munmap`、修改 linker 状态或发信号。
 7. **不保证不可观测**：临时/驻留映射、linker 模式的 loader 记录、构造函数副作用和
-   时序都可被目标观察；manual 不注册到 bionic 的 soinfo/调试/展开元数据。
+   时序都可被目标观察；manual 不注册到 bionic 的 soinfo/调试/展开元数据。1.4.2/1.4.3
+   消除了 1.4.1 报告中的固定跳板指纹、已知镜像 ELF 头锚点、固定 `KCLFBAIL` 字面量
+   和固定临时映射布局，但**不消除**“本进程可读的 payload 内容可被按内容扫描”这一事实；
 8. **目标退出时**：请求持有 `struct pid` 身份但不长期持有 `mm`，避免延后 `exit_mmap`
    导致 ActivityManager 收不到进程死亡；目标消失后由 `reap` 清槽，旧 mm 中的临时映射
    随最后使用者退出。
@@ -237,10 +264,21 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
 11. **不绕过 non-dumpable/ptrace 策略**：App 被系统标记为 non-dumpable 时，
     `/proc/self/auxv`、`/proc/self/mem` 对 App 自身凭据也可能是 `EACCES`。框架用
     内核 accessor 解决自己的 `AT_HWCAP` 需求，但不会替 payload 打开这些文件。
-12. **没有覆盖所有内核**：1.4.1 已在无 BTF 的 Android 12 / 5.10.66 / 4K 上实测；
+12. **没有覆盖所有内核**：1.4.3 已在无 BTF 的 Android 12 / 5.10.66 / 4K 上实测；
     其他 5.x、6.x、16K/64K 页仍需同一产物的真机回归。历史版本结果不是当前版本验收。
 
 ## 测试
+
+防检测回归（普通 App 自检夹具：旧方法 A/B、ELF 头页级扫描、残余内容扫描、
+`KCLFBAIL` 字面量扫描、系统调用 guard、`keepelf` 对照）：
+
+```powershell
+$env:KCLF_SUPERKEY = Read-Host 'KernelPatch superkey'
+python kpms/kclf/test/observability/run.py --serial '<SERIAL>' --rounds 5
+Remove-Item Env:KCLF_SUPERKEY
+```
+
+说明与规则边界见 [test/observability/README.md](test/observability/README.md)。
 
 默认 manual 后端（需要先构建 KPM；`--app` 仅使用已安装且停止的自有测试 App）：
 
@@ -300,10 +338,18 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 
 ## 文档
 
-- [MANUAL_LOADER.md](MANUAL_LOADER.md)：1.4.1 手动加载、依赖来源选择、边界与验证记录。
+- [MANUAL_LOADER.md](MANUAL_LOADER.md)：手动加载、依赖来源选择、随机 pad/ELF 头擦除、
+  `keepelf`、边界与验证记录。
+- [OBSERVABILITY_HARDENING_20261030.md](OBSERVABILITY_HARDENING_20261030.md)：1.4.2/1.4.3
+  对 1.4.1 两个检测点的加固设计、真机验证与残余暴露。
+- [HARDENING_PROGRESS_20261030.md](HARDENING_PROGRESS_20261030.md)：1.4.2/1.4.3
+  防检测改造的计划、逐项进度、验证和未完成事项。
+- [OBSERVABILITY_REPORT.md](OBSERVABILITY_REPORT.md)：1.4.1 普通 App 可观测性报告，
+  包含两项真机确认方法、正反例、检测副作用及被排除的方法；其方法 A/B 对 1.4.2+
+  不再适用，保留作为历史基线。
 - [LIBTEST_NAP_20261029.md](LIBTEST_NAP_20261029.md)：libtest.so 注入
   com.miHoYo.Nap 的实测、两个缺陷的根因、Perfare 输出与 payload 侧限制。
 - [COMPATIBILITY_1.3.1.md](COMPATIBILITY_1.3.1.md)：历史内核兼容修改、设备测试与未验证项。
 - [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)：1.3.0 的历史实现、兼容性、设备结果与限制。
-- `IMPLEMENTATION.md`、`HARDENING.md`、`OBSERVABILITY_AUDIT.md`：历史版本资料，
+- `IMPLEMENTATION.md`、`HARDENING.md`：历史版本资料，
   不代表当前实现；其中关于宿主补丁、seccomp 拒绝和默认行为的段落已过时。

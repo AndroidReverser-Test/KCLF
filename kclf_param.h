@@ -4,13 +4,18 @@
  *
  * The parameter block lives in a private anonymous page inside the target
  * address space. Offsets below are shared by the kernel side (kclf_exec.c) and
- * by the position independent trampoline (kclf_tramp.S); both include this
- * header, so the layout can only change in one place.
+ * by the position independent trampoline emitted by kclf_codegen.c; both
+ * include this header, so the layout can only change in one place.
  *
  * The trampoline scrubs the used region (rounded to 16 bytes) before the
- * completion trap; the unused page tail is untouched. Results are
- * handed to the kernel through x1 (loader handle), x2 (dlerror string pointer)
- * and x3 (dlclose return code), never through persistent target memory.
+ * completion trap; the unused page tail is untouched. Results are handed to
+ * the kernel through the registers of the completion syscall, never through
+ * persistent target memory.
+ *
+ * A second, immediately following private page (kclf_codegen.h KCLF_PV_*)
+ * stores the original register file, the randomized completion syscall list
+ * and the EL0 recovery marker.  It is never scrubbed: the EL0 recovery path
+ * needs it after the ABI page has already been wiped.
  */
 #ifndef _KCLF_PARAM_H_
 #define _KCLF_PARAM_H_
@@ -41,8 +46,5 @@
 
 #define KCLF_PATH_MAX 256
 #define KCLF_ERR_MAX 256
-
-/* completion trap: getpid with a magic x0, consumed by the kernel hook */
-#define KCLF_COMPLETION_NR 172
 
 #endif

@@ -25,17 +25,23 @@
 #include <asm/current.h>
 #include <asm/ptrace.h>
 #include <kclf_param.h>
+#include <kclf_codegen.h>
 
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.4.1"
+#define KCLF_VER "1.4.3"
 
 #define KCLF_MAX_REQ 4
-#define KCLF_CODE_MAX 1024 /* trampoline blob upper bound */
+#define KCLF_COMPL_MAX KCLF_PV_NRS_MAX
 
-/* mapping layout: [RX code][RW parameter][PROT_NONE guard][RW stack] */
-#define KCLF_STACK_PAGES 8
+/* mapping layout: one anonymous region whose four blocks (RX code, RW ABI
+ * parameter page, RW private parameter page, PROT_NONE guard + RW stack) are
+ * placed in a random order with random pad pages between them, so the code
+ * page is not at the region base, the parameter pair is not always adjacent to
+ * it, and the guard is not at a fixed offset.  Sizes are randomized too. */
+#define KCLF_MIN_STACK_PAGES 6
+#define KCLF_STACK_PAGES_SPAN 9
 
 /* request states, only mutated by the owner of the request */
 enum kclf_state
@@ -66,6 +72,7 @@ enum kclf_stage
 #define KCLF_F_UNLOAD 0x8 /* release after constructors (backend-specific) */
 #define KCLF_F_LINKER 0x10 /* explicit legacy bionic backend; manual is default */
 #define KCLF_F_RELEASE 0x20 /* release a manual image reference */
+#define KCLF_F_KEEPELF 0x40 /* keep in-memory ELF/program headers (manual) */
 
 struct kclf_manual_image;
 
@@ -110,8 +117,15 @@ struct kclf_req
     u64 map_addr;
     u64 map_len;
     u64 code_addr;
+    u64 guard_addr; /* PROT_NONE page below the transient stack */
     u64 param_addr;
+    u64 priv_addr; /* second parameter page: saved register file */
     u64 stack_top;
+    u64 entry_pc; /* where EL0 starts executing the generated program */
+    u64 compl_pc; /* resume PC of the completion syscall (svc + 4) */
+    u64 bail_token; /* per-request EL0 recovery marker (never a fixed magic) */
+    u8 compl_nrs[KCLF_COMPL_MAX]; /* randomized completion syscall list */
+    u8 compl_count;
 
     struct kclf_loader ld;
     struct kclf_manual_image *image; /* transaction; never the sole resident owner */
@@ -119,6 +133,7 @@ struct kclf_req
     u64 image_id, image_addr, image_len;
     u32 image_refs, init_count, fini_count;
     u32 ifunc_count, protect_count;
+    u32 image_hdr_kept; /* the resident manual image kept its ELF headers */
     u64 hwcap, hwcap2;
 
     /* saved context */
@@ -149,7 +164,6 @@ struct kclf_req
     struct callback_head work_prepare;
     struct callback_head work_hijack;
     struct callback_head work_cleanup;
-    u8 codebuf[KCLF_CODE_MAX] __attribute__((aligned(4)));
 };
 
 static inline int kclf_state_load(const struct kclf_req *r)
@@ -207,6 +221,9 @@ extern int kclf_page_size;
 extern u64 kclf_user_limit;
 extern int kclf_user_tbi;
 extern int kclf_ready;
+/* randomized completion syscall pool, registered by kclf.c */
+extern const int kclf_compl_pool[];
+extern const int kclf_compl_pool_num;
 
 /* kclf.c */
 int kclf_sym_lookup_all(void);
@@ -222,6 +239,7 @@ void kclf_exec_restore(struct kclf_req *r, struct pt_regs *regs);
 long kclf_exec_finish(struct kclf_req *r, int capture_err);
 int kclf_exec_probe(char *out, int outlen);
 int kclf_exec_init(void);
+int kclf_urd(u64 addr, void *buf, int len);
 int kclf_urds(u64 addr, void *buf, int len);
 int kclf_uwr(u64 addr, const void *buf, int len);
 int kclf_walk_vmas(u64 scratch, int (*visit)(u64, const char *, void *), void *context);

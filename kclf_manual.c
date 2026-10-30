@@ -5,6 +5,7 @@
  * reconstruction of bionic namespace/global interposition state. */
 #include "kclf_internal.h"
 #include "kclf_elf.h"
+#include <kputils.h>
 #include <linux/string.h>
 #include <linux/kernel.h>
 #include <syscall.h>
@@ -34,6 +35,7 @@ struct kclf_manual_image {
     char path[KCLF_PATH_MAX];
     u64 fini[KM_CALLS];
     int nodelete;
+    int hdr_kept; /* the creating injection kept the in-memory ELF headers */
     pid_t original_tid;
     u64 linker_base, linker_end;
 };
@@ -435,18 +437,23 @@ static int map_image(struct km_context *c)
     struct ke_object *o = &c->object;
     struct kclf_manual_image *m = c->r->image;
     struct ke_io fileio = c->io;
-    u64 base, length, bias, header = 0;
+    u64 base, length, bias, header = 0, pad;
     unsigned i;
     int rc;
     fileio.read = file_read;
     if ((rc = ke_headers(&fileio, 0, o)) || (rc = ke_file_layout(&fileio, o, c->file_size, kclf_page_size))) return rc;
-    length = o->high - o->low + o->alignment;
+    /* A random pad in front of the image keeps the ELF header away from every
+     * VMA boundary: the pad is given the first segment's protection later, so
+     * it merges into one mapping and a scanner that anchors on mapping starts
+     * never reads the header. */
+    pad = (u64)(1 + (int)(get_random_u64() % 8)) * (u64)kclf_page_size;
+    length = o->high - o->low + o->alignment + pad;
     base = kclf_ks.vm_mmap(0, 0, length, 3, 0x22, 0);
     if (!base || base >= (u64)-4095) return base ? (int)(long)base : -ENOMEM;
     /* Record ownership before any fallible write, so rollback cannot leak it. */
     m->map = base; m->length = length;
     if (base < o->low || base >= kclf_user_limit || length > kclf_user_limit - base) return -EFAULT;
-    bias = (base - o->low + o->alignment - 1) & ~(o->alignment - 1);
+    bias = (base + pad - o->low + o->alignment - 1) & ~(o->alignment - 1);
     m->bias = bias;
     for (i = 0; i < o->phnum; i++) {
         const struct ke_phdr *p = &o->ph[i];
@@ -533,7 +540,55 @@ static int protect_image(struct km_context *c)
             if (rc) return (int)rc;
         }
     }
+    /*
+     * The randomized pad in front of the image takes the first load segment's
+     * protection.  vm_area merging then makes the header page the middle of a
+     * mapping instead of its start, so a detector that anchors a candidate on
+     * /proc/self/maps region boundaries never sees an ELF header there.
+     */
+    {
+        u64 img = (o->bias + o->low) & ~(page - 1);
+        unsigned prot = 0;
+        int have = 0;
+        for (i = 0; i < o->phnum; i++) {
+            const struct ke_phdr *p = &o->ph[i];
+            if (p->type != 1 || !p->memsz) continue;
+            if (o->low >= p->vaddr && o->low - p->vaddr < p->memsz) {
+                prot = ((p->flags & 4) ? 1 : 0) | (p->flags & 2) | ((p->flags & 1) ? 4 : 0);
+                have = 1;
+                break;
+            }
+        }
+        if (have && img > m->map) {
+            rc = raw_syscall3(__NR_mprotect, m->map, img - m->map, prot);
+            if (rc) return (int)rc;
+        }
+    }
     return 0;
+}
+
+/*
+ * The manual loader has already consumed the ELF and program headers, and this
+ * backend rejects payload TLS/IFUNC/exceptions and never registers the image
+ * with the linker, so nothing re-reads them at runtime.  A byte-identical ELF
+ * header left in target memory is exactly what a known-payload detector anchors
+ * on, so drop it.  "keepelf" keeps the legacy layout for payloads that inspect
+ * their own __ehdr_start.
+ */
+static int scrub_headers(struct km_context *c)
+{
+    struct ke_object *o = &c->object;
+    struct ke_ehdr eh;
+    u8 zeros[sizeof(struct ke_ehdr) + KE_PHNUM * sizeof(struct ke_phdr)];
+    u64 total = sizeof(eh);
+
+    if (kclf_urds(o->header, &eh, sizeof(eh))) return -EFAULT;
+    if (eh.phoff >= sizeof(eh) && eh.phnum && eh.phnum <= KE_PHNUM && eh.phentsize == sizeof(struct ke_phdr)) {
+        u64 end = eh.phoff + (u64)eh.phnum * sizeof(struct ke_phdr);
+        if (end <= (u64)kclf_page_size && end <= (u64)sizeof(zeros)) total = end;
+    }
+    memset(zeros, 0, sizeof(zeros));
+    return kclf_uwr(o->header, zeros, (int)total);
 }
 
 static int reserve_image(struct kclf_req *r)
@@ -570,6 +625,7 @@ static int reserve_image(struct kclf_req *r)
         m->mm = r->mm;
         m->original_tid = r->pid;
         m->owner = owner;
+        m->hdr_kept = !!(r->flags & KCLF_F_KEEPELF);
         owner = 0;
         strncpy(m->path, r->path, sizeof(m->path) - 1);
         r->image_action = KM_NEW;
@@ -577,6 +633,7 @@ static int reserve_image(struct kclf_req *r)
     m->state = KM_BUSY;
     r->image = m;
     r->image_id = m->id;
+    r->image_hdr_kept = (u32)m->hdr_kept;
 out:
     unlock_registry();
     if (owner) kclf_ks.put_pid(owner);
@@ -615,6 +672,9 @@ long kclf_manual_prepare(struct kclf_req *r)
     c->io = (struct ke_io){c, kclf_user_limit, user_read, user_write, report, defer_ifunc};
     if ((rc = read_snapshot(c))) { step = "file snapshot"; goto out; }
     if ((rc = map_image(c))) { step = "ELF mapping"; goto out; }
+    if (!(r->flags & KCLF_F_KEEPELF)) {
+        if ((rc = scrub_headers(c))) { step = "ELF header scrub"; goto out; }
+    }
     r->image->nodelete = !!(c->object.flags1 & 8);
     if (r->image->nodelete && (r->flags & KCLF_F_UNLOAD)) {
         report(c, "DT_FLAGS_1 NODELETE conflicts with unload", ""); rc = -EOPNOTSUPP; step = "NODELETE policy"; goto out;
@@ -774,10 +834,11 @@ int kclf_manual_status(char *out, int length, unsigned start)
                                   (unsigned long long)m->id, m->original_tid, m->path);
             continue;
         }
-        off += kclf_scnprintf(out + off, length - off, "image=%llu state=%s refs=%u original_tid=%d base=%llx size=%llu path=%s%s\n",
+        off += kclf_scnprintf(out + off, length - off, "image=%llu state=%s refs=%u original_tid=%d base=%llx size=%llu hdr=%s path=%s%s\n",
                              (unsigned long long)m->id, m->state == KM_LIVE ? "live" :
                              (m->state == KM_BUSY ? "busy" : "abandoned"), m->refs, m->original_tid,
-                             (unsigned long long)m->map, (unsigned long long)m->length, m->path,
+                             (unsigned long long)m->map, (unsigned long long)m->length,
+                             m->hdr_kept ? "kept" : "scrubbed", m->path,
                              m->nodelete ? " nodelete" : "");
     }
     if (!count) off += kclf_scnprintf(out + off, length - off, "no manual images\n");

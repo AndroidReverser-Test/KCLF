@@ -6,8 +6,9 @@
 > 当前实现和本轮实测见 [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)。
 
 日期：2026-10-27。对应源码：`kpms/kclf`，模块版本 `1.1.0`。本文记录针对
-[OBSERVABILITY_AUDIT.md](OBSERVABILITY_AUDIT.md) 所做修改、设备实测结果和仍然
-存在的特征；不把“减少特征”表述成“不可检测”。
+原 2026-10-27 历史可观测性审计所做修改、设备实测结果和仍然
+存在的特征；不把“减少特征”表述成“不可检测”。旧审计文件已替换删除，
+当前版本结论见 [1.4.1 可观测性报告](OBSERVABILITY_REPORT.md)。
 
 ## 1. 改动摘要
 
