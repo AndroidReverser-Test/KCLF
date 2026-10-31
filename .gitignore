@@ -1,10 +1,11 @@
-# Intermediate files only; this nested repository already tracks test binaries.
+# Build outputs and local signing material.
 *.o
 *.d
-
-# test/app build products
-test/app/app.apk
-test/app/classes/
-test/app/dex/
-test/app/obj/
-test/app/*.keystore
+*.kpm
+*.so
+*.apk
+*.class
+*.dex
+*.keystore
+__pycache__/
+/build/

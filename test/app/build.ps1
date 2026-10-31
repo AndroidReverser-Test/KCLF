@@ -71,7 +71,7 @@ $Clang = Join-Path $NdkRoot 'toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64
 if (-not (Test-Path $Clang)) { Fail "NDK clang wrapper not found: $Clang" }
 
 if (-not $OutDir) {
-    $OutDir = Join-Path $PSScriptRoot '..\..\..\..\build\kclf-apptest'
+    $OutDir = Join-Path $PSScriptRoot '..\..\build\kclf-apptest'
 }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $OutDir = (Resolve-Path $OutDir).Path
@@ -89,7 +89,7 @@ $ClassFiles = @(Get-ChildItem (Join-Path $Work 'classes') -Recurse -Filter *.cla
 Run $D8 (@('--lib', $AndroidJar, '--min-api', '26', '--output', (Join-Path $Work 'dex')) + $ClassFiles) 'd8'
 
 Run $Clang @('-Wall', '-Wextra', '-Werror', '-O2', '-shared', '-fPIC',
-    '-Wl,-z,max-page-size=16384', (Join-Path $PSScriptRoot 'jni\host.c'), (Join-Path $PSScriptRoot '..\fpsimd.S'),
+    '-Wl,-z,max-page-size=16384', (Join-Path $PSScriptRoot 'jni\host.c'), (Join-Path $PSScriptRoot 'jni\fpsimd.S'),
     '-o', (Join-Path $Work 'obj\libkclfhost.so')) 'host clang'
 Run $Clang @('-Wall', '-Wextra', '-Werror', '-O2', '-shared', '-fPIC',
     '-Wl,-z,max-page-size=16384', (Join-Path $PSScriptRoot 'jni\payload.c'), '-o', (Join-Path $Work 'obj\libkclfapp_payload.so')) 'payload clang'

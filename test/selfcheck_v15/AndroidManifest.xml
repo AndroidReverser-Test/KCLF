@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.kclf.selfcheckv15">
-    <application android:label="KCLF self-check audit"
-        android:debuggable="false" android:extractNativeLibs="true">
-        <activity android:name=".MainActivity" android:exported="true" />
-    </application>
-</manifest>

@@ -12,7 +12,7 @@ param(
 $ErrorActionPreference = 'Stop'
 if ($SuperKey -notmatch '^[A-Za-z0-9_@.+-]+$') { throw 'Use a shell-safe superkey with this test runner.' }
 $ModuleDir = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
-$RepoDir = (Resolve-Path (Join-Path $ModuleDir '../..')).Path
+$RepoDir = $ModuleDir
 if (-not $Apk) { $Apk = Join-Path $RepoDir 'build/kclf-apptest/app.apk' }
 $Apk = (Resolve-Path -LiteralPath $Apk).Path
 if (-not $Kpm) { $Kpm = Join-Path $ModuleDir 'kclf.kpm' }

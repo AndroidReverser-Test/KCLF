@@ -1,4 +1,4 @@
-ifneq ($(filter-out clean test,$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
+ifneq ($(filter-out clean,$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
 ifndef TARGET_COMPILE
     $(error TARGET_COMPILE not set)
 endif
@@ -11,7 +11,6 @@ endif
 
 CC = $(TARGET_COMPILE)gcc
 LD = $(TARGET_COMPILE)ld
-PYTHON ?= python3
 
 INCLUDE_DIRS := include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 
@@ -43,9 +42,6 @@ kclf.kpm: ${objs}
 
 -include $(objs:.o=.d)
 
-.PHONY: all clean test
-test:
-	$(PYTHON) test/run_host_tests.py
-
+.PHONY: all clean
 clean:
 	rm -f kclf.kpm $(objs) $(objs:.o=.d)

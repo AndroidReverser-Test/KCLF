@@ -1,1 +1,2 @@
-# KCLF sources/docs are LF. Test binaries are detected as binary by git.
+# Keep sources, scripts and documentation portable across hosts.
+* text=auto eol=lf

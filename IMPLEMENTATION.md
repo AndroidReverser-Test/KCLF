@@ -1,719 +1,616 @@
-# KCLF KPM 实现说明（1.1 历史文档）
+# KCLF 1.5.4 实现说明 / Implementation
 
-> 1.5.0 结构变更（2026-10-30）：完成调用已从生成页内的 `svc` 改为调用真实 libc
-> `usleep()`/`open()`（RELRO 也调用 libc `mprotect`），私有参数页布局随机化并与 ABI
-> 页分离，优先借用目标线程栈。本文第 9/11 节的 trampoline/完成 trap 描述仅适用于
-> 1.4.3 及更早版本；当前实现与检测边界见 [DETECTION_POINTS.md](DETECTION_POINTS.md)。
->
-> 版本说明（2026-10-28）：以下保留 1.1 阶段的实现与历史测试记录，不再描述当前源码。
-> 1.2.0 的结构布局、取消 ABI、寄存器保护、11 页映射、卸载规则和设备结果见
-> [COMPATIBILITY_AUDIT.md](COMPATIBILITY_AUDIT.md)。下文“当前”均指当时版本。
-> 1.3.0 增加了普通 64 位 app 支持（seccomp、pending signal、VMA 上限、不长期持有 mm），
-> 并删除了全部 KernelPatch 宿主补丁；本文中依赖宿主排空/exit-veto 的段落已过时。
+[中文](#中文) · [English](#english) · [编译与使用 / Build and use](README.md)
 
-本文描述 `kpms/kclf` 当前的实际实现（代码即事实），包括触发链、寄存器处理、
-用户态 trampoline ABI、错误模型、可观测性分析与已知限制。
+本文以本分支源码为准。/ This document describes the source on this branch.
 
-2026-10-27 静态审计更正：当前实现仍可被目标进程自身观察，不能保证注入不可检测。
-第 14 节区分当时的源码事实与历史测试记录；当前版本结论见
-[1.4.1 可观测性报告](OBSERVABILITY_REPORT.md)。原历史审计文件已被替换删除。
-2026-10-27 已按审计做了一轮可观测性收敛（临时映射 40 KB、参数页擦除、默认不伪造
-signal、可选 `unload`、munmap 校验等），改动与设备实测见
-[HARDENING.md](HARDENING.md)。本文以下涉及 trampoline、参数页、控制面和清理
-路径的段落已同步到当前源码；历史设备输出仍不构成新的验证结论。
+## 中文
 
-设计目标来自 `kclf-design.md` / `kclf-shadow-design.md`；两份设计文档里依靠
-内核补丁才能实现的部分（`handle_mm_fault` 故障期派发、misc 设备 ioctl 控制面）
-在 KPM 环境中不可得，改用下面第 1 节列出的等价手段。
+### 1. 架构与源码分工
 
----
+KCLF 是 KernelPatch 加载的可重定位 KPM（`ld -r`），不是常规 Linux LKM。
+控制器通过 superkey 保护的 `kpatch ... kpm ctl0 kclf <命令>` 提交请求。
+内核安排目标线程自己的 `task_work`，在该线程的 mm、凭据及命名空间下准备映射，
+修改返回用户态的 `pt_regs`，让 EL0 跳板执行加载工作，随后恢复目标继续运行。
+用户态函数始终在 EL0 执行，内核不直接调用 SO 构造函数。
 
-## 1. 设计取舍（相对设计文档的偏差）
-
-| 设计文档方案 | 本实现 | 原因 |
-| --- | --- | --- |
-| misc 设备 + ioctl/poll 控制面 | KernelPatch superkey 保护的 `ctl0` 字符串通道 | KPM 无法注册字符设备；superkey 等价于原来的 fd 权限校验 |
-| `handle_mm_fault` 故障期派发（Tier-H） | 只改 `pt_regs`（Tier-L）：`task_work` 触发 + 返回用户态前重定向 | KPM 不能挂内核内部函数；故障路径需要页表级改写 |
-| 写故障 trap 检测 payload 完成 | `svc #0` + `getpid`(172) 系统调用 trap，cookie 在 `x0` | 无需新增页表项；cookie 用于关联请求，不隔离目标进程（见 11 节） |
-| 注入后可观测面为 0 | 部分收敛：临时跳板降到 40 KB 且参数页在完成前擦除；`unload` 模式可移除 `dlopen` 的持久映射/记录；默认仍保留常规映射与 linker 记录 | 见第 14 节、可观测性审计与 [HARDENING.md](HARDENING.md) |
-
-实现边界：
-
-* **不使用 ptrace**：不 attach、不注入信号处理器、不 `SIGSTOP`；这不能保证
-  `TracerPid` 恒为 0，目标可能已有其他 tracer。
-* **复用目标线程**：框架不显式创建用户线程或安装用户 fd；动态链接器和 payload
-  仍可能打开 fd、创建线程或产生其他副作用。
-* **临时映射回收**：完成路径通过 `work_cleanup`（在目标上下文里执行）调用
-  `vm_munmap`。其他线程可以在此前观察共享地址空间；回收现在会检查
-  `vm_munmap` 返回值并最多重试 8 次，失败时保留映射字段并在 `status` 里报告，
-  但不承诺映射必定删除。
-
----
-
-## 2. 文件与构建
-
-```
-kpms/kclf/
-  kclf.c            生命周期、符号/偏移解析、控制面、请求状态机、task_work 回调、getpid 完成 hook
-  kclf_exec.c       目标 ELF 解析、loader 解析、prepare/hijack/restore/finish、诊断
-  kclf_tramp.S      EL0 trampoline（位置无关、不建栈帧、末尾 svc 自陷）
-  kclf_internal.h   请求结构、阶段/状态枚举、符号表结构、跨文件原型
-  kclf_param.h      参数块 ABI（内核侧与 trampoline 共用的偏移常量）
-  Makefile          -r 链接成单个 .kpm（kclf.o + kclf_exec.o + kclf_tramp.o）
-  test/             测试目标与 payload（见第 17 节）
-```
-
-* 编译：`aarch64-none-elf-gcc -O2 -fno-stack-protector -fno-asynchronous-unwind-tables`，
-  KPM 头文件来自 `kernel/`（`-I` 见 Makefile）。
-* 模块元信息：`KPM_NAME("kclf")`、`KPM_VERSION(KCLF_VER)` = `1.1.0`、`KPM_LICENSE("GPL v2")`。
-* 三个目标文件用 `gcc -r` 合并；`kclf_tramp.S` 单独放在 `.text.kclf_tramp` 段，
-  便于内核侧用符号差值定位 blob 与字面量槽位。
-
----
-
-## 3. 生命周期
-
-### 3.1 `kclf_init`
-
-1. `kclf_slot_reset()` 清空 4 个请求槽。
-2. `kclf_page_size = kclf_detect_page_size()`，必须是 2 的幂。
-3. 校验 `stack_in_task_offset`、`thread_size`（来自 KernelPatch 的探测结果）。
-4. `kclf_sym_lookup_all()` 解析全部内核符号（见第 4 节），缺任何一个必要符号即
-   返回 `-ENOENT` 并打印缺失名（模块加载失败，不半初始化）。
-5. `kclf_probe_mm_offset()` 推导 `task_struct.mm` 偏移（见 4.2）。
-6. `kclf_exec_init()`（当前为空，保留扩展点）。
-7. `kclf_hook_install()` 安装 `getpid` 完成 hook；失败不卸载模块，只是
-   `inject` 会因为 `kclf_hook_ok == 0` 直接返回 `-EOPNOTSUPP`（便于现场排查）。
-8. `kclf_ready = 1`，打印 `ready, page=..., thread=..., hook=...`。
-
-### 3.2 `kclf_exit`
-
-1. `kclf_unloading = 1`（所有回调入口先看这个标志，避免卸载竞态）。
-2. 对每个请求：
-   * `ARMED` → `task_work_cancel(work_prepare)`；
-   * `READY` → `task_work_cancel(work_hijack)`；
-   * `PREPARING` → 直接置 `CANCELLED`（说明回调正在跑，靠下面的排空等待）。
-   * `RUNNING` 没有安全中止逻辑。
-3. `unhook_syscalln(172, ...)`。
-4. 最多轮询 3000 次检查 `busy`/`completing`/`loading_num`，每次有 `msleep`
-   时请求睡眠 1ms；缺少 `msleep` 时提前退出。循环结束后仍返回成功。
-
-当前代码先移除完成 hook，再进行上述有限等待，**没有保证所有回调已经排空**。
-因此不能把此卸载路径描述为安全排空；仍在执行或排队的工作可能引用模块代码。
-
----
-
-## 4. 内核符号与偏移
-
-### 4.1 符号解析
-
-全部通过 `kallsyms_lookup_name()`（KernelPatch 导出）解析，不使用
-`kallsyms_lookup_name_by_suffix`（部分部署版本未导出该符号）。
-带候选回退的项：
-
-| 用途 | 首选 | 回退 |
-| --- | --- | --- |
-| 用户态读 | `__arch_copy_from_user`（配合逐页预缺页） | `_copy_from_user` → `copy_from_user_nofault` |
-| 预缺页 | `fault_in_pages_readable` | `access_process_vm` |
-| 用户态写 | `__arch_copy_to_user` | `_copy_to_user` → KP 的 `compat_copy_to_user` |
-| 取消 task_work | `task_work_cancel` | `task_work_cancel_func` |
-| 唤醒阻塞任务 | `signal_wake_up_state` | `signal_wake_up` |
-| RCU 读锁 | `__rcu_read_lock` | 无（尽量用） |
-| 时间戳 | `ktime_get` | 无（缺失则时间字段为 0） |
-
-必需符号（缺失即加载失败）：`task_work_add`、`task_work_cancel*`、
-`find_task_by_vpid`、`vm_mmap`、`vm_munmap`、`find_vma`、`filp_open`、
-`kernel_read`、`fput`。可选：`get_task_mm`/`mmput`（用于 mm 偏移推导）、
-`msleep`（卸载等待）、`fault_in_pages_readable`/`access_process_vm`（冷页读取）、
-`signal_wake_up_state`（仅 `wake` 模式需要）。
-
-> 注意：`__arch_copy_from_user` / `__arch_copy_to_user` 返回"未拷贝字节数"，
-> 0 表示成功；KP 的 `compat_copy_to_user` 语义相反（返回已拷贝长度），
-> `kclf_uwr()` 里分别处理。
->
-> 设备实测（Android 12 / kernel 5.10）中 `_copy_from_user` 在 KPM task_work
-> 上下文里会返回 0 但不填充目标缓冲区，因此首选 `__arch_copy_from_user`；
-> 后者不会为未驻留的文件页缺页，读 ELF/符号前先用 `fault_in_pages_readable`
-> 逐页触摸，失败时回退 `access_process_vm`。
-
-### 4.2 `task_struct.mm` 偏移推导
-
-KernelPatch 用 `init_mm` 反查 `mm_offset`，但 `init_mm` 在部分内核不可解析
-（本机探测结果为 0）。因此本模块自带推导：
-
-1. `mm = get_task_mm(current)`，记下指针值 `want`；
-2. 在 `current` 的 `task_struct` 前 0x1800 字节里按 8 字节步长找等于 `want` 的字段；
-3. 用 `find_task_by_vpid(2)`（kthreadd，`mm == NULL`、`active_mm == init_mm`）
-   去掉等于 0 的候选；
-4. 命中即写入 `kclf_mm_off`（本机实测 1440，即 `0x5a0`）。
-
-推导失败则模块拒绝加载：后续所有安全检查都依赖 `kclf_task_mm()`。
-
----
-
-## 5. 控制面（ctl0 协议）
-
-KernelPatch 把 `kpatch <KEY> kpm ctl0 kclf <args>` 的 `<args>` 原样交给
-`kclf_ctl0()`。由于中间可能经过多种 shell 引用，参数按
-`空格 / 逗号 / 制表符` 统一切分（`kclf_tokenize`），因此两种写法等价：
-
-```
-kpatch <KEY> kpm ctl0 kclf inject,<tid>,<path>[,force][,wake][,unload]
-kpatch <KEY> kpm ctl0 kclf "inject <tid> <path> force"
-```
-
-| 命令 | 作用 |
+| 文件 | 职责与主要入口 |
 | --- | --- |
-| `probe` | 解析当前进程的 linker/libdl/libc、`__loader_dlopen` 地址，并检查本上下文能否取到合法 `pt_regs`（用于灰度验证内核兼容性） |
-| `inject,<tid>,<path>[,force][,wake][,unload]` | 排队一次加载请求 |
-| `status` | 打印请求表（状态/阶段/handle/错误文本）与后端可用性 |
-| `cancel,<slot>` | 取消仍在 `ARMED`/`READY` 的请求 |
-| `reap` | 回收 `finished` 槽位；对目标已退出/`exec` 的请求补记失败 |
-| `sym` | 打印本模块关心的内核符号解析结果（现场排障） |
-| `help` | 用法 |
+| [kclf.c](kclf.c) | KPM 生命周期、命令解析、请求槽、task_work、完成观察；`kclf_ctl0`、`kclf_work_*` |
+| [kclf_internal.h](kclf_internal.h) | 状态机、请求、运行时内核接口和限制 |
+| [kclf_compat.c](kclf_compat.c)、[kclf_btf.h](kclf_btf.h) | 内核布局和 ABI 验证、BTF 解析、访问器回退 |
+| [kclf_exec.c](kclf_exec.c)、[kclf_maps.h](kclf_maps.h) | 用户内存访问、VMA/loader 解析、临时映射、现场重定向和清理 |
+| [kclf_elf.c](kclf_elf.c)、[kclf_elf.h](kclf_elf.h) | 有界 ELF64 解析、哈希/版本符号查询、重定位解码 |
+| [kclf_manual.c](kclf_manual.c) | manual 文件快照、依赖闭包、权限、初始化表及镜像引用登记 |
+| [kclf_codegen.c](kclf_codegen.c)、[kclf_codegen.h](kclf_codegen.h)、[kclf_param.h](kclf_param.h) | 每请求 AArch64 机器码生成、随机私有布局和 EL0 ABI |
+| [test/app](test/app) | 普通 Android 测试目标、payload、构建和设备回归 |
 
-输出通过 KP 的 `compat_copy_to_user` 写回（`kclf_ctl0` 的 `out_msg`），
-缓冲区 1KB，超长截断。
+### 2. 初始化与运行时兼容
 
-默认行为（不带标志）：用 `TWA_RESUME` 排队，不调用 `signal_wake_up_state`，
-不伪造 pending signal；目标若在可中断睡眠中，请求会停在 `armed` 直到该调用
-自然返回。`force`：跳过 10.2 的安全点启发式。`wake`：恢复旧的低延迟路径，
-主动打断可中断睡眠，但会改变系统调用重启和耗时语义。`unload`：`dlopen`
-成功后调用 `__loader_dlclose`/`dlclose`，用于构造函数完成即自洽的 payload。
-`resume` 仍被接受，等价于默认行为。
+`kclf_init` 从 ARM64 翻译配置识别页大小，检查 KernelPatch 已知的内核栈布局，
+通过 `kallsyms_lookup_name` 精确解析 task_work、PID、VFS、mm、GUP 等入口。
+必需符号缺失时拒绝初始化；可选符号缺失时仅在已实现的回退条件下继续。
+代码接受的内核版本族为 `5.0 <= version < 7.0`，不是对所有设备的兼容认证。
 
----
+有 BTF 时检查 `task_struct.mm`、VMA 范围、mmap 锁和 `pt_regs` 的大小及关键偏移；
+并验证 `task_work_add` 通知参数与同名不同 ABI 的 `task_work_cancel`。
+取消优先选择明确的 `task_work_cancel_match` / `task_work_cancel_func`，
+其余情况结合 BTF 和有限版本基线决定，无法确认时拒绝。
 
-## 6. 请求对象与状态机
+没有可验证布局时：
+- mm 使用内核 `get_task_mm` / `mmput_async` 访问器；
+- VMA 使用目标上下文的 `/proc/thread-self/maps`，由 procfs 处理锁与 rb-tree/maple-tree 差异；
+- `pt_regs` 大小可从被观察的真实 syscall wrapper 帧学习，不能扫描内核栈猜测；
+- syscall hook 只用 nofault 读取；缺少 nofault 时通过可睡眠 poll task_work 使用 GUP。
 
-`struct kclf_req`（`kclf_internal.h`）是唯一的状态载体，`KCLF_MAX_REQ = 4`
-个静态槽位，全部位于模块 `.bss`（约 1.6KB/槽）。
+`probe` 输出 BTF、页大小、寄存器帧、VMA 方法、wake ABI、HWCAP 来源和完成观察能力。
+无 syscall 观察且无已知 `pt_regs` 时不能注入。TIF 宏不在 BTF 中，仍使用版本基线；
+6.16 的 UPROBE 位变化等已有处理，但厂商回移标志位仍需要核验。
 
+### 3. 控制面、身份和状态机
+
+命令使用逗号分隔，最多 8 个 token、512 字节解析缓冲区；数字只接受十进制无符号形式。
+路径必须是绝对路径、最多 255 字节，逗号没有转义机制。
+默认 manual，不会在失败时自动切到 linker；重复、冲突或未知选项直接报错。
+
+全局控制命令用原子 busy 标记串行化。最多 4 个请求槽，每个线程只能有一个活动请求。
+持有 `struct pid` 引用避免 PID 重用误认；mm 只记录身份，不长期持有 `mm_users`，
+以免阻碍进程退出和 Binder 清理。跨线程查找在 RCU 下完成，使用前复查身份。
+
+正常路径：
+
+```text
+IDLE -> ARMED -> PREPARING -> READY -> RUNNING -> DONE -> reap -> IDLE
+                  |           |          |
+                  +-----------+----------+-> FAILED
+ARMED -> cancel/quiesce -> CANCELLED -> reap -> IDLE
 ```
-IDLE ──inject──► ARMED ──prepare──► PREPARING ──► READY ──hijack──► RUNNING
-                   │                                   │               │
-                   ├── cancel ──► CANCELLED            ├── cancel ──► CANCELLED
-                   └── fail ────► FAILED               └── fail ────► FAILED
-                                                                       │
-                                                     completion trap ──┴──► DONE
-```
 
-关键字段：
+`DONE` 表示观察到了完整结果；仍需等待清理，`pending=` / `map=` 表示尚未排空。
+`stage=queue|prepare|hijack|loader|restore` 表示当前阶段或失败位置。
+每个排队和执行中的 task_work 都计入 `pending`，直到回调真正退出才释放引用；
+因此“已从 task_work 链表摘下”不等于“可以重用请求槽”。
 
-| 字段 | 含义 |
+### 4. 借用目标线程与安全点
+
+`inject` 建立请求后排队 `work_prepare`。默认 `TWA_RESUME` 等待线程自然返回 EL0；
+`wake` 使用经验证的 `TWA_SIGNAL` 唤醒可中断等待，没有人为挂起的用户信号。
+旧 bool 通知 ABI 不支持 wake，明确返回错误。
+
+prepare 在目标上下文完成可睡眠的文件、映射、符号工作，再排队 `work_hijack`。
+hijack 根据已验证/学习的帧大小定位栈顶 `pt_regs`，检查用户 PC/SP、EL0t、
+64 位目标、跟踪/模拟标志、SVE/SME 状态。基础 FPSIMD 可保存，SVE/SME 不支持，
+即使用 force 也拒绝；跟踪目标同样拒绝。
+
+默认还拒绝 linker 内部返回 PC 和非白名单系统调用边界；这只是启发式。
+`-EAGAIN` 时回滚，控制器稍后重新提交，不在同一次 task_work_run 中无限重排。
+`force` 仅跳过这些启发式，不能让持锁/重入或寄存器竞态消失。
+
+**x16/IP0 不能完整恢复**：最终 `RET x16` 必须用 x16 保存原 PC。
+AAPCS64 的 caller-saved 约定只适用于函数调用边界，不意味着任意中断点的 x16 都可丢弃。
+调用方应提供 x16 已无活跃值、没有相关锁/协议中间态的协作边界；
+框架的系统调用白名单无法证明这一条件。真实信号仍由内核正常处理，
+不保证对异步观察者呈现原子化的寄存器恢复。
+
+### 5. 临时映射、参数和现场重定向
+
+`kclf_exec_prepare` 分配一段匿名 RW 区，随机排列代码、ABI 参数、私有参数三个块，
+各为一页；各块之间和首尾可加 0–2 页随机填充。
+优先借用目标线程栈的可用下部空间：要求栈 VMA 至少 128 KiB、SP 下方至少 48 KiB，
+并预留 headroom；无法满足则增加 guard 页和 6–14 页临时栈。
+hijack 时还会检查借用栈的 SP 是否移动过大。
+
+所有临时页先随机填充；代码写入后改为 RX，专用栈 guard 改为 PROT_NONE，
+参数和栈保持 RW。代码和数据没有 W+X。完成准备后刷新指令缓存。
+私有页在前 4 KiB 布局窗口内随机分配保存 GPR、FPSIMD、FPCR/FPSR、结果和 token 的槽，
+ABI 页与私有页没有固定相邻关系。
+
+重定向前把 x0–x30、SP、PC、PSTATE 存在请求中，并把 GPR、SP、PC、NZCV 导出到私有页。
+随后只将返回帧的 PC/SP 指向跳板和选定栈，清除入口 BTYPE 并设置 `syscallno=-1`，
+避免 syscall restart 机制把跳板当作原调用返回。
+内核侧使用 `-mgeneral-regs-only -ffixed-x18`；
+保存/恢复 SIMD 的机器码在 EL0 执行。
+
+### 6. manual 后端：文件、映射与依赖
+
+`kclf_manual_prepare` 先在独立的 32 项镜像表中预留事务。
+按 TGID 的 `struct pid` 和 mm 绑定进程，同进程的 manual 镜像事务遇到正在处理项返回 busy；
+短原子元数据锁不会跨 VFS/GUP/mmap 或用户代码持有，也不冻结其他用户线程。
+
+新镜像的顺序：
+
+1. 用目标凭据打开文件，以有界快照读取，限制 64 MiB。快照避免反复解析变化的文件，
+   不是文件系统原子快照；加载期间不要修改文件。
+2. 验证 ELF64、小端、AArch64、ET_DYN 和 program headers，按 PT_LOAD 分配匿名镜像，
+   预留 1–8 页随机前导 pad 及对齐余量。逐段复制文件内容，BSS 使用匿名页的零填充。
+3. 默认擦除内存 ELF 头；程序头在满足首个页及前缀范围限制时一并清除。
+   解析元数据已在内核保存，后续不重新依赖这些头。`keepelf` 用于需自查 ELF 头的 payload。
+4. 扫描目标 VMA，解析有有效 ELF 和 SONAME 的已加载提供库。maps 路径优先可用，
+   验证的直接 VMA 遍历为回退；不把框架自己的 manual 镜像隐式当作依赖库。
+5. 根据导入对象的路径，为每条 DT_NEEDED 选择同名 SONAME 的提供库，并按稳定顺序
+   广度优先展开传递依赖，去重且处理环。
+6. 解析符号、执行可在内核完成的重定位，保存 IFUNC fixup 和初始化/析构表；
+   设置段权限，保存延迟 RELRO 范围，导出 EL0 调用元数据。
+
+提供库路径评分依次优先：完全相同路径、同目录、同 APEX、同分区、
+vendor/odm 来源对应的 VNDK APEX、平台 system/system_ext/product、runtime APEX，
+最后最长公共路径前缀。最高分的不同路径仍并列时失败；没有路径且多个候选也失败。
+这是来源启发式，不是 bionic namespace 的完整复刻。
+
+**不会自动加载依赖或增加其 linker 引用数**。整个准备和 payload 存活期间，
+调用方必须保证所有直接/传递依赖已加载且不会被其他线程 dlclose/munmap。
+框架没有取得 bionic loader 锁，无法提供并发卸载保护。
+
+### 7. ELF 符号、重定位与权限
+
+ELF 核心通过 `ke_io` 读写回调工作，不依赖内核结构布局或 section headers。
+表、字符串、符号及写入目标都检查边界；读表限制在真实可读 PT_LOAD 内，
+重定位写入限制在可写段内，拒绝越界、溢出和不支持语义。
+
+支持 SysV/GNU hash、版本符号 VERSYM/VERNEED/VERDEF、函数/数据/绝对符号；
+本地定义优先，未定义符号只在 DT_NEEDED 闭包中按序搜索。未定义弱符号可取零，
+强符号或所需版本未找到则失败。
+
+| 重定位 | 实际计算 |
 | --- | --- |
-| `state/stage` | 状态机；`stage` 记录失败发生点（queue/prepare/hijack/restore/loader） |
-| `id` | 全局自增序号（原子） |
-| `pid`/`comm` | 目标任务（`tid`）与进程名，用于状态机与回收判定 |
-| `mm`/`pgd` | 地址空间身份；`exec`/退出后不匹配则放弃请求（绝不写坏新 `mm`） |
-| `task` | 仅记录，不 deref（避免引用计数问题） |
-| `map_addr/map_len/code_addr/param_addr/stack_top` | 目标内临时映射布局 |
-| `ld` | loader 解析结果（`fn`/`dlerror`/`caller`/linker 区间/符号名） |
-| `saved`/`saved_orig_x0`/`saved_syscallno` | 被打断的 EL0 上下文 |
-| `woke` | 本次请求是否由我们制造了 pending-signal 标志（11.3 用） |
-| `handle`/`err_user`/`unload_rc` | 完成陷阱从 x1/x2/x3 取回的结果 |
-| `busy`/`completing`/`finished`/`cleanup_tries` | 并发保护 / 回收重试计数 |
-| `work_prepare`/`work_hijack`/`work_cleanup` | 三段 `callback_head` |
-| `codebuf[512]` | trampoline 副本（补丁后再拷入目标） |
+| NONE | 无写入 |
+| RELATIVE | `*(B + offset) = B + A` |
+| ABS64 / GLOB_DAT / JUMP_SLOT | `*(B + offset) = S + A` |
+| RELR | 位图/地址表指定位置的原值加 B |
+| Android APS2 packed RELA | 有界 SLEB128 解码后复用 RELA 逻辑 |
 
-`kclf_slot_by_task(task)` 只按"当前 task 是否等于某请求的 `run_task`/目标任务"
-匹配，用于完成 hook 与回调入口的快速索引；`run_task` 在 hijack 成功时写入，
-在 `kclf_slot_reset()` 里清零。
+B 是 load bias，S 是符号地址，A 是 addend；地址加法按 ELF 的模 2^64 语义。
+执行顺序为 RELR、APS2、普通 RELA 和 PLT RELA，共享累计重定位上限。
+导入提供库的 IFUNC 时记录 resolver、写入位置、addend 三元组，延迟到 EL0，
+不会从 EL1 执行 resolver；需要写 init/fini 数组的 IFUNC fixup 明确拒绝。
 
----
+镜像先整体 PROT_NONE，再给各 PT_LOAD 设置 R/RW/RX，空洞及尾部对齐空间保持不可访问。
+前导 pad 使用首个段的权限以允许 VMA 合并。
+**GNU_RELRO 在所有 EL0 初始化/析构工作完成后的 cleanup 中由 EL1 应用**；
+构造期间相关页仍可写，即使没有 IFUNC 也一样。失败逐范围重试，
+没有成功应用全部保护就不提交驻留镜像。这比常规 linker 更晚施加 RELRO。
 
-## 7. 触发链：三段 task_work
+### 8. 每请求生成的 EL0 程序
 
-不用 ptrace、不发真实信号，全部在目标线程**已经在内核里**的返回用户态路径上完成：
+`kclf_prog_build` 直接编码 AArch64 指令并回填分支。
+每请求随机代码页内容、入口偏移、x19–x26 的八种工作寄存器角色、
+FPSIMD 槽顺序、GPR 恢复顺序及只修改失活临时值的填充指令。
+入口前有一条可落入的 restart pad，入口为 `bti c`。
 
-```
-target 阻塞/运行
-   │  inject (默认):
-   │    task_work_add(work_prepare, TWA_RESUME)   ← 下一个返回边界执行，不唤醒
-   │  inject,wake:
-   │    signal_wake_up_state(task, 0) + TWA_SIGNAL ← 旧低延迟路径
-   ▼
-work_prepare   (目标上下文, 非原子)
-   check mm 身份 → kclf_exec_prepare() → task_work_add(work_hijack, TWA_RESUME)
-   ▼
-work_hijack    (同一次 exit_to_user_mode 循环内)
-   检查安全点 → 保存 pt_regs → pc/sp 重定向 → state = RUNNING
-   ▼
-目标执行 trampoline（EL0）：dlopen →（可选 dlclose）→ 擦参数页 → svc getpid
-   ▼
-kclf_getpid_before/after (KP 系统调用 hook, 172)
-   校验 task + cookie + x8 → 取 x1/x2/x3 → skip_origin → 回填寄存器 → DONE
-   → task_work_add(work_cleanup, TWA_RESUME)
-   ▼
-work_cleanup   (目标上下文)
-   读 dlerror 指针 → vm_munmap(临时映射，失败重试) → finished = 1 → 分类
-```
+程序先保存 q0–q31、FPCR、FPSR 到私有页，然后分后端执行：
 
-为什么必须拆成两段（prepare + hijack）：`prepare` 里要 `vm_mmap`、`mprotect`、
-读文件，可能睡眠；`hijack` 必须严格发生在"即将返回 EL0"的那一刻，不能有睡眠。
-`work_hijack` 用 `TWA_RESUME` 排队后，通常在同一次
-`exit_to_user_mode_loop` 的 `task_work_run()` 里紧接着执行，中间不会再返回用户态。
+- manual：逐个调用导入 IFUNC resolver，传入 HWCAP（含 Android IFUNC 参数标志）
+  和 `__ifunc_arg_t`，检查非零及 4 字节对齐结果，写回结果加 addend；
+  再执行 DT_INIT、正序 INIT_ARRAY；需要释放时执行逆序 FINI_ARRAY、DT_FINI。
+  构造函数的 argc/argv/envp 均为零。HWCAP 优先来自内核 accessor，缺失时读目标 auxv。
+- linker：调用 loader(path, RTLD_NOW, caller)，失败时可调用 dlerror；
+  `unload` 时再调用 dlclose，并记录返回值。
 
-`work_cleanup` 单独一段是因为完成 hook 运行在系统调用返回路径上，`vm_munmap`
-不应在 hook 里做（且需要在目标上下文里执行才能命中正确的 `mm`）。
+结果先复制到私有页，随后清零整个 ABI 页。恢复 q0–q31、FPCR/FPSR、SP、NZCV 和
+除 x16 外的 GPR，写入每请求非零随机完成 token，最后取原 PC 到 x16、
+恢复 x10 并执行 `RET x16`。保留原 x30；RET 令 BTYPE=00，
+可以返回 BTI 保护函数内部的被中断指令，避免 BR 的 BTYPE 导致异常。
 
----
+生成程序自身没有 SVC 指令；其完成尾部也不调用库、不制造故障或信号。
+但 payload、IFUNC 和 linker 调用仍可产生普通系统调用、信号和其他副作用。
+随机布局不构成不可检测保证，x16、匿名映射和中间现场仍可被观察。
 
-## 8. `prepare` 阶段
+### 9. 完成观察与清理
 
-`kclf_exec_prepare()`（`kclf_exec.c`）按顺序：
+EL0 写入 token 不触发专门的内核事件。观察有两条路径：
+- `kclf_token_before`：在候选池 70 个普通 syscall 的入口安装 before hook；
+  只检查被借用线程、mm、随机 token 和完整结果，不修改/吞掉该系统调用。
+  实际安装数量可能少于 70，状态显示 `done=syscall`。
+- `status/reap/quiesce`：给 RUNNING 线程排队单个 poll task_work，
+  在目标上下文用可睡眠 GUP 读取，状态显示 `done=poll`。
+  原请求带 wake 时 poll 也允许唤醒，避免目标完成后再次阻塞而无法清理。
 
-1. **路径与文件校验**（默认拒绝）
-   * 路径必须 `/` 开头、长度 < 256；
-   * `filp_open(path, O_RDONLY, 0)`（错误指针用 `>= -4095` 判定，不能用 `(long) < 0`，
-     内核指针强制转换后是负数）；
-   * `kernel_read` 读前 64 字节，校验 ELF：magic、`ELFCLASS64`、`ELFDATA2LSB`、
-     `EM_AARCH64`、`ET_DYN`/`ET_EXEC`、`phentsize`/`phnum` 合理；
-   * `fput`。
-   任何一步失败都在 `prepare` 阶段报告；此前排队可能已经唤醒目标，
-   不能把这一结果等同于目标完全未受影响。
-2. **loader 解析**（`kclf_loader_resolve()`）
-   * 遍历 `mm->mm_mt`（`find_vma` + `vma->vm_start/vm_end`），对每个 VMA 起始地址
-     直接试读 ELF 头；不依赖 `vma->vm_flags`（部分厂商内核偏移不一致，按它过滤
-     会漏掉 `ld-android.so`）；
-   * 用 `DT_SONAME` 识别 `ld-android.so`（linker）、`libdl.so`、`libc.so`；
-   * 逐个镜像查动态符号表拿 `__loader_dlopen` / `__loader_dlerror` /
-     `__loader_dlclose`（linker），找不到时退回 `libdl.so` 的
-     `dlopen`/`dlerror`/`dlclose`；
-   * `caller` 取 `libc` 基址（bionic 用 `find_containing_library(caller)` 决定命名空间，
-     因此必须是真实库内地址）；
-   * 校验 `fn` 非 0、4 字节对齐、落在用户地址空间内。
-3. **临时映射**
-   * `vm_mmap(NULL, 0, (2 + 8) * page, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0)`；
-   * 布局：`[0] 代码页`、`[1] 参数页`、`[2..9] 备用栈`（共 10 页 / 40 KB；`stack_top` = 映射末尾）；
-   * `code_addr = map`、`param_addr = map + page`、`stack_top = map + len`。
-4. **trampoline 准备**
-   * `code_len = kclf_tramp_end - kclf_tramp_start`，`ptr_off = kclf_tramp_ptr_slot - kclf_tramp_start`；
-   * `memcpy` 到 `r->codebuf`，`kclf_patch_ptr()` 把参数页地址写进 `movz/movk x19` 四连；
-   * `kclf_verify_patch()` **反解**这四条指令，必须还原出同一个地址，否则失败
-     （编译器的向量化/常量合并曾把这里算错，自检是硬性防线）；
-   * `kclf_uwr(code_addr, codebuf, code_len)` 拷入目标；
-   * `raw_syscall3(SYS_mprotect, code_addr, page, PROT_READ|PROT_EXEC)`
-     —— 代码页最终是 **R-X**，全程不存在 RWX；
-   * 参数块按 `kclf_param.h` 填写（新增 `dlclose`、`unload`）后拷入参数页。
-5. 任何失败：`kclf_free_user(r, 0)` 用 `vm_munmap` 撤销映射；失败会保留区间并
-   排 cleanup 重试，置 `FAILED/stage=prepare`。
+token 在最后 RET 前就写入，因此 poll 还检查保存的 PC 已离开整个临时区，
+避免中断恰落在恢复尾部时提前解除代码映射。
+只在结果字段完整读取后发布 DONE，再排队目标上下文的 cleanup：
+先应用全部 RELRO，随后提交/释放 manual 引用并解除临时区。
+RELRO 失败和映射清理失败有有界重试，耗尽后保留所有权和诊断，不能当作成功。
+`status` 先渲染再排队本次 poll，可能需要后续查询才能看到完成。
 
-失败文本示例：`open library failed rc=-2`（不存在）、`resolve loader failed rc=-3`、
-`mmap failed 0x...`、`trampoline patch verification failed`、`mprotect failed rc=...`。
+### 10. 驻留镜像、release 与退出
 
----
+请求槽和镜像表分开，reap 请求不会释放驻留代码。
+同进程、完全相同路径字符串的 manual 加载复用原镜像、增加 refs、不重复构造；
+不按 inode/符号链接去重，也不感知该路径的文件更新。
+`image-id` 是框架十进制 ID，不是 bionic handle。
 
-## 9. EL0 trampoline ABI
+`release` 可使用同 TGID/mm 的任一满足条件的存活线程。
+refs > 1 时只减一；最后引用执行析构并解除整段镜像映射。
+新镜像 `inject,...,unload` 在一次事务中构造、析构、回收；
+对已驻留镜像使用 unload 只是临时借还，不消耗已有引用。
+DF_1_NODELETE 镜像拒绝显式 release 和首次 unload，需目标退出才能排空。
 
-`kclf_tramp.S`（`.text.kclf_tramp`，当前 0xa0 字节）：
+用户代码已进入但完成结果不可信时，镜像可能标记 abandoned，
+需要进程退出后 reap；不能假定没有后台线程或回调引用。
+借用线程退出而进程其余线程仍在时也可能需要让整个进程退出。
+进程退出/exec 的旧 mm 负责回收映射，控制器不会在自己的 mm 中误执行 munmap。
 
-```
-   0: b    1f                  ; +4 是入口，向前跳一步避免擦除窗口落到 bti 上
-   4: bti  c                   ; BTI 内核/硬件要求
-   8: movz/movk x19, #<param>  ; 由内核写入的四条指令（字面量槽）
-  18: add  x0, x19, #0x40      ; path
-  1c: ldr  w1, [x19, #0x28]    ; dlopen flags
-  20: ldr  x2, [x19, #0x10]    ; caller
-  24: ldr  x16, [x19, #0x00]   ; fn = __loader_dlopen / dlopen
-  28: blr  x16
-  2c: str  x0, [x19, #0x18]    ; handle 暂存
-  30: cbnz x0, 2f              ; 失败才取 dlerror
-  34: ldr  x16, [x19, #0x08]
-  38: cbz  x16, 3f
-  3c: blr  x16
-  40: str  x0, [x19, #0x140]   ; dlerror 字符串指针
-  44: b    3f
-  48: (成功且 unload) ldr w3,[x19,#0x38]; ldr x16,[x19,#0x30]
-       ldr x0,[x19,#0x18]; blr x16; mov x10,x0
-  68: mov  x10, #0              ; 非 unload / 失败
-  6c: ldr  x1, [x19, #0x18]    ; handle
-  70: ldr  x2, [x19, #0x140]   ; dlerror 指针
-  74: ldr  x9, [x19, #0x20]    ; cookie
-  78: 清零 [x19, x19+0x150)    ; 整页参数（路径/cookie/指针）
-  8c: mov  x0, x9
-  90: mov  x3, x10             ; dlclose 返回值
-  94: mov  x8, #172            ; getpid
-  98: svc  #0
-  9c: b    .                   ; 内核不会返回这里；若返回则停住而不是跑飞
-```
+linker 后端的驻留 handle 由 bionic 管理，`images/release` 不管理它。
+需要立即平衡引用时使用 `inject,...,linker,unload`；
+否则由目标应用管理 handle 或等待进程退出。
 
-约定：
+### 11. 能力边界与卸载协议
 
-* 入口 `pc = code_addr + 4`（跳过 `b`），因此即便有 4 字节擦除窗口也仍落在 `bti c` 上；
-* `x19` 是参数页地址，全程只用 `x19`，不建栈帧、不碰 `sp`（所以调用者给的
-  `sp = stack_top` 就是 loader 的栈）；
-* 完成后结果只经寄存器回传：`x1=handle`、`x2=dlerror 字符串指针`、`x3=dlclose
-  返回值`；参数页在 `svc` 前已清零，目标内存不再保留路径/cookie/loader 地址；
-* 只有 `x19`/`x0`/`x1`/`x2`/`x3`/`x9`/`x10`/`x16` 被使用；loader 按 AAPCS 保存
-  其余 callee-saved 寄存器，`dlopen`/`dlclose` 返回后 `x19` 仍有效。
+manual 明确拒绝：PT_TLS/TLS 重定位、emutls、线程析构注册入口、
+需要解析的 payload 自定义 IFUNC、IRELATIVE、GNU_UNIQUE、REL/textrel、
+PT_INTERP、PT_GNU_PROPERTY、可执行栈、非可读或 W+X 段、共享/重叠 PT_LOAD 页、
+不支持的动态 flags/filter/preinit，以及跨 DSO CFI 导入。
+初始化/析构入口必须在 payload 自身可执行段。
 
-参数块（`kclf_param.h`，一页）：
+manual 不插入 soinfo、TLS、debugger 或异常展开登记，不自动调用 JNI_OnLoad。
+不保证 C++ 异常、栈展开、ART/JNI、dlsym/dladdr/dl_iterate_phdr 识别，
+也不复刻全局符号抢占和 namespace。需要这些集成时评估显式 linker 后端。
+目标凭据、SELinux、seccomp 和 non-dumpable 状态未被自动放宽；
+payload 自己调用 API 的限制仍生效。
 
-| 偏移 | 内容 |
+主要上限：4 请求、32 镜像、64 MiB 文件、256 MiB ELF 跨度/最大对齐、
+64 program headers、每对象 64 NEEDED、512 提供库、128 依赖闭包成员、
+50 万动态符号、100 万累计重定位、16 MiB APS2、128 初始化和 128 析构、
+64 IFUNC fixup、8 RELRO 范围、16384 个 VMA 遍历步数。
+调用表和 IFUNC 表还必须共同装入一页 ABI，镜像额外 pad/对齐会增加实际预留长度。
+
+卸载顺序：
+
+1. `quiesce` 禁止新 inject；已排队且可取消的请求取消，运行请求继续排空，release 仍允许。
+2. 调用方停止 payload 线程、注销异步回调并保证无活跃代码指针。
+   用 images/release 排空全部 manual 引用，NODELETE/abandoned 目标需要退出。
+3. 重复 status/reap/quiesce，确认 `quiesce=idle`。
+4. 才调用 `kpm unload kclf`。quiesce 后没有恢复接收命令，需重新加载 KPM。
+
+引用计数不是代码无人执行的证明。stock KernelPatch 即使 exit 返回 -EBUSY 也可能释放模块；
+强制卸载仍有 task_work 指向已释放代码的风险。无回调但有驻留镜像时，
+退出仅释放内核登记，活进程中的 orphan 映射要等其退出回收。
+
+### 12. 编译与测试 App 如何衔接
+
+Makefile 使用 KernelPatch 头文件，以 freestanding、无 libc、无栈保护/展开表、
+严格警告及 `-mno-outline-atomics` 编译六个 C 对象，避免旧 KPM ABI 缺失原子 libcall，
+最后 `ld -r` 生成 kclf.kpm。它不会构建 Android payload，也不是 NDK 内核模块构建。
+
+App 的 build.ps1 依次调用 javac、d8、NDK clang、aapt2、zipalign 和 apksigner，
+不依赖 Gradle；输出在独立仓库自己的 build/ 下，支持 -OutDir。
+APK 使用 API 26 最低版本、targetSdk 35、debuggable 和 extractNativeLibs。
+NDK SO 使用 16 KiB 段对齐，这不等于 16 KiB 页设备认证。
+
+MainActivity 加载 host JNI 库并输出 PID、filesDir、nativeLibraryDir；
+主线程回到 Looper，Java sleeper 周期睡眠，四个 native idle 线程阻塞 pipe read，
+FP 线程通过 jni/fpsimd.S 验证 nanosleep 两侧的 q0/q8/q31 和 FPCR/FPSR。
+payload 构造函数写 files/hit_<pid>，记录 PID/TID 和构造地址；
+另外编译 FP 破坏和两秒延时版本。
+
+device-test.ps1 支持 manual/linker、重复次数、指定 APK/KPM 和 poll 预期，
+检查 marker、映射回收、引用、取消、多槽、退出/restart、FPSIMD 和排空卸载，
+同时保存日志并检查新增内核告警/App 崩溃。它会安装和停止自建测试 App，
+不会把编译成功当作设备回归通过。历史实验和其他测试保留在 dev；
+构建复现和控制命令见 README。
+
+## English
+
+### 1. Architecture and source map
+
+KCLF is a relocatable KernelPatch KPM built with `ld -r`, rather than a standard
+Linux LKM. A controller submits superkey-protected `kpatch ... kpm ctl0 kclf`
+commands. The kernel schedules task_work on the target thread, prepares mappings
+in its mm, credentials and namespaces, redirects its return-to-user pt_regs,
+and lets an EL0 trampoline perform the loading work before resuming the thread.
+User functions, including constructors, execute in EL0.
+
+| Source | Responsibility and entry points |
 | --- | --- |
-| `0x00` | loader 入口（`__loader_dlopen` 或 `dlopen`） |
-| `0x08` | `dlerror` 入口，0 表示不可用 |
-| `0x10` | `caller`（libc 内地址，用于命名空间解析） |
-| `0x18` | handle 暂存 |
-| `0x20` | 完成 cookie |
-| `0x28` | `dlopen` flags（`RTLD_NOW`） |
-| `0x30` | `dlclose` 入口，0 表示不可用 |
-| `0x38` | unload 标志（0/1） |
-| `0x40` | 库路径（≤255 字节，`\0` 结尾） |
-| `0x140` | `dlerror()` 字符串指针（不是文本） |
-| `0x148` | 参数区结束（清零到 `0x150`，余下为页内对齐） |
+| [kclf.c](kclf.c) | KPM lifecycle, commands, request slots, task_work and completion; kclf_ctl0, kclf_work_* |
+| [kclf_internal.h](kclf_internal.h) | States, requests, runtime kernel interfaces and limits |
+| [kclf_compat.c](kclf_compat.c), [kclf_btf.h](kclf_btf.h) | Runtime layouts, ABI validation, BTF and accessor fallbacks |
+| [kclf_exec.c](kclf_exec.c), [kclf_maps.h](kclf_maps.h) | User access, VMA/loader lookup, transient mapping, redirection and cleanup |
+| [kclf_elf.c](kclf_elf.c), [kclf_elf.h](kclf_elf.h) | Bounded ELF64, hash/version lookup and relocation decoding |
+| [kclf_manual.c](kclf_manual.c) | File snapshots, dependencies, protection, call vectors and image references |
+| [kclf_codegen.c](kclf_codegen.c), [kclf_codegen.h](kclf_codegen.h), [kclf_param.h](kclf_param.h) | Per-request AArch64 machine code, private layouts and EL0 ABI |
+| [test/app](test/app) | Android target, payloads, build and device regression |
 
-> payload 的构造函数在 `dlopen` 内部执行，此时该线程正持有 linker 锁：
-> payload **不得**再调用 `dlopen`/`dlsym`（会自死锁），也不应长时间阻塞。
-> `unload` 模式下 `dlclose` 在构造函数返回后执行；若 payload 还有线程在执行库内
-> 代码，卸载会崩溃，调用者需自行保证。
+### 2. Initialization and runtime compatibility
 
----
+kclf_init derives the page size from ARM64 translation configuration, checks the
+KernelPatch-discovered kernel stack layout, and resolves exact kernel symbol
+names for task_work, PID, VFS, mm and GUP services using kallsyms_lookup_name.
+Missing required symbols fail initialization; optional services have specific
+fallbacks. The accepted version family is `5.0 <= version < 7.0`, which is not a
+certification of every device.
 
-## 10. `hijack` 阶段
+When BTF is present, the module validates task_struct.mm, VMA bounds, mmap lock,
+and pt_regs size and key offsets. It also checks task_work_add notification ABI
+and the incompatible implementations sharing the task_work_cancel name.
+Unambiguous cancel_match/cancel_func APIs take priority; remaining cases use BTF
+and limited version baselines, rejecting unknown ABIs.
 
-### 10.1 `pt_regs` 定位
+Without verified layouts:
+- mm uses get_task_mm/mmput_async accessors;
+- /proc/thread-self/maps supplies a kernel-locked VMA view independent of
+  rb-tree/maple-tree internals;
+- pt_regs size can be learned from a real observed syscall-wrapper frame,
+  without scanning the stack for a plausible frame;
+- syscall hooks use nofault reads only; sleepable poll task_work can use GUP.
 
-`kclf_find_regs()`：
+probe reports BTF, pages, register frame, VMA method, wake ABI, HWCAP source and
+completion observation. Injection requires syscall observation or an already
+known pt_regs layout. TIF macros are absent from BTF and still use version
+baselines, including the 6.16 UPROBE bit change; vendor backports need verification.
 
-1. 不依赖 KernelPatch 的 `_task_pt_reg` 导出（老版本不导出，模块会加载失败）；
-2. 从 `get_stack(current) + thread_size` 起按 288/296/…/400 逐个回退候选，用
-   `kclf_regs_basic()` 校验：帧位于当前线程内核栈顶下方 1KB 内、8 字节对齐、
-   `pc` 4 字节对齐且落在 `(0x1000, 0x8000000000)`、`sp` 16 字节对齐、
-   `pstate & PSR_MODE_MASK == 0`（EL0t）、高 32 位为 0；
-3. 再用更严格的 `kclf_regs_sane()`（额外要求 `syscallno ∈ [-1, 600]` 且
-   `syscallno == regs[8]`）确认；本机 5.10 命中 336。
+### 3. Control plane, identity and request states
 
-### 10.2 安全点判定
+Commands are comma-separated, with at most eight tokens and a 512-byte parser
+buffer. Integers are unsigned decimal. Paths must be absolute, at most 255 bytes,
+and cannot contain escaped commas. Manual is the default; failures never trigger
+automatic linker fallback. Unknown, duplicate or conflicting options fail.
 
-`inject` 的 `force` 未设置时，`kclf_exec_hijack()` 会拒绝以下边界并返回 `-EAGAIN`：
+An atomic busy flag serializes control commands. There are four request slots
+and at most one active request per thread. A struct pid reference prevents PID
+reuse confusion. mm is an identity only: the module does not retain mm_users and
+delay process/Binder teardown. Task lookup uses RCU and identity rechecks.
 
-1. `pc` 落在 linker 的映射区间内（不能在 linker 里递归进 linker）；
-2. `syscallno` 不在白名单（`epoll_pwait`、`ioctl`、`nanosleep`、`clock_nanosleep`、
-   `read/write/readv/writev`、`ppoll`、`sendmsg/recvmsg`、`getpid/getuid/gettid`、
-   `sched_yield`、`rt_sigprocmask`、`*stat*`、`fsync`、`epoll_pwait2`… 共 28 个；
-   arm64 的 `nanosleep` 编号是 **101**，列表已按此修正），
-   目的是避开 malloc/linker 临界区，防止注入后 payload 里的 `dlopen` 自锁；
-3. `TIF_NOTIFY_SIGNAL` 置位；
-4. `TIF_SIGPENDING` 置位且**不是**本次请求自己制造的标志（`r->woke`）。
-
-`-EAGAIN` 会重新以 `TWA_RESUME` 排队，最多 8 次；仍失败则
-`FAILED/stage=hijack` + 提示"中途点在 linker/分配器临界区，可重试或使用 force"。
-`force` 模式下上述 1–4 全部跳过（调用者承担风险）。
-
-32 位目标：`pstate & PSR_MODE32_BIT` 命中即返回 `-EOPNOTSUPP`
-（`FAILED/stage=hijack  32-bit target unsupported`）。
-
-### 10.3 重定向
-
-只改三个字段：
-
-```c
-r->saved = { regs[0..30], sp, pc, pstate };   /* 完整快照 */
-r->saved_orig_x0 = regs->orig_x0;
-r->saved_syscallno = regs->syscallno;
-
-regs->pc = r->code_addr + 4;   /* trampoline 入口（bti 之后） */
-regs->sp = r->stack_top;       /* 备用栈顶 */
-regs->syscallno = -1;          /* 入口不是系统调用返回，屏蔽重启机制 */
+```text
+IDLE -> ARMED -> PREPARING -> READY -> RUNNING -> DONE -> reap -> IDLE
+                  |           |          |
+                  +-----------+----------+-> FAILED
+ARMED -> cancel/quiesce -> CANCELLED -> reap -> IDLE
 ```
 
-`x0` 保持目标原值不动（cookie 由 trampoline 在 `svc` 前自己设置），
-因此目标寄存器文件除了 `pc`/`sp` 之外未被改写；`RUNNING` 状态与
-`kclf_loading_num`（原子计数）在此写入，完成 hook 用它们做快速过滤。
+DONE means a complete result was observed; cleanup may still be pending.
+pending= or map= means draining is incomplete.
+stage=queue|prepare|hijack|loader|restore identifies progress or failure.
+Every queued and executing task_work holds a pending reference until its callback
+actually exits. A detached callback is not yet safe to reuse.
 
----
+### 4. Borrowing a thread and choosing a boundary
 
-## 11. 完成与恢复
+inject queues work_prepare. Default TWA_RESUME waits for a natural EL0 return;
+wake requests the validated TWA_SIGNAL mechanism to wake interruptible waits
+without synthesizing a pending user signal. Older bool notification ABIs reject wake.
 
-### 11.1 完成 trap
+Preparation performs sleepable I/O, mapping and symbol work in target context,
+then queues work_hijack. Hijack locates pt_regs using its verified/learned size,
+checks PC/SP, EL0t, 64-bit execution, tracing/emulation flags and SVE/SME state.
+Only base FPSIMD is supported. SVE/SME and traced targets remain rejected with force.
 
-`kclf_hook_install()` 用 `hook_syscalln(172, 0, before, after, 0)` 挂到
-KernelPatch 的系统调用分发器（`invoke_syscall`/`el0_svc_common`）上。
+Default heuristics also reject a PC inside the linker and non-allowlisted syscall
+boundaries. EAGAIN rolls preparation back for a later controller retry, rather
+than requeueing indefinitely at the same task_work_run boundary.
+force only bypasses these heuristics; it cannot remove lock or reentrancy hazards.
 
-`before` 匹配条件全部满足才消费：`kclf_loading_num != 0`、存在当前任务的请求、
-`saved_valid`、`state == RUNNING`、`regs->regs[0] == cookie`、`regs->regs[8] == 172`。
-命中后置 `completing = 1`、`skip_origin = 1`（不执行真正的 `getpid`）、`ret = 0`。
+**x16/IP0 cannot be fully restored:** the final RET x16 uses it for the original PC.
+AAPCS64 caller-saved rules apply at call boundaries, not arbitrary interruptions.
+The caller needs a cooperative point where x16 is dead and relevant locks or
+protocol state permit payload execution. The syscall allowlist proves neither.
+Real signals retain normal kernel handling, and asynchronous observers can see
+intermediate register-restoration states.
 
-`after` 负责：`kclf_exec_restore()` → `args->ret = regs->regs[0]` →
-`state = DONE` → 递减 `loading_num` → 排 `work_cleanup`。
+### 5. Transient mapping, parameters and redirection
 
-> `args->ret = regs->regs[0]` 不是可选项：KP 的分发器在 after 回调**之后**才把
-> `args->ret` 写回 `regs->regs[0]`。漏这一句会被写成 0，导致被重启的系统调用
-> 参数指针变成 NULL（实测表现为 `nanosleep` 返回 `EFAULT`）。
+kclf_exec_prepare allocates anonymous RW memory and randomly orders three
+one-page blocks: code, ABI parameters and private state. It adds zero to two
+padding pages between blocks and at the ends. It first tries borrowing unused
+space below the target SP, requiring a stack VMA of at least 128 KiB and at least
+48 KiB below SP, with headroom. Otherwise it adds a guard page and a six-to-fourteen
+page temporary stack. Hijack rechecks that a borrowed SP has not moved too far.
 
-cookie 用 `get_random_u64()` 生成，只在 prepare 到完成陷阱之间暂存于目标参数页；
-trampoline 在 `svc` 前擦除整页，完成后结果经 `x1/x2/x3` 回传。cookie 对目标本身
-不保密，不能把此机制描述为“目标无法伪造”或安全隔离边界。
+Pages start with random filler. Written code becomes RX, the dedicated stack guard
+becomes PROT_NONE, and parameter/stack pages remain RW. No code/data page is W+X;
+instruction caches are flushed after preparation. Private GPR, FPSIMD, FPCR/FPSR,
+result and token fields occupy random nonoverlapping offsets within a 4 KiB layout
+window, even with larger pages. ABI and private pages are separate randomized blocks.
 
-### 11.2 恢复
+Before redirection, the request saves x0–x30, SP, PC and PSTATE; the private page
+receives GPRs, SP, PC and NZCV. The return frame then receives the trampoline PC/SP,
+cleared entry BTYPE and syscallno=-1 to avoid syscall restart handling.
+Kernel code uses -mgeneral-regs-only and -ffixed-x18; EL0 machine code preserves SIMD.
 
-`kclf_exec_restore()` 先把 31 个通用寄存器、`sp`、`pc`、`pstate`、
-`syscallno` 全部还原，再处理系统调用重启语义。
+### 6. Manual loading: file, mapping and dependencies
 
-### 11.3 被中断系统调用的重启语义（本实现的重点与坑）
+kclf_manual_prepare reserves a transaction in a separate 32-entry image table.
+Images are owned by TGID struct pid plus mm. A busy image transaction prevents
+another manual transaction in that process. A short atomic metadata lock never
+spans VFS, GUP, mmap or user code; other user threads are not frozen.
 
-`task_work` 可能在两种边界上执行，必须都正确：
+For a new image:
 
-**情况 A：内核已经做过回退。** 若被打断的系统调用返回
-`-ERESTARTNOINTR/-ERESTARTNOHAND/-ERESTARTSYS/-ERESTART_RESTARTBLOCK`，
-arm64 的 `do_signal()` 在进入 `get_signal()` 之前就已经把 `pc` 回退到 `svc`、
-`x0` 还原成 `orig_x0`，并把 `syscallno` 置为 `-1`。此时快照里的
-`pc` 指向 `svc` 指令本身（`0xd4000001`），恢复时**不能**再回退一次。
+1. Open with target credentials and read a bounded snapshot, at most 64 MiB.
+   This avoids reparsing changing file contents but is not an atomic filesystem
+   snapshot; do not modify the file during loading.
+2. Validate little-endian ELF64/AArch64 ET_DYN and program headers. Reserve an
+   anonymous image with one-to-eight random leading pages and alignment slack.
+   Copy PT_LOAD file bytes; anonymous zero-fill supplies BSS.
+3. Scrub the in-memory ELF header by default. Program headers are also cleared
+   when their extent fits the first-page/prefix bounds. Kernel metadata is already
+   captured. keepelf supports payloads that inspect their own headers.
+4. Scan VMAs for valid loaded ELF providers with SONAMEs. Prefer maps pathnames,
+   with verified direct VMA traversal as fallback. Existing manual images are
+   excluded as implicit dependency providers.
+5. Resolve each DT_NEEDED using the importing object's origin and expand a stable
+   breadth-first transitive dependency closure with deduplication/cycle handling.
+6. Resolve symbols and kernel-side relocations, retain IFUNC fixups and call
+   vectors, set segment permissions, record deferred RELRO and export EL0 metadata.
 
-**情况 B：内核还没回退。** 快照里 `pc` 指向 `svc` 的下一条指令、`x0` 仍是
-`-ERESTART*`。此时需要我们自己 `pc -= 4`、`x0 = orig_x0`，并对
-`-ERESTART_RESTARTBLOCK` 把 `x8` 设为 `__NR_restart_syscall(219)`。
+Provider ranking prefers exact path, same directory, same APEX, same partition,
+VNDK APEX for vendor/odm importers, platform system/system_ext/product, runtime APEX,
+then longest common path prefix. Distinct paths tied for highest score fail.
+Multiple candidates without usable paths also fail. This origin heuristic does
+not reconstruct bionic namespaces.
 
-判别方式：读 `pc` 与 `pc-4` 处的指令字（`kclf_is_svc()`）：
-`pc` 是 `svc` → 情况 A，原样恢复；`pc-4` 是 `svc` → 情况 B，自己回退；
-两者都不是 → 兜底返回 `-EINTR`。回退时同时把 `syscallno` 置 `-1`，
-阻止 `do_signal()` 再次回退。
+**Dependencies are never loaded automatically or pinned through linker references.**
+The caller must keep every direct/transitive provider loaded throughout preparation
+and the payload lifetime. No bionic loader lock protects against concurrent
+dlclose/munmap.
 
-**默认路径不再制造 pending signal。** `inject` 默认用 `TWA_RESUME` 排队，
-只在目标下一次自然返回用户态时执行，不唤醒睡眠线程，也不触发上述重启分支。
-代价是阻塞在长时间 `nanosleep`/`epoll_wait` 的目标要等该调用返回后才处理请求
-（实测 5 秒睡眠期间请求保持 `armed`，睡眠耗时无异常）。
+### 7. ELF symbols, relocations and protection
 
-`wake` 模式保留旧行为：`signal_wake_up_state(task, 0)` 只置 `TIF_SIGPENDING`、
-不排真实信号，被唤醒的系统调用返回 `-ERESTART_RESTARTBLOCK`，随后按上面的
-语义重启。实测 5 秒 `nanosleep` 变为约 5.886 秒；这是用时间语义换低延迟。
-`hijack` 通过 `r->woke` 区分“我们制造的标志”和真实待投递信号；真实信号若在
-此刻投递，会以 trampoline 的 `sp` 建立信号帧。
+The ELF core uses ke_io callbacks and does not depend on kernel structure layouts
+or section headers. Tables, strings, symbols and destinations are bounded.
+Table reads must fit real readable PT_LOAD ranges and relocation writes must
+target writable segments. Unsupported semantics and invalid ranges fail.
 
-历史 `block_target` 记录（旧 `wake` 路径）：`elapsed=6s`，同样说明总耗时
-会变化，不能据此保证所有 `errno`/超时/线程状态不变。
+It supports SysV/GNU hash, VERSYM/VERNEED/VERDEF, function/data/absolute symbols,
+local definitions before imports, and ordered lookup in the DT_NEEDED closure.
+Missing undefined weak symbols resolve to zero; missing strong symbols or required
+versions fail.
 
----
-
-## 12. 回收、取消与目标消失
-
-* `work_cleanup`（目标上下文）：在 `mm` 仍是同一地址空间时调用
-  `kclf_exec_finish(r, 1)`——按 `x2` 指针读 `dlerror` 文本，然后
-  `vm_munmap` 回收整块临时映射（2+8 页）。只有 munmap 成功（或返回 `EINVAL`，
-  说明区间已不存在）才清空 `map_addr/map_len`；失败最多重试 8 次，仍失败则保留
-  区间并在 `status` 里报告 `cleanup incomplete`。`finished` 不再单独代表回收成功。
-  * 若 `state == RUNNING`（trampoline 跑完但 trap 没被消费）→
-    `FAILED/stage=restore  completion trap missed`；
-  * 若 `state == DONE` 但 `handle == 0` → `FAILED/stage=loader`，
-    错误文本就是 loader 的 `dlerror()`，例如
-    `dlopen failed: "..." has invalid shdr offset/size: 2132216/1536`。
-* `unload`：`dlopen` 成功后 trampoline 调用 `__loader_dlclose`/`dlclose`，状态行
-  显示 `unload=ok|failed rc=... by=...`。引用计数大于 1 时 `dlclose` 只减计数，
-  映射仍在，这是 linker 语义。
-* `reap`：只回收 `finished` 且 `map_addr == 0` 的槽位；有残留映射时报告
-  `cleanup incomplete` 而不静默复用。对 `ARMED/PREPARING/READY/RUNNING` 的请求，
-  用 `find_task_by_vpid(pid)` + `kclf_task_alive()`（`mm`/`pgd` 一致且 `mm_users>0`）
-  判断目标是否还在，不在则记 `FAILED/target exited or exec'd`。
-* `cancel,<slot>`：`ARMED`/`READY` 时 `task_work_cancel` 两段 work 并置
-  `CANCELLED`；`RUNNING` 拒绝（payload 已在目标里跑，只能等）。
-* 槽位复用：4 个槽位，`reap` 后可复用；未 `reap` 的槽位在下次 `inject`
-  时不会抢占（`kclf_slot_alloc` 只取 `IDLE`）。
-
----
-
-## 13. 目标侧 ELF 解析器（`kclf_exec.c`）
-
-不依赖目标进程自己的 `libdl`/`libc` 接口，全部用"内核读用户态内存 + 手工解析"：
-
-* `kclf_elf_open()`：读 `Ehdr` → 校验 → 遍历 `Phdr` 取第一个 `PT_LOAD`
-  （`p_offset == 0`）算 `bias = map_start - p_vaddr`，并记录 `PT_LOAD` 的
-  `[vaddr, vaddr+memsz)` 范围与 `PT_DYNAMIC`；
-* `kclf_elf_dyninfo()`：读 `DT_SYMTAB/DT_STRTAB/DT_STRSZ/DT_SONAME/DT_GNU_HASH/DT_HASH`；
-* `kclf_elf_symcount()`：优先 `DT_HASH`（`nchain`），否则用 `DT_GNU_HASH`
-  遍历 buckets + chain 求最大符号下标；两者都没有时用
-  `(image_end - symtab)/sizeof(Sym)` 作上限；
-* `kclf_elf_lookup()`：线性扫描 `.dynsym`，比 `DT_STRTAB` 里的名字，
-  `st_shndx == 0` 视为未定义，`st_value == 0` 跳过；
-* 所有读都经过 `kclf_urd()`，地址一律限制在 `0x8000000000` 以下，任何一次失败
-  都安全退出（返回 -1）。
-
-VMA 遍历：从 `0x1000` 起反复 `find_vma(mm, addr)`，只读 `vm_start/vm_end`，
-在每个 VMA 起始地址试读 ELF 头；不依赖 `vm_flags`（厂商内核偏移不一致会漏掉
-linker）。`kclf_probe` 在本机扫描到约 100 个 VMA 后定位到
-`ld-android.so` / `libdl.so` / `libc.so`。
-
----
-
-## 14. 可观测性与历史测试记录
-
-### 14.1 普通进程的观察范围
-
-目标进程可检查自己的地址空间和动态库列表，通常无需 root。其他无关进程能否
-读取该目标的 `/proc/<pid>`，还受 UID、ptrace 访问检查及 Android SELinux 策略
-限制；跨进程读取受限不能证明目标进程无法自检。
-
-| 可能被观测的点 | 当前源码能支持的结论 |
+| Relocation | Computation |
 | --- | --- |
-| `TracerPid` | 框架不执行 ptrace attach；值为 0 不能证明没有注入 |
-| `Threads` | 框架复用一个线程；payload 仍可创建线程，数量不变也不能证明没有注入 |
-| `/proc/self/fd` | 内核 `filp_open` 校验不安装用户 fd；用户态 linker 加载文件时仍可能产生临时 fd，payload 也可打开 fd |
-| `/proc/self/maps`、`smaps` | 默认加载仍保留常规映射；`unload` 模式可使 payload 映射消失（引用计数为 1 时）；临时跳板回收不等于库映射消失 |
-| `dl_iterate_phdr` | 默认仍可枚举到 payload 记录；`unload` 后记录消失；框架没有做通用隐藏 |
-| 临时匿名映射 | 现在为 40 KB / 2 个 VMA；从准备到清理仍跨越 trampoline、`dlopen` 和构造函数执行，其他线程可并发观察 |
-| 多次加载 | 同一库可能复用 handle；`unload` 只减引用计数，引用计数大于 1 时映射仍在 |
-| 目标上下文 | 默认不再制造 pending signal；保存/恢复部分 `pt_regs` 仍不等于完整运行状态或时间语义不变 |
-| 信号与耗时 | 默认不排真实信号、不唤醒睡眠线程；`wake` 仍会影响系统调用重启和耗时 |
-| payload 行为 | 测试 payload 默认静默；只有 `KCLF_TEST_VERBOSE=1` 才写文件/打印；payload 自身副作用仍可观察 |
+| NONE | No write |
+| RELATIVE | `*(B + offset) = B + A` |
+| ABS64 / GLOB_DAT / JUMP_SLOT | `*(B + offset) = S + A` |
+| RELR | Add B to original words selected by address/bitmap entries |
+| Android APS2 packed RELA | Bounded SLEB128 decoding, then the RELA operation |
 
-以上信息可用于发现非预期加载，但某一条映射或单次耗时变化不能单独证明注入
-来源就是 KCLF。[Linux maps 文档](https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html)
-说明了映射信息和访问检查；[AOSP linker 实现](https://android.googlesource.com/platform/bionic/+/d3e7d088453e089b3d625b0864ccdf3c74893f18/linker/linker.cpp)
-展示了动态库枚举机制。具体 ROM 行为仍需单独验证。
+B is load bias, S the symbol address, and A the addend, with ELF modulo-2^64
+arithmetic. Processing order is RELR, APS2, regular RELA and PLT RELA, sharing a
+cumulative relocation limit. Imported provider IFUNCs produce resolver/destination/
+addend triples for EL0 execution. IFUNC fixups into init/fini arrays are rejected.
 
-本轮修改后的设备实测（Android 12 / kernel 5.10）见
-[HARDENING.md](HARDENING.md)：临时映射 40 KB，默认注入不改变 5 秒睡眠，
-`unload` 后 payload 映射消失；这些结果仍不能证明目标无法检测。
+The whole image first becomes PROT_NONE, then PT_LOAD segments receive R/RW/RX.
+Holes and trailing alignment slack remain inaccessible. Leading pad inherits the
+first segment's permissions to allow VMA merging.
+**GNU_RELRO is applied by EL1 cleanup after all EL0 initialization/finalization.**
+Those pages remain writable during constructors, even without IFUNCs.
+Protection is retried per range; no resident image is committed before all ranges
+succeed. This applies RELRO later than a conventional linker.
 
-### 14.2 历史记录（OnePlus PJF110，Android 15，kernel 6.1，`/data/local/tmp`）
+### 8. Per-request EL0 code generation
 
-下列为原文保留的历史输出，本次未在设备复测。这份快照已经显示加载后的持久
-变化；它不支持“VMA、VmSize 回到注入前基线”或“零可观测面”的结论：
+kclf_prog_build directly encodes AArch64 instructions and patches branches.
+Each request randomizes code-page contents, entry offset, eight working roles
+across x19–x26, FPSIMD slots, GPR restore order and filler touching dead temporaries.
+A fall-through restart pad precedes a bti c entry.
 
-```
-== before                      == after
-TracerPid: 0                   TracerPid: 0
-Threads: 1                     Threads: 1
-fd=3                           fd=3
-task=1                         task=1
-vma=91                         vma=98            (+7 = payload 的 r--/r-x/r--/rw/bss)
-anon exec=8                    anon exec=9       (原记录未附统计方法，无法验证归因)
-VmSize 2170732 kB              VmSize 2170768 kB (+36KB = payload)
-min_flt=371                    min_flt=387
-```
+The program saves q0–q31, FPCR and FPSR to the private page, then dispatches:
 
-状态机输出：
+- Manual: call imported IFUNC resolvers with HWCAP, the Android IFUNC argument flag
+  and __ifunc_arg_t; validate nonzero, four-byte-aligned results and store result
+  plus addend. Execute DT_INIT and forward INIT_ARRAY, then reverse FINI_ARRAY and
+  DT_FINI when releasing. Constructor argc/argv/envp are zero.
+  HWCAP comes from kernel accessors, with target auxv as fallback.
+- Linker: call loader(path, RTLD_NOW, caller), optionally dlerror on failure,
+  and dlclose for unload, preserving the result code.
 
-```
-#0 id=1 pid=25159(kclf_target) state=done stage=queue handle=2aadbe4a13ae1f05 via=__loader_dlopen
-```
+The common tail copies results to private state and zeros the entire ABI page.
+It restores q0–q31, FPCR/FPSR, SP, NZCV and all GPRs except x16, publishes a nonzero
+per-request random token, loads the original PC into x16, restores x10 and executes
+RET x16. Original x30 is preserved. RET selects BTYPE=00 so resumption inside a
+BTI-protected function does not require a new branch landing pad.
 
-以下也仅为历史记录，不能作为本次修改后的验证结果；同一 handle 或目标存活
-不足以证明语义完全透明：
+The generated program contains no SVC instruction, and its completion tail makes
+no library call and deliberately raises no fault/signal. Payload, IFUNC and linker
+calls can still make syscalls or have other side effects.
+Randomized layouts do not guarantee undetectability; x16, mappings and intermediate
+contexts remain observable.
 
-* 连续注入 6 次同一目标：记录为全部 `done`（同一 handle），目标存活；
-* 错误路径：不存在文件 → `failed/prepare  open library failed rc=-2`；
-  损坏 ELF → `failed/loader  dlopen failed: ... invalid shdr offset/size`，
-  目标继续正常运行（其 tick 日志连续）;
-* 阻塞在 5s `nanosleep` 的目标：注入成功且系统调用最终 `rc=0`；
-* 卸载：记录为 `kpm unload kclf` 后 `kpm num` 为 0；该计数不能证明目标侧
-  库已卸载或所有异步回调均已安全排空。
+### 9. Completion observation and cleanup
 
----
+Publishing the token triggers no dedicated kernel event. Two observers exist:
 
-## 15. 错误模型
+- kclf_token_before installs before hooks from a pool of 70 ordinary syscalls.
+  It verifies the borrowed thread, mm, token and complete results without consuming
+  or modifying the syscall. Fewer hooks may be available; completion reports
+  done=syscall.
+- status/reap/quiesce enqueue one poll task_work per RUNNING request.
+  Sleepable GUP reads occur in target context; completion reports done=poll.
+  A wake-enabled request also allows poll to wake the thread if it blocks again.
 
-`stage` 明确区分"框架没做到"和"目标/loader 拒绝"：
+The token precedes the final RET, so poll also verifies that the saved PC has left
+the entire transient allocation before reclaiming it. Complete result reads
+precede publication of DONE. Target-context cleanup then applies every RELRO
+range, commits/releases manual ownership and unmaps the transient region.
+Protection and mapping failures have bounded retries; exhaustion retains ownership
+and diagnostics. status renders before queuing its own poll, so a later query may
+be needed to see completion.
 
-| `stage` | 典型错误文本 | 含义 |
-| --- | --- | --- |
-| `queue` | `task_work_add failed` | 无法排队（任务正在退出等） |
-| `prepare` | `open library failed rc=-2`、`resolve loader failed rc=-3`、`mmap failed 0x...`、`trampoline patch verification failed`、`mprotect failed rc=...` | 准备失败；此前可能已唤醒目标或建立临时映射，不能保证目标未受影响 |
-| `hijack` | `no pt_regs frame at return boundary`、`no safe point in N attempts ...`、`32-bit target unsupported`、`target address space replaced` | 未进入 trampoline；仍可能已有准备阶段的副作用 |
-| `restore` | `completion trap missed`、`no register frame on completion` | trampoline 已执行但内核没能完成恢复（目标可能已异常） |
-| `loader` | `dlopen failed: ...`（`dlerror()` 原文） | loader 拒绝加载；此阶段标签本身不能证明所有目标运行状态已恢复 |
+### 10. Resident images, release and process exit
 
-`err` 字段一律为可读文本（不是裸 errno），以 `snprintf` 语义写入，
-`status` 原样输出；`reap` 后清空。
+Request slots and image records are independent: reaping a request does not unload
+resident code. A repeated manual load in the same process with exactly the same
+path string reuses the image, increments refs and skips constructors.
+Deduplication does not follow inode/symlink identity or detect file updates.
+image-id is a decimal framework ID, not a bionic handle.
 
----
+release may borrow any suitable live thread with the same TGID/mm.
+Nonfinal release decrements refs; final release runs finalizers and unmaps the
+whole image. A new inject with unload constructs, finalizes and unmaps in one
+transaction. For an existing image, unload temporarily borrows/returns a reference
+without consuming prior refs. DF_1_NODELETE rejects explicit release and first-load
+unload; process exit is needed to drain it.
 
-## 16. 已知限制
+After entering user code, an untrusted completion may mark an image abandoned;
+reap can discard it after process exit. Background threads/callbacks may still use
+the code. An execution thread exiting while sibling threads live can require the
+whole process to exit. On exit/exec the old mm owns mapping teardown; the controller
+never performs munmap in its own unrelated mm.
 
-1. **仅支持 64 位目标**。命中 `PSR_MODE32_BIT` 直接拒绝，未实现 arm32
-   trampoline 与 compat `pt_regs` 布局。
-2. **必须具备可用的后端**：`has_syscall_wrapper`（KernelPatch 系统调用分发器）、
-   `task_work_add`、`kallsyms_lookup_name`、`signal_wake_up_state`。
-   缺任意一项时模块仍可加载（便于排障），但 `inject` 返回
-   `-EOPNOTSUPP`。
-3. **需要一次返回用户态的机会**：若线程永久阻塞在不可中断睡眠
-   （如 `io_schedule()` 的 D 状态）或内核线程，请求会停在 `ARMED`，
-   需要用 `cancel`/`reap` 收尾。
-4. **系统调用时间语义未经完整验证**：`nanosleep`/`poll`/`epoll_wait` 等
-   调用可能受到唤醒和重启影响（见 11.3）；不能承诺超时、剩余时间和
-   总耗时不变，也不能仅凭可重试就认定没有影响。
-5. **payload 约束**：构造函数运行在 linker 锁内，不得再次 `dlopen`、
-   不得长时间阻塞；且必须能被目标自身的 seccomp 策略允许加载。
-6. **静态/无 linker 目标**：`prepare` 阶段失败（找不到 `ld-android.so`）。
-7. **`force` 模式**：跳过安全点判定，可能把 linker 的锁重入，或者与真实
-   待投递信号交错，仅用于排障。
-8. **`mm` 偏移推导**依赖 `get_task_mm`/`mmput`；若内核不导出这两个符号，
-   模块拒绝加载（宁可失败也不做不可靠写入）。
-9. **按 tid 重定向，共享进程状态**：框架不暂停整个进程，其他线程仍共享
-   同一地址空间、文件描述符表和 linker 状态，能够观察加载产生的变化。
-10. **不提供不可检测保证**：临时映射清理不会删除加载库的映射及记录；
-    清理失败和卸载期间的未完成工作也尚无完整成功保证。
+Resident linker handles belong to bionic and are outside images/release management.
+Use inject,...,linker,unload to balance the injected reference immediately;
+otherwise let the target manage the handle or wait for process exit.
 
----
+### 11. Limits and module unload protocol
 
-## 17. 测试方法
+Manual rejects payload PT_TLS/TLS relocations, emutls, thread-destructor registration,
+resolved payload-defined IFUNCs, IRELATIVE, GNU_UNIQUE, REL/textrel, PT_INTERP,
+PT_GNU_PROPERTY, executable stacks, non-readable/W+X segments, overlapping/shared
+PT_LOAD pages, unsupported dynamic flags/filter/preinit, and cross-DSO CFI imports.
+Initializer/finalizer addresses must lie in the payload's own executable segments.
 
-```bash
-# 构建（需要 aarch64-none-elf- 工具链）
-make TARGET_COMPILE=aarch64-none-elf-
+It does not register soinfo, TLS, debugger or unwind metadata, or automatically call
+JNI_OnLoad. C++ exceptions, unwinding, ART/JNI, dlsym/dladdr/dl_iterate_phdr recognition,
+global interposition and namespace semantics are not guaranteed. Evaluate the
+explicit linker backend when such integration is needed.
+Target credentials, SELinux, seccomp and non-dumpable policy are not automatically
+relaxed; payload API calls retain those restrictions.
 
-# 部署
-adb push kclf.kpm /data/local/tmp/kclf.kpm
-adb push test/libkclf_payload.so /data/local/tmp/
-adb push test/kclf_target /data/local/tmp/
+Main limits: four requests, 32 images, 64 MiB snapshot, 256 MiB ELF span/alignment,
+64 program headers, 64 NEEDED per object, 512 providers, 128 closure members,
+500,000 dynamic symbols, 1,000,000 cumulative relocations, 16 MiB APS2,
+128 initializers and 128 finalizers, 64 IFUNC fixups, eight RELRO ranges and
+16,384 VMA traversal steps. Call vectors and IFUNC metadata must also fit one ABI
+page. Padding/alignment increases the actual reserved mapping length.
 
-# 加载与自检
-adb shell /data/local/tmp/kpatch <KEY> kpm load /data/local/tmp/kclf.kpm
-adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf probe
-adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf sym
+Unload sequence:
 
-# 默认注入（TWA_RESUME，不主动唤醒）
-adb shell '/data/local/tmp/kclf_target 400000 >/dev/null 2>&1 & echo $!'
-adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf inject,<tid>,/data/local/tmp/libkclf_payload.so
-adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf status
+1. quiesce disables new inject operations and cancels cancellable queued loads.
+   Running work drains; release remains allowed.
+2. Stop payload threads/callbacks and ensure no live code pointers.
+   Drain manual references through images/release. NODELETE/abandoned targets
+   require process exit.
+3. Repeat status/reap/quiesce until quiesce=idle.
+4. Only then issue kpm unload kclf. Accepting new loads requires a KPM reload.
 
-# 需要证据时（默认静默 payload）
-adb shell 'KCLF_TEST_VERBOSE=1 /data/local/tmp/kclf_target 400000 >/data/local/tmp/t.log 2>&1 & echo $!'
+Reference counts do not prove no thread is executing payload code.
+Stock KernelPatch may free a module even when exit returns EBUSY, leaving task_work
+pointing to freed code after forced unload. With resident images but no callbacks,
+shutdown drops kernel bookkeeping only; orphan mappings remain until target exit.
 
-# 一次性 payload：构造函数返回后 dlclose
-adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf inject,<tid>,/data/local/tmp/libkclf_payload.so,unload
+### 12. Build and test app integration
 
-# 睡眠中的目标需要低延迟时（会改变 sleep 耗时）
-adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf inject,<tid>,/data/local/tmp/libkclf_payload.so,wake
+The Makefile compiles six C objects against external KernelPatch headers with
+freestanding/no-libc settings, strict warnings, no stack protector/unwind tables,
+and -mno-outline-atomics to avoid missing atomic libcalls on older KPM hosts.
+ld -r produces kclf.kpm. This does not build Android payloads or use the NDK for
+kernel code.
 
-# 卸载
-adb shell /data/local/tmp/kpatch <KEY> kpm unload kclf
-```
+build.ps1 invokes javac, d8, NDK clang, aapt2, zipalign and apksigner without Gradle.
+Outputs default to this independent repository's build/ directory; -OutDir overrides.
+The APK has min API 26, targetSdk 35, debuggable and extractNativeLibs.
+Native segments use 16 KiB alignment, which does not certify 16 KiB devices.
 
-`test/` 说明：`target.c` 循环 `nanosleep`，支持 `KCLF_TEST_SLEEP_MS`、
-`KCLF_TEST_VERBOSE`（报告 sleep 异常）、`KCLF_TEST_PHDR_EVERY`（周期性调用
-`dl_iterate_phdr` 打印自身模块列表）；`payload.c` 默认静默，`KCLF_TEST_VERBOSE=1`
-才写 hit 文件/打印，`KCLF_TEST_HOLD_MS` 可让构造函数保持临时映射以便观察。
-这些样例仍不构成完整可观测性测试。
+MainActivity loads the host JNI library and logs PID, filesDir and nativeLibraryDir.
+The main thread returns to Looper; a Java sleeper sleeps periodically; four native
+idle threads block on pipe reads; an FP probe uses jni/fpsimd.S to check q0/q8/q31
+and FPCR/FPSR across nanosleep. Payload constructors write files/hit_<pid> with
+PID/TID and constructor address. Additional builds clobber FP state or hold a
+constructor for two seconds.
 
----
-
-## 18. 关键实现经验（避免重复踩坑）
-
-1. **内核指针不能用 `(long)p < 0` 判错**，必须用 `>= -4095`（`kclf_is_err`）。
-   `filp_open` 返回的合法指针强制转 `long` 也是负数。
-2. **KPM 的 `compat_copy_to_user` 语义是"返回已拷贝长度"**，与
-   `__arch_copy_to_user`（返回未拷贝字节数）相反。
-3. **编译器会把 `movz/movk` 字面量构造向量化**（GCC 对 4 次循环的 NEON 化
-   曾把高 16 位算错）。构造指令序列必须标量 + `volatile` 存储，并用
-   `kclf_verify_patch()` 反解自检。
-4. **KP 系统调用 hook 的返回值在 after 回调之后写回**：恢复寄存器时
-   必须同步 `args->ret`，否则 `x0` 被写成 0（`nanosleep` 表现为 `EFAULT`）。
-5. **`task_work` 与 `do_signal` 的先后不确定**：重启语义必须能识别
-   "内核已回退"和"未回退"两种现场，靠 `svc` 指令字判别。
-6. **只踢醒不置 pending signal 会截断可中断睡眠**：`signal_wake_up_state(task, 0)`
-   是让被中断系统调用正确重启的关键。
-7. **卸载前必须排空所有 `callback_head`**：模块代码被释放后，残留的
-   `func` 指针会在目标线程里被调用。完成 hook 要最后移除，否则正在运行的
-   trampoline 会执行真实 `getpid` 后死循环。
-8. **`vma->vm_flags` 不能假设固定偏移**：设备 5.10 上按 offset 32 读到的不是
-   `vm_flags`，按 READ/WRITE 过滤会漏掉 linker，导致一直退回 `libdl.dlopen`。
-   现在不依赖 flags，逐个 VMA 试读 ELF 头。
-9. **`_copy_from_user` 在部分 KPM task_work 上下文会返回 0 但不填充缓冲区**：
-   改用 `__arch_copy_from_user`，并在读 ELF/符号前用
-   `fault_in_pages_readable` 逐页预缺页，失败再回退 `access_process_vm`。
-10. **arm64 的 `nanosleep` 是 101，不是 35**：35 是 `unlinkat`。安全点白名单
-    写错会让默认 `TWA_RESUME` 注入在睡眠边界反复 `-EAGAIN`。
-11. **GCC 14 的 C11 原子默认走 `__aarch64_ldadd*` libcall**：老 KernelPatch
-    不导出这些符号，构建需 `-mno-outline-atomics`。
+device-test.ps1 selects manual/linker, repetitions, APK/KPM and expected poll mode.
+It checks markers, mapping reclamation, references, cancellation, slots, exit/restart,
+FPSIMD and draining, retaining logs and checking new kernel warnings/app crashes.
+It installs/stops the test app. Compilation success does not establish device
+regression success. Other tests and historical experiments remain on dev;
+README supplies reproducible build and control commands.
