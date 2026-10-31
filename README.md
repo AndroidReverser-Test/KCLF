@@ -10,11 +10,6 @@ KCLF 通过内核 `task_work` 借用目标线程，在 EL0 执行 SO 的构造/�
 默认 `manual` 后端自行映射和重定位 ELF；显式 `linker` 后端调用目标 bionic loader。
 `main` 只维护框架、构建配置和测试 App；历史报告、检测实验及原有测试在 `dev`。
 
-### 许可证
-
-除另有声明的文件外，KCLF 按 GNU 通用公共许可证第 2 版或（由你选择）任何后续版本发布，
-SPDX 标识为 `GPL-2.0-or-later`。完整条款见 [LICENSE](LICENSE)；请保留已有的版权与许可声明。
-
 ### 编译
 
 模块需要 GNU Make、AArch64 bare-metal GCC/binutils，以及一份 KernelPatch 源码。
@@ -137,13 +132,6 @@ finalizers in EL0. The default `manual` backend maps and relocates ELF itself;
 the explicit `linker` backend calls the target bionic loader.
 `main` contains the framework, build configuration and test app.
 Historical reports, detection experiments and the original tests remain on `dev`.
-
-### License
-
-Unless a file states otherwise, KCLF is licensed under the GNU General Public
-License, version 2 or (at your option) any later version (`GPL-2.0-or-later`).
-See [LICENSE](LICENSE) for the full text. Existing copyright and license notices
-must be preserved.
 
 ### Build
 
