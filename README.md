@@ -52,21 +52,38 @@ adb push kclf.kpm /data/local/tmp/kclf.kpm
 ```sh
 adb shell /data/local/tmp/kpatch "$KEY" kpm load /data/local/tmp/kclf.kpm
 adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf probe
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf "inject,$TID,$LIBDIR/libkclfapp_payload.so,wake,unload"
+adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf "inject,$TID,$LIBDIR/libkclfapp_payload.so,wake"
 adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf status
 adb shell run-as com.kclf.apptest cat /data/user/0/com.kclf.apptest/files/hit_$TID
 ```
 
 此例注入主线程，因此 marker 文件后缀也是 PID。重复查看 `status`，
-直到出现 `state=done`、`via=manual`、`unload=ok` 且没有 `pending=` / `map=`。
-命令返回 `queued` 只表示已排队。追加 `,linker` 可选择 bionic 后端，
-其路径需满足目标 linker namespace 和 SELinux 策略。
+直到出现 `state=done`、`via=manual`、`refs=1` 且没有 `pending=` / `map=`。
+此例让 SO 保持驻留；需要卸载时按下文 `images` / `release` 流程释放。
+命令返回 `queued` 只表示已排队。追加 `,linker` 可选择 bionic 后端。
+
+#### SO 路径要求
+
+`,$LIBDIR/libkclfapp_payload.so` 中的逗号是命令参数分隔符，后面才是 SO 路径。
+`LIBDIR` 是**设备上的目录**，由主机 shell 展开；本示例应填写测试 App 日志中的
+`libdir`，例如 `/data/app/~~.../com.kclf.apptest-.../lib/arm64`，并确认其中已有
+由测试 APK 安装的 `libkclfapp_payload.so`。注入其他 SO 时替换为实际完整路径。
+
+- 展开后的路径必须是设备端绝对路径，最多 255 字节，不能包含逗号、空格、制表符、
+  换行等分隔符；给命令加引号也不能让这些字符成为路径的一部分。
+- SO 必须是框架支持的 64 位小端 AArch64 ELF 共享库（`ET_DYN`）。
+- 准备阶段使用**目标进程的凭据**打开文件；目标需能读取 SO、访问各级目录，
+  并满足 SELinux 策略。控制端取得 root 不等于目标 App 获得文件访问权限。
+- `manual` 不强制使用 App 的 native library 目录，也可使用目标有权读取的
+  `/data/user/0/<包名>/files/<模块>.so`；依赖仍需预先加载，映射权限仍受设备策略限制。
+  `linker` 还要求路径属于目标 linker namespace 允许的范围，并允许文件的可执行映射；
+  本示例使用安装后的 native library 目录。`/data/local/tmp` 不能视为普通 App 通用可用的路径。
 
 常用控制字符串（作为 `kpm ctl0 kclf` 的最后一个参数）：
 
 | 命令 | 含义 |
 | --- | --- |
-| `inject,<tid>,<绝对路径>[,manual\|linker][,wake][,unload][,keepelf][,force]` | 默认 manual；路径最多 255 字节，不支持逗号 |
+| `inject,<tid>,<绝对路径>[,manual\|linker][,wake][,unload][,keepelf][,force]` | 默认 manual；设备端路径最多 255 字节，不支持逗号或空白分隔符 |
 | `status` / `probe` / `sym` | 请求状态 / 兼容性 / 内核符号诊断 |
 | `images[,cursor]` | 枚举 manual 驻留镜像；有 `next=N` 时继续 `images,N` |
 | `release,<tid>,<image-id>[,wake][,force]` | 释放一个 manual 引用；最后一次执行析构并解除映射 |
@@ -74,7 +91,17 @@ adb shell run-as com.kclf.apptest cat /data/user/0/com.kclf.apptest/files/hit_$T
 | `quiesce` | 禁止新加载并检查能否卸载；重新加载 KPM 才恢复接收 |
 
 `wake` 可唤醒可中断睡眠；省略时等待线程自然返回用户态。
-`unload` 在本次加载后立即释放；省略则保持驻留。
+`unload` 用于一次性加载：manual 新镜像在构造函数返回后执行析构并解除映射；
+linker 在加载后调用 `dlclose` 释放本次引用，实际卸载取决于 linker 的引用计数等规则。
+省略 `unload` 则保持驻留。它控制的是注入 SO 的生命周期。
+
+**`unload` 的副作用：框架不会自动等待 SO 创建的后台线程退出，也不会注销其异步回调、
+定时器或 hook。** 构造函数返回时这些任务可能仍在执行；解除映射后继续使用其中的代码、
+数据或函数指针，可能导致崩溃、死锁或 App 卡住。仅在所有工作已同步完成、没有后续使用者时
+使用 `unload`。需要后台任务或持续回调的 SO 应保持驻留，先通过 payload 自身的机制停止任务、
+注销回调并确认不再执行，再释放。已有 manual 驻留镜像应通过 `release` 释放引用；
+重复 `inject,...,unload` 不会替代这一步。
+
 `keepelf` 只用于 manual，保留内存 ELF 头。
 `force` 仅跳过安全点启发式。**恢复路径会改写 x16/IP0，必须选择 x16 不再使用的协作边界**；
 系统调用白名单无法证明这一点，也无法证明目标未持有锁。
@@ -152,22 +179,47 @@ For the host-shell commands below, set `KEY` to your superkey (never commit it),
 ```sh
 adb shell /data/local/tmp/kpatch "$KEY" kpm load /data/local/tmp/kclf.kpm
 adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf probe
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf "inject,$TID,$LIBDIR/libkclfapp_payload.so,wake,unload"
+adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf "inject,$TID,$LIBDIR/libkclfapp_payload.so,wake"
 adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf status
 adb shell run-as com.kclf.apptest cat /data/user/0/com.kclf.apptest/files/hit_$TID
 ```
 
 This example targets the main thread, so the marker suffix is also the PID.
-Poll `status` until it reports `state=done`, `via=manual`, `unload=ok`, with no
-`pending=` or `map=`. A `queued` response only acknowledges scheduling.
-Append `,linker` for bionic loading; its path must satisfy the target namespace
-and SELinux policy.
+Poll `status` until it reports `state=done`, `via=manual`, `refs=1`, with no
+`pending=` or `map=`. This example keeps the SO resident; use the `images` /
+`release` procedure below when it is ready to unload. A `queued` response only
+acknowledges scheduling. Append `,linker` for bionic loading.
+
+#### SO path requirements
+
+In `,$LIBDIR/libkclfapp_payload.so`, the comma separates command arguments; the
+SO path follows it. `LIBDIR` is a **directory on the device**, expanded by the
+host shell. For this example, use the test app's logged `libdir`, such as
+`/data/app/~~.../com.kclf.apptest-.../lib/arm64`, and verify that it contains
+`libkclfapp_payload.so` installed by the test APK. Replace the full path when
+injecting another SO.
+
+- The expanded path must be absolute on the device, at most 255 bytes, and
+  contain no commas, spaces, tabs, newlines or other argument separators.
+  Quoting the command does not make these characters valid within the path.
+- The SO must be a supported 64-bit little-endian AArch64 ELF shared object
+  (`ET_DYN`).
+- Preparation opens the file using **the target process's credentials**. The
+  target must be able to read the SO, traverse its parent directories and
+  satisfy SELinux policy. Root access for the controller does not grant file
+  access to the target app.
+- `manual` also accepts a target-readable path such as
+  `/data/user/0/<package>/files/<module>.so`; dependencies must already be loaded
+  and mapping permissions remain subject to device policy. `linker` additionally
+  requires an allowed path in the target linker namespace and permission for
+  executable file mappings. This example uses the installed native library
+  directory. Do not assume `/data/local/tmp` is usable by an ordinary app.
 
 Common control strings, passed as the last argument to `kpm ctl0 kclf`:
 
 | Command | Meaning |
 | --- | --- |
-| `inject,<tid>,<absolute-path>[,manual\|linker][,wake][,unload][,keepelf][,force]` | Defaults to manual; path is at most 255 bytes and cannot contain commas |
+| `inject,<tid>,<absolute-path>[,manual\|linker][,wake][,unload][,keepelf][,force]` | Defaults to manual; device path is at most 255 bytes and cannot contain commas or whitespace separators |
 | `status` / `probe` / `sym` | Requests / compatibility / kernel-symbol diagnostics |
 | `images[,cursor]` | List resident manual images; follow `next=N` with `images,N` |
 | `release,<tid>,<image-id>[,wake][,force]` | Release one manual reference; the last release runs finalizers and unmaps |
@@ -175,7 +227,22 @@ Common control strings, passed as the last argument to `kpm ctl0 kclf`:
 | `quiesce` | Disable new loads and check drain status; reload the KPM to accept loads again |
 
 `wake` wakes interruptible waits; otherwise work waits for a natural return to EL0.
-`unload` releases immediately after loading; omitting it keeps the library resident.
+`unload` requests a one-shot load: a new manual image runs finalizers after its
+constructors return and is then unmapped. The linker backend calls `dlclose` to
+release this load's reference; actual unloading depends on linker reference
+counts and other rules. Omitting `unload` keeps the SO resident. This option
+controls the injected SO's lifetime.
+
+**Side effects of `unload`: the framework does not automatically wait for SO-created
+threads to exit or unregister asynchronous callbacks, timers or hooks.** These may
+outlive the constructors. Accessing unmapped code, data or function pointers can
+crash, deadlock or freeze the app. Use `unload` only when all work has completed
+synchronously and no later users remain. Keep SOs with background work or persistent
+callbacks resident; stop their work and unregister callbacks through the payload's
+own mechanism, then confirm execution has ended before releasing them. Use
+`release` for existing resident manual references; repeating `inject,...,unload`
+does not release those references.
+
 `keepelf` retains in-memory ELF headers for manual images.
 `force` only bypasses safe-point heuristics. **The restore tail overwrites x16/IP0:
 use a cooperative boundary where x16 is dead.** The syscall allowlist cannot prove
