@@ -42,20 +42,33 @@ powershell -ExecutionPolicy Bypass -File kpms\kclf\test\app\build.ps1 `
 ```powershell
 $KclfKey = Read-Host 'KernelPatch superkey'
 ./kpms/kclf/test/app/device-test.ps1 -SuperKey $KclfKey -Serial '<SERIAL>' `
-  -Apk '<absolute APK path>' -Repeat 100
+  -Apk '<absolute APK path>' -Backend manual -Repeat 10
+# 同一套场景也可显式验证 bionic linker 后端
+./kpms/kclf/test/app/device-test.ps1 -SuperKey $KclfKey -Serial '<SERIAL>' `
+  -Apk '<absolute APK path>' -Backend linker -Repeat 10
 ```
 
+脚本默认测试 manual 后端；`-Backend linker` 测试 bionic 后端。`-Kpm` 可选择独立
+构建的模块，`-ExpectPoll` 要求每个成功请求均显示 `done=poll`，用于回退路径验收。
+密钥校验接受 `@`。设备若返回 `INSTALL_FAILED_USER_RESTRICTED`，可以显式追加
+`-RootInstall`，使用已授权的 kpatch root 调用 `pm install -r -t` 安装自建测试 APK；
+默认仍使用 `adb install`。两种方式都不修改系统安装设置。
 脚本安装测试 APK，测试普通应用主线程 / Java sleeper / Binder / native probe，
-校验 payload marker 的 PID/TID、FPSIMD、正常驻留、dlclose、缺失/截断 SO 错误恢复、
+每次注入前删除旧 marker，校验新 marker 的 PID/TID 和构造函数地址实际解除映射，
+同时校验 FPSIMD、正常驻留、后端回收、缺失/截断 SO 错误恢复、
 四槽排队与取消、重复请求、连续加载卸载、完成未 reap / 排队中 / 构造函数中
 force-stop 后旧进程消失与新进程启动、RX/guard/临时映射完整回收，以及 busy quiesce / reload。
-最后核对 boot ID、SELinux、crash buffer 和内核告警，安全排空并卸载测试模块。
+最后核对 boot ID、SELinux、main/crash buffer 中的 libc fatal signal 与 Java crash
+及内核告警，安全排空并卸载测试模块。包含截断为 `om.kclf.apptest` 的线程名，避免
+在 debuggerd 尚未生成 tombstone 时漏掉原生崩溃。
 
 每轮证据保存在 `build/kclf-app-<runid>/`。脚本不清空 logcat/dmesg、不修改
-SELinux/seccomp、不触碰其他 App；结束后保留测试 APK、marker 和最终测试进程。
+SELinux/seccomp、不触碰其他 App；结束后保留测试 APK 和 marker，停止测试进程。
 测试前不能已经加载同名 kclf，以免卸载用户原有模块。
 
-本次完整回归及 100 轮连续测试结果见 [当前审计](../../COMPATIBILITY_1.3.1.md)。
+1.5.4 的 5.15 双后端与无 BTF/nofault 回退测试见 [兼容性报告](../../COMPATIBILITY_1.5.4.md)。
+1.5.3 的 6.1 测试见 [历史设备复核](../../DEVICE_COMPATIBILITY_20261031.md)。
+旧版 100 轮连续测试是 [1.3.1 历史证据](../../COMPATIBILITY_1.3.1.md)。
 
 ## 手工验证
 
@@ -73,13 +86,14 @@ adb shell logcat -d -s KCLFAPP:I | tail -2
 ```sh
 adb push kpms/kclf/kclf.kpm /data/local/tmp/kclf.kpm
 adb shell /data/local/tmp/kpatch $KEY kpm load /data/local/tmp/kclf.kpm
-adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf inject,<PID>,<LIBDIR>/libkclfapp_payload.so,wake
+adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf inject,<PID>,<LIBDIR>/libkclfapp_payload.so,wake,unload
 adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf status
 adb shell run-as com.kclf.apptest cat /data/user/0/com.kclf.apptest/files/hit_<PID>
 ```
 
-应看到 `state=done ... via=__loader_dlopen`，marker 中的 `pid/tid` 与注入线程一致。
-主线程在 `epoll_pwait`，必须带 `wake`；不带时 `status` 会给出
+应看到 `state=done ... via=manual ... unload=ok`，marker 中的 `pid/tid` 与注入线程一致。
+追加 `,linker` 才使用旧后端并显示 `via=__loader_dlopen`。
+主线程在 `epoll_pwait`，通常应带 `wake`；不带时 `status` 会给出
 `hint=blocked(use wake)`。改注入 `kclf-sleeper` 的 tid 时可以省略 `wake`。
 
 验证“目标在请求完成但未 reap 时被系统杀死”不会卡住 ActivityManager（1.3.0 修复）：
@@ -100,12 +114,16 @@ adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf inject,<NEWPID>,<LIBDIR>/lib
 adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf status   # unload=ok
 ```
 
-需要确认映射消失时，以 root 读取 `/proc/<NEWPID>/maps`，检查没有
-`libkclfapp_payload.so`。`/data/local/tmp` 里的 payload 对 `untrusted_app` 不可用：
-设备实测 `prepare` 能打开，但 linker 会返回
+需要确认映射消失时，以 root 读取 `/proc/<NEWPID>/maps`，检查 marker 中的构造函数地址
+已不在任何 VMA 内。manual 的镜像是匿名映射，不能只按文件名判断回收；同时检查
+`images` 为空、请求没有 `map=` / `pending=`。linker 后端还可检查文件名消失。
+设备实测 linker 后端从 `/data/local/tmp` 加载时，`prepare` 能打开，但 linker 会返回
 `dlopen failed: ... Permission denied`，这是预期失败路径。
 
 卸载模块：
+
+若使用默认驻留模式（没有 `unload`），先通过 `images` 获取 image ID，再以
+`release,<TID>,<image-id>,wake` 排空全部引用；`reap` 本身不释放驻留镜像。
 
 ```sh
 adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf reap

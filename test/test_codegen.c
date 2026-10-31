@@ -83,6 +83,14 @@ int main(int argc, char **argv)
         for (i = 0; i + 4 <= prog.length; i += 4)
             if (word_at(code, i) == 0xd4000001u) svc++;
         if (svc) failures++;
+        /* Returning to the interrupted instruction can land in the middle of
+         * a BTI-guarded libc function. BR marks it as a new indirect entry and
+         * faults there; RET must leave BTYPE=00. x30 still belongs to the
+         * interrupted frame, so the return address is held in x16. */
+        if (word_at(code, prog.length - 4) != 0xd65f0200u) {
+            fprintf(stderr, "seed %u: resume must use RET x16 for BTI-guarded targets\n", seed);
+            failures++;
+        }
         /* the entry is preceded by a random fall-through restart pad, not by a
          * fixed branch instruction */
         if (!restart_pad_ok(word_at(code, 0))) failures++;

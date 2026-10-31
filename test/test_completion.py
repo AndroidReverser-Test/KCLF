@@ -30,14 +30,16 @@ typedef int64_t s64;
 typedef int32_t s32;
 typedef uint8_t u8;
 struct callback_head { int unused; };
+struct task_struct { int unused; };
 struct pt_regs { u64 pc; } regs;
 static int regs_available = 1;
 static struct pt_regs *kclf_find_regs(void) { return regs_available ? &regs : NULL; }
 struct kclf_req {
-    int state, priv_layout_ok, flags, completing, busy, stage, unloaded;
+    int state, priv_layout_ok, flags, completing, busy, stage, unloaded, poll_queued;
     s32 unload_rc;
     s64 handle;
-    u64 err_user, priv_addr, mm, done_token, map_addr, map_len, j_done;
+    u64 err_user, priv_addr, mm, done_token, map_addr, map_len, j_done, task;
+    void *pid_ref;
     u8 completion_via;
     struct { u64 done, handle, errptr, rc; } pl;
     struct callback_head work_poll, work_cleanup;
@@ -45,6 +47,8 @@ struct kclf_req {
 #define local_container_of(p, type, field) ((type *)((char *)(p) - offsetof(type, field)))
 #define current ((void *)1)
 #define KCLF_F_UNLOAD 8
+#define KCLF_F_WAKE 4
+#define KCLF_MAX_REQ 1
 #define KCLF_VIA_SYSCALL 1
 #define KCLF_VIA_POLL 2
 #define KCLF_RUNNING 4
@@ -53,7 +57,15 @@ struct kclf_req {
 #define KCLF_TWA_SIGNAL 2
 #define KCLF_TWA_RESUME 1
 static int kclf_loading_num, kclf_wake_supported = 1;
-static int nofault_available, reads, fault_reads, fail_at, queued;
+static int nofault_available, reads, fault_reads, fail_at, queued, last_notify, fail_queue, rcu_depth;
+static struct kclf_req kclf_reqs[KCLF_MAX_REQ];
+static struct task_struct *test_pid_task(void *pid, int type) {
+    assert(pid && type == 0 && rcu_depth == 1);
+    return (struct task_struct *)1;
+}
+static struct { struct task_struct *(*pid_task)(void *, int); } kclf_ks = { test_pid_task };
+static void kclf_rcu_read_lock(void) { assert(rcu_depth == 0); rcu_depth++; }
+static void kclf_rcu_read_unlock(void) { assert(rcu_depth == 1); rcu_depth--; }
 static u64 words[4];
 static int read_user(u64 addr, void *out, int n, int sleepable) {
     reads++;
@@ -71,7 +83,8 @@ static void kclf_state_store(struct kclf_req *r, int st) { r->state = st; }
 static u64 kclf_now(void) { return 42; }
 static void kclf_set_err(struct kclf_req *r, const char *s) { (void)r; (void)s; }
 static int kclf_queue_work(struct kclf_req *r, void *t, struct callback_head *w, int n) {
-    (void)t; (void)n; assert(w == &r->work_cleanup); queued++; return 0;
+    (void)t; assert(w == &r->work_cleanup || w == &r->work_poll);
+    queued++; last_notify = n; return fail_queue ? -ESRCH : 0;
 }
 '''
 
@@ -81,7 +94,7 @@ static struct kclf_req fresh(void) {
         .priv_addr = 0x1000, .mm = 0x55, .done_token = 123, .map_addr = 0x1000, .map_len = 0x3000,
         .pl = { 0, 8, 16, 24 } };
     words[0] = 123; words[1] = 789; words[2] = 0; words[3] = 0;
-    reads = fault_reads = queued = fail_at = 0;
+    reads = fault_reads = queued = fail_at = fail_queue = 0;
     regs.pc = 0x8000; regs_available = 1; kclf_loading_num = 1;
     return r;
 }
@@ -122,6 +135,23 @@ int main(void) {
     kclf_work_poll_body(&r.work_poll);
     assert(r.state == KCLF_DONE && queued == 1);
     puts("poll defers while return PC is in transient pages or frame is unavailable: PASS");
+    for (int wake = 0; wake <= 1; wake++) {
+        for (int supported = 0; supported <= 1; supported++) {
+            kclf_reqs[0] = fresh();
+            kclf_reqs[0].task = 1; kclf_reqs[0].pid_ref = (void *)2;
+            kclf_reqs[0].flags = wake ? KCLF_F_WAKE : 0;
+            kclf_wake_supported = supported;
+            kclf_poll_running();
+            assert(queued == 1 && kclf_reqs[0].poll_queued && !rcu_depth);
+            assert(last_notify == (wake && supported ? KCLF_TWA_SIGNAL : KCLF_TWA_RESUME));
+            kclf_poll_running();
+            assert(queued == 1 && !rcu_depth); /* never queue the same head twice */
+            kclf_reqs[0].poll_queued = 0; fail_queue = 1;
+            kclf_poll_running();
+            assert(queued == 2 && !kclf_reqs[0].poll_queued && !rcu_depth);
+        }
+    }
+    puts("controller poll honors wake capability/choice, deduplicates and retries queue failure: PASS");
     return 0;
 }
 '''
@@ -133,6 +163,7 @@ parts += [function(control, signature) for signature in (
     "static int kclf_read_results(struct kclf_req *r, int sleepable)",
     "static void kclf_complete(struct kclf_req *r, int via, int force_drain)",
     "static void kclf_work_poll_body(struct callback_head *head)",
+    "static void kclf_poll_running(void)",
 )]
 with tempfile.TemporaryDirectory(prefix="kclf-completion-") as directory:
     source = Path(directory) / "test.c"

@@ -1,6 +1,7 @@
 /* Ordinary-app payload: no JNI, no dlopen, no ART calls. It only writes a
  * marker into the app's own files directory, which the app UID may access. */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,7 +35,9 @@ __attribute__((constructor)) static void kclf_app_payload_init(void)
         if (ms > 0) {
             ts.tv_sec = ms / 1000;
             ts.tv_nsec = (ms % 1000) * 1000000L;
-            nanosleep(&ts, 0);
+            /* A wake-enabled controller poll can interrupt this sleep. Keep
+             * the hold duration so lifecycle tests can observe RUNNING. */
+            while (nanosleep(&ts, &ts) && errno == EINTR) {}
         }
     }
 

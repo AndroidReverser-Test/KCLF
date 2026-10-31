@@ -41,13 +41,18 @@ def main():
     remote = "/data/local/tmp/" + run_id
     events, targets = [], []
     loaded = False
+    functional_passed = False
     app_started = False
     package = "com.kclf.apptest"
     baseline = ""
 
     def adb(*words, check=True):
-        r = subprocess.run([args.adb, "-s", args.serial, *words], text=True,
-                           encoding="utf-8", errors="replace", capture_output=True, timeout=40)
+        try:
+            r = subprocess.run([args.adb, "-s", args.serial, *words], text=True,
+                               encoding="utf-8", errors="replace", capture_output=True, timeout=40)
+        except subprocess.TimeoutExpired:
+            # TimeoutExpired includes argv, which can contain the superkey.
+            raise RuntimeError("adb operation timed out (arguments redacted)") from None
         if check and r.returncode:
             raise RuntimeError("adb operation failed: " + r.stdout + r.stderr)
         return r.returncode, r.stdout.strip()
@@ -182,7 +187,21 @@ def main():
         loaded = True
         check("pt_regs=ok" in ctl("probe"), "runtime register frame available")
         pid = start()
+        for bad in (
+            f"inject,{pid},{remote}/libkclf_payload.so,wake,resume",
+            f"inject,{pid},{remote}/libkclf_payload.so,wake,wake",
+            f"inject,{pid},{remote}/libkclf_payload.so,manual,linker",
+            f"inject,{pid},{remote}/libkclf_payload.so,linker,keepelf",
+            f"release,{pid},1,unload",
+            f"inject,2147483648,{remote}/libkclf_payload.so",
+            f"release,{pid},18446744073709551616",
+            "cancel,4", "images,32", "status,unexpected",
+        ):
+            rc, message = kpm("ctl0", "kclf", bad, check=False)
+            check(rc != 0 and "error:" in message, "invalid control command rejected with diagnostic: " + bad)
+        check("no requests" in ctl("status"), "rejected commands never queue target work")
         status = inject(pid)
+        check("err=" not in status, "successful load has no uninitialized error result")
         check("via=manual" in status and "refs=1" in status, "unmodified existing payload loads without linker backend")
         check(f"pid={pid} " in root(f"cat {remote}/hit_{pid}"), "original payload constructor independently witnessed")
         identity = re.search(r"image=(\d+)", status).group(1)
@@ -311,7 +330,8 @@ def main():
             check("quiesce=idle" in ctl("quiesce"), "release remains available while quiescing")
         check(root("cat /proc/sys/kernel/random/boot_id") == boot, "device boot identity unchanged")
         check(root("getenforce") == policy, "SELinux mode unchanged")
-        events.append({"result": "ALL MANUAL DEVICE CASES PASSED"})
+        functional_passed = True
+        events.append({"functional_cases": "passed"})
     finally:
         for pid in targets:
             stop(pid)
@@ -329,7 +349,10 @@ def main():
         after = root("dmesg", check=False)
         (output / "dmesg-after.txt").write_text(after, encoding="utf-8")
         faults = [line for line in after.splitlines() if re.search(r"BUG:|WARNING:|Oops:|Kernel panic", line) and line not in baseline]
-        events.append({"new_kernel_faults": faults, "module_retained": loaded})
+        # Functional assertions alone are not a successful device acceptance.
+        # Keep kernel warnings and cleanup failures visible in the final result.
+        events.append({"new_kernel_faults": faults, "module_retained": loaded,
+                       "result": "PASS" if functional_passed and not faults and not loaded else "FAIL"})
         (output / "results.json").write_text(json.dumps(events, ensure_ascii=False, indent=2), encoding="utf-8")
         adb("pull", remote, str(output), check=False)
         print("Evidence: " + str(output), flush=True)

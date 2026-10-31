@@ -10,9 +10,10 @@
  * neither the entry nor the shape of the tail is predictable.
  *
  * Completion is deliberately *not* a syscall and *not* a library call.  After
- * the payload work the program restores the interrupted thread's whole register
- * file in EL0, publishes a per-request random token in its private page and
- * branches back to the interrupted PC itself.  The kernel notices the token
+ * the payload work the program restores the interrupted thread's register
+ * file except x16 in EL0, publishes a per-request random token in its private
+ * page and returns to the interrupted PC using RET x16 (BTYPE=00). The kernel
+ * notices the token
  * when the thread enters an ordinary watched syscall, or from a controller poll
  * callback, and then tears the transient mapping down.
  *
@@ -20,7 +21,9 @@
  * libc frame whose saved link register points into the transient code page, no
  * fixed call stub and no private-page pointer in a fixed stack slot.  The one
  * register the EL0 branch cannot restore is x16/IP0, which has to hold the
- * resume address; x16 is caller-saved scratch in the supported ABI.
+ * resume address. The AAPCS64 caller-saved rule only describes call boundaries;
+ * it does not make x16 disposable at arbitrary interruptions. A cooperative
+ * target boundary where x16 is dead is required for correct resumption.
  *
  * The private page layout is randomized per request: every field (saved
  * register file, FPSIMD file, completion token, result slots) is placed at an

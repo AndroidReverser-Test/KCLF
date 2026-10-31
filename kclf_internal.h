@@ -33,9 +33,11 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.5.2"
+#define KCLF_VER "1.5.4"
 
 #define KCLF_MAX_REQ 4
+#define KCLF_MAX_IMAGES 32
+#define KCLF_CLEANUP_RETRIES 8
 /* GNU_RELRO ranges whose protection is applied from the kernel once the EL0
  * phase finished (IFUNC results must be written before they turn read-only). */
 #define KCLF_MAX_RELRO 8
@@ -138,7 +140,7 @@ struct kclf_req
 
     /* deferred GNU_RELRO protection (kernel-side, after the EL0 phase) */
     u32 relro_count;
-    u32 relro_done;
+    u32 relro_done; /* number of ranges successfully protected; retry cursor */
     u64 relro[KCLF_MAX_RELRO][2];
 
     struct kclf_loader ld;
@@ -246,8 +248,9 @@ extern const int kclf_watch_pool_num;
 /* kclf.c */
 int kclf_sym_lookup_all(void);
 struct kclf_req *kclf_slot_by_task(struct task_struct *task);
-void kclf_fail(struct kclf_req *r, int state, int stage, long err, const char *fmt, ...);
-void kclf_set_err(struct kclf_req *r, const char *fmt, ...);
+void kclf_fail(struct kclf_req *r, int state, int stage, long err, const char *fmt, ...)
+    __attribute__((format(printf, 5, 6)));
+void kclf_set_err(struct kclf_req *r, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 u64 kclf_now(void);
 
 /* kclf_exec.c */

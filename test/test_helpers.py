@@ -68,6 +68,13 @@ int main(void) {
     assert(kclf_tokenize("inject,123,/x,unload", buffer, sizeof(buffer), tokens, 4) == 4);
     assert(!strcmp(tokens[2], "/x") && !strcmp(tokens[3], "unload"));
     assert(kclf_tokenize(" \t,\n", buffer, sizeof(buffer), tokens, 4) == 0);
+    assert(kclf_tokenize("status\r\n", buffer, sizeof(buffer), tokens, 4) == 1);
+    assert(!strcmp(tokens[0], "status"));
+    assert(kclf_tokenize("help\v", buffer, sizeof(buffer), tokens, 4) == -EINVAL);
+    assert(kclf_tokenize("help\177", buffer, sizeof(buffer), tokens, 4) == -EINVAL);
+    assert(kclf_tokenize(NULL, buffer, sizeof(buffer), tokens, 4) == -EINVAL);
+    assert(kclf_tokenize("help", NULL, 0, tokens, 4) == -EINVAL);
+    assert(kclf_tokenize("help", buffer, sizeof(buffer), tokens, 0) == -EINVAL);
     assert(kclf_tokenize("a,b,c,d,e", buffer, sizeof(buffer), tokens, 4) == -E2BIG);
     char boundary[33];
     memset(boundary, 'a', sizeof(boundary)); boundary[32] = 0;
@@ -75,6 +82,46 @@ int main(void) {
     boundary[31] = 0;
     assert(kclf_tokenize(boundary, buffer, sizeof(buffer), tokens, 4) == 1);
     puts("tokenizer length and token limits: PASS");
+
+    u64 number = 123;
+    assert(!kclf_parse_uint("0", 0, &number) && number == 0);
+    assert(!kclf_parse_uint("00031", 31, &number) && number == 31);
+    assert(kclf_parse_uint("32", 31, &number) == -ERANGE && number == 31);
+    assert(kclf_parse_uint("9", 3, &number) == -ERANGE && number == 31);
+    assert(!kclf_parse_uint("2147483647", INT32_MAX, &number) && number == INT32_MAX);
+    assert(kclf_parse_uint("2147483648", INT32_MAX, &number) == -ERANGE);
+    assert(!kclf_parse_uint("18446744073709551615", UINT64_MAX, &number) && number == UINT64_MAX);
+    assert(kclf_parse_uint("18446744073709551616", UINT64_MAX, &number) == -ERANGE);
+    const char *bad[] = {"", "-1", "+1", "1x", "0x10", " 1", "1 "};
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        assert(kclf_parse_uint(bad[i], UINT64_MAX, &number) == -EINVAL);
+    assert(kclf_parse_uint(NULL, 31, &number) == -EINVAL);
+    assert(kclf_parse_uint("1", 31, NULL) == -EINVAL);
+    puts("bounded decimal integers (slot/cursor/TID/image ID): PASS");
+
+    char *options[] = {"inject", "1", "/x", "manual", "wake", "force", "unload", "keepelf"};
+    int flags = 0;
+    assert(!kclf_parse_flags(options, 8, 0, &flags));
+    assert(flags == (KCLF_F_WAKE | KCLF_F_FORCE | KCLF_F_UNLOAD | KCLF_F_KEEPELF));
+    assert(!kclf_parse_flags(options, 3, 1, &flags) && flags == (KCLF_F_RELEASE | KCLF_F_UNLOAD));
+    assert(kclf_parse_flags(options, 4, 1, &flags) == -EINVAL);
+    options[3] = "linker";
+    assert(kclf_parse_flags(options, 8, 0, &flags) == -EINVAL); /* keepelf is manual-only */
+    assert(!kclf_parse_flags(options, 7, 0, &flags) && (flags & KCLF_F_LINKER));
+    options[3] = "wake";
+    assert(kclf_parse_flags(options, 5, 0, &flags) == -EINVAL);
+    options[3] = "resume";
+    assert(kclf_parse_flags(options, 5, 0, &flags) == -EINVAL);
+    assert(!kclf_parse_flags(options, 4, 1, &flags));
+    options[3] = "manual"; options[4] = "linker";
+    assert(kclf_parse_flags(options, 5, 0, &flags) == -EINVAL);
+    options[3] = "force"; options[4] = "force";
+    assert(kclf_parse_flags(options, 5, 0, &flags) == -EINVAL);
+    options[3] = "unload";
+    assert(kclf_parse_flags(options, 4, 1, &flags) == -EINVAL);
+    options[3] = "unknown";
+    assert(kclf_parse_flags(options, 4, 0, &flags) == -EINVAL);
+    puts("ctl0 rejects duplicate/conflicting/unsupported options: PASS");
 
     struct kclf_req request = {.state = KCLF_RUNNING};
     assert(!kclf_slot_reclaimable(&request));
@@ -164,11 +211,15 @@ parts = [function(execution, name) for name in (
     "static int kclf_elf_lookup(")]
 reclaim = function(control, "static int kclf_slot_reclaimable(")
 assert reclaim.index("&r->finished") < reclaim.index("&r->pending")
-parts += [function(control, "static int kclf_tokenize("), function(compat, "int kclf_scnprintf("), reclaim]
+parts += [function(control, signature) for signature in (
+    "static int kclf_tokenize(", "static int kclf_parse_uint(", "static int kclf_parse_flags(")]
+parts += [function(compat, "int kclf_scnprintf("), reclaim]
+header = (MODULE / "kclf_internal.h").read_text()
+flags = header[header.index("#define KCLF_F_FORCE"):header.index("struct kclf_manual_image;")]
 with tempfile.TemporaryDirectory(prefix="kclf-helpers-") as directory:
     source = Path(directory) / "test.c"
     exe = Path(directory) / "test"
-    source.write_text(PRELUDE + types + "\n" + "\n".join(parts) + MAIN)
+    source.write_text(PRELUDE + flags + types + "\n" + "\n".join(parts) + MAIN)
     subprocess.run(["gcc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-g",
                     "-fsanitize=address,undefined", str(source), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

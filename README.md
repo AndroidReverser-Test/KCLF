@@ -1,11 +1,35 @@
-# KCLF 1.5.2
+# KCLF 1.5.4
+
+2026-10-31 小米 13 / Android 13 / **5.15.74 / ARM64 / 4K** 实测发现 1.5.3
+在 BTI 设备上会在构造完成后返回 libc 时触发 SIGILL。1.5.4 将 EL0 尾部的
+`br x16` 改为 `ret x16`，使返回中断指令时的 BTYPE 为 00，并保留原 x30。
+修复后普通 App 的 manual / linker / 无 BTF+nofault 回退三套回归通过
+（236 / 219 / 178 项断言），没有新增内核告警或 App fatal signal。
+实现梳理、跨版本边界、原始失败及产物见 [1.5.4 兼容性报告](COMPATIBILITY_1.5.4.md)。
+历史 Pixel 6 / 6.1 证据仍保留在下文；其他版本与 16K/64K 页没有因此获得认证。
+
+1.5.3 历史设备复核（2026-10-31，Pixel 6 / 6.1.134）：已修复 **完成 poll 无法唤醒再次阻塞的 wake 目标**，以及
+status 自身排队 poll 导致运行映射信息被遮蔽的问题。自建普通 App 的正式 manual / linker
+两套回归和无 BTF/nofault 的 manual 回退回归均通过（236 / 219 / 178 项断言）。
+此次未发现新增内核告警，但此前 ucounts 告警的根因仍未确定，不能解释为风险已消除。
+实现分析、兼容边界、失败复现和最终产物见 [本次设备兼容性复核](DEVICE_COMPATIBILITY_20261031.md)。
+
+1.5.3 是代码规范与错误处理修订：修复 RELRO 失败仍提交成功、结果字段未初始化、
+控制面冲突选项被忽略等问题，加入统一主机测试入口与更严格的编译检查。
+实现梳理、修改依据、未解决风险及本轮设备证据见 [代码审查报告](CODE_REVIEW_1.5.3.md)。
+
+此前代码审查轮次 **10 组主机测试通过，设备 148 项功能断言通过，但设备总体验收未通过**：
+清理测试进程时出现 `dec_rlimit_ucounts` 内核 WARNING，原因尚未确定。
+已完成 `quiesce=idle` 和模块卸载，不能将功能通过解释为无内核风险。
+
+以下 1.5.2 兼容性与 1.5.1 可观测性测试记录为历史证据，不是 1.5.3 的全面认证。
 
 1.5.2 是内核兼容性修订：修正 6.16+ 的 UPROBE 标志位；用 BTF 验证 task_work
 通知/取消 ABI；缺少 nofault accessor 时使用可睡眠 GUP 轮询；补齐必需符号检查，
 降低内核栈用量，并避免轮询在返回 PC 尚处于临时映射时回收它。
 详见 [5.x / 6.x 兼容性实现与验证](COMPATIBILITY_1.5.2.md)。
 
-**不是所有 5.x / 6.x 均已认证。** 本轮真机是 Android 16 / 6.1.134 / ARM64 / 4K。
+**不是所有 5.x / 6.x 均已认证。** 该轮真机是 Android 16 / 6.1.134 / ARM64 / 4K。
 5.x、其他 6.x、16K/64K 页仍需同一产物的设备回归。无 BTF/nofault 测试构建验证了
 回退机制，但它仍运行在 6.1 上，不等于 5.x 实测。下文的 1.5.1 测试数字是历史结果。
 
@@ -119,6 +143,8 @@ adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf sym
 1.5.2 另显示 `wake_abi=btf|version`、`trace_mask`、`vector_mask`、`nofault`、
 `poll_io=gup`。`nofault=0` 时普通 syscall hook 仅用于学习寄存器帧，完成依赖控制端
 调用 `status`/`reap`/`quiesce` 排队的目标线程 poll；不会在 hook 内调用可睡眠 GUP。
+显式 `wake` 请求的 poll 也会使用 `TWA_SIGNAL`，防止目标再次阻塞后无法观察完成；
+这可能再次打断构造函数或原程序的可中断 syscall。默认 resume 请求仍等待自然返回点。
 
 ## 控制接口
 
@@ -160,6 +186,11 @@ adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf inject,<tid>,/path/to/lib.s
 
 路径必须是绝对路径、长度小于 256 字节，且不能包含逗号、制表符、空格等控制面分隔符；
 模块在 `prepare` 阶段用**目标进程的凭据**打开并校验 ELF。
+
+1.5.3 起重复选项、`wake,resume`、`manual,linker`、`linker,keepelf` 会返回错误，
+不再静默忽略。`release` 仅接受 `wake` / `resume` / `force`；`resume` 与 `wake`
+互斥。整数只接受十进制数字，TID 必须为正且不超过 `INT_MAX`，image ID 为非零 u64，
+槽号和分页游标按实际表容量检查。控制命令支持 CRLF，拒绝其他非分隔控制字符。
 
 ## 注入普通 app
 
@@ -260,6 +291,11 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
 继续完成。释放前必须由 payload 使用方停止后台线程和回调；引用计数不代表代码无人执行。
 在 stock 宿主上不能在 `running`/`preparing`/`ready` 或仍有 cleanup 回调时卸载。
 
+RELRO 或资源清理最多重试 8 次；耗尽或无法排队时报告 `state=failed stage=restore`
+和 `mapping retained`，保留资源所有权，`quiesce` 不会返回 idle。此时不要强制卸载：
+应由使用方停止对应的自有目标进程，再 `reap`、确认 `quiesce=idle` 后卸载。
+不要只根据 `state=done` 判断完成，仍须确认没有 `pending=`、`map=` 或错误信息。
+
 ## 限制
 
 1. **仅 64 位目标**。32 位 app 在 hijack 阶段以 `32-bit target unsupported` 拒绝。
@@ -279,6 +315,9 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
    但仍保留匿名 RX 代码页、随机私有状态页、可读 payload 内容和回退栈暴露面。
    完成回收窗口延长到目标线程下一次被观察系统调用或控制器下一次 poll。EL0 完成
    路径不恢复 x16/IP0（分支寄存器），其余 30 个 GPR 和 FPSIMD/SP/NZCV 精确恢复。
+   **x16 的 caller-saved 属性只适用于调用边界，不适用于任意异步中断点。** 当前启发式
+   无法证明 x16 不存活；即使未使用 `force`，也必须由目标提供可协作的安全边界。
+   不能把这个实现称为完整透明的异步上下文恢复。
    遇到持续 trap 或过滤掉框架观察点的环境时，请求可能停留到控制器 poll，属于功能
    失败/未覆盖，不应写成检测阳性。
 8. **目标退出时**：请求持有 `struct pid` 身份但不长期持有 `mm`，避免延后 `exit_mmap`
@@ -293,18 +332,31 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
 11. **不绕过 non-dumpable/ptrace 策略**：App 被系统标记为 non-dumpable 时，
     `/proc/self/auxv`、`/proc/self/mem` 对 App 自身凭据也可能是 `EACCES`。框架用
     内核 accessor 解决自己的 `AT_HWCAP` 需求，但不会替 payload 打开这些文件。
-12. **没有覆盖所有内核**：1.5.2 本轮设备为 Android 16 / 6.1.134 / 4K；
-    其他 5.x、6.x、16K/64K 页仍需同一产物的真机回归。1.5.1 的无 BTF 5.10.66
-    结果不能当作 1.5.2 验收。厂商回移 TIF 位号、隐藏必需符号、宿主不支持该内核
+12. **没有覆盖所有内核**：1.5.4 本轮设备为 Android 13 / 5.15.74 / 4K；
+    其他 5.x、6.x、16K/64K 页仍需同一产物的真机回归。历史 5.10.66 / 6.1.134
+    结果不能当作 1.5.4 验收。厂商回移 TIF 位号、隐藏必需符号、宿主不支持该内核
     时，仍可能需要适配；不推测未知函数 ABI 或结构偏移。
 13. **借用栈有回退**：只有能找到 pt_regs、栈 VMA 足够大且距 guard 有余量时才借用
     线程栈；否则回退到临时栈块，`status` 会显示 `stack=transient`。深栈、altstack
     或找不到 syscall 帧的目标可能走回退路径。
-14. **BTI 落点未全面验收**：EL0 完成用 `br x16` 返回被中断 PC；若设备对该映射强制
-    BTI 且该 PC 不是合法 landing pad，会触发分支目标异常。当前 Android 12 /
-    5.10.66 设备未触发，但未在 BTI 强制设备上验证。
+14. **扩展返回状态有边界**：1.5.4 已在 BTI/PAC libc 的 5.15.74 设备上验证
+    `ret x16` 返回；仍不恢复 x16，也未验证 GCS（Guarded Control Stack）。启用
+    GCS 的线程不在支持范围，RET 不能被解释为完整的异步上下文恢复协议。
 
 ## 测试
+
+主机回归统一入口（Linux/WSL，需 Python 3、GCC 与 ASan/UBSan）：
+
+```sh
+make -C kpms/kclf test
+make -C kpms/kclf TARGET_COMPILE=aarch64-linux-gnu- -j4
+```
+
+主机测试不连接设备、不需要 superkey；覆盖生产解析/兼容性/完成逻辑、故障注入以及
+4K/16K/64K 跳板结构检查。后者不是对应页大小的真机验收。
+1.5.3 代码审查轮次仅运行 `test/manual-device-test.py` 的自有 native 进程用例；
+测试记录和 WARNING 说明见代码审查报告。1.5.4 本轮运行普通 App 双后端及能力回退
+回归，见兼容性报告；未重跑以下历史可观测性用例。
 
 1.5.1 普通 App 自检（关键验收；full 45 个用例，期望 `detections=0`、
 `done=syscall`、构造函数/析构函数执行、`quiesce=idle`、`kpm num=0`）：
@@ -415,7 +467,8 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 
 ## 文档
 
-- [COMPATIBILITY_1.5.2.md](COMPATIBILITY_1.5.2.md)：当前实现、5.x/6.x 兼容修订、真机证据与未验证范围。
+- [COMPATIBILITY_1.5.4.md](COMPATIBILITY_1.5.4.md)：当前实现、5.15 BTI 返回故障修复及普通 App 实测。
+- [COMPATIBILITY_1.5.2.md](COMPATIBILITY_1.5.2.md)：历史 5.x/6.x 兼容修订、真机证据与未验证范围。
 - [DETECTION_POINTS_20261031.md](DETECTION_POINTS_20261031.md)：历史 1.5.1 检测点、
   纯 EL0 完成协议、45/45 自检结果、poll 路径、残余可观测面与边界。
 - [DETECTION_POINTS.md](DETECTION_POINTS.md)：1.5.0 历史基线（libc 完成调用、

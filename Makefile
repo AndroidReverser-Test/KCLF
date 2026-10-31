@@ -1,4 +1,4 @@
-ifneq ($(MAKECMDGOALS),clean)
+ifneq ($(filter-out clean test,$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
 ifndef TARGET_COMPILE
     $(error TARGET_COMPILE not set)
 endif
@@ -11,6 +11,7 @@ endif
 
 CC = $(TARGET_COMPILE)gcc
 LD = $(TARGET_COMPILE)ld
+PYTHON ?= python3
 
 INCLUDE_DIRS := include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 
@@ -21,6 +22,7 @@ INCLUDE_FLAGS := -I. $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 # atomics inline (LDXR/STXR or LSE) instead.
 ARCH_CFLAGS := -mno-outline-atomics -mgeneral-regs-only -ffixed-x18
 KPM_CFLAGS := -std=gnu11 -Wall -Wextra -Werror -Wno-unused-parameter \
+	-Wformat=2 -Wshadow -Wframe-larger-than=2048 -fno-strict-aliasing \
 	-ffreestanding -fno-builtin -nostdinc -fno-pic -fno-pie \
 	-fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -MMD -MP
 
@@ -41,6 +43,9 @@ kclf.kpm: ${objs}
 
 -include $(objs:.o=.d)
 
-.PHONY: clean
+.PHONY: all clean test
+test:
+	$(PYTHON) test/run_host_tests.py
+
 clean:
 	rm -f kclf.kpm $(objs) $(objs:.o=.d)

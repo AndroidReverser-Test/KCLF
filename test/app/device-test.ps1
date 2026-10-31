@@ -3,14 +3,20 @@ param(
     [string]$Serial,
     [string]$Adb = 'adb',
     [string]$Apk,
+    [string]$Kpm,
+    [ValidateSet('manual', 'linker')][string]$Backend = 'manual',
+    [switch]$ExpectPoll,
+    [switch]$RootInstall,
     [ValidateRange(1, 100)][int]$Repeat = 10
 )
 $ErrorActionPreference = 'Stop'
-if ($SuperKey -notmatch '^[A-Za-z0-9_.+-]+$') { throw 'Use a shell-safe superkey with this test runner.' }
+if ($SuperKey -notmatch '^[A-Za-z0-9_@.+-]+$') { throw 'Use a shell-safe superkey with this test runner.' }
 $ModuleDir = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $RepoDir = (Resolve-Path (Join-Path $ModuleDir '../..')).Path
 if (-not $Apk) { $Apk = Join-Path $RepoDir 'build/kclf-apptest/app.apk' }
 $Apk = (Resolve-Path -LiteralPath $Apk).Path
+if (-not $Kpm) { $Kpm = Join-Path $ModuleDir 'kclf.kpm' }
+$Kpm = (Resolve-Path -LiteralPath $Kpm).Path
 $RunId = 'kclf-app-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
 $Results = Join-Path $RepoDir ('build/' + $RunId)
 $Remote = '/data/local/tmp/' + $RunId
@@ -43,8 +49,7 @@ function Kpm([string[]]$Arguments, [switch]$AllowFailure) {
     return $Result
 }
 function Ctl([string]$Command, [switch]$AllowFailure) {
-    # This historical regression suite asserts bionic linker semantics.
-    if ($Command.StartsWith('inject,')) { $Command += ',linker' }
+    if ($Command.StartsWith('inject,')) { $Command += ",$Backend" }
     Kpm @('ctl0', 'kclf', $Command) -AllowFailure:$AllowFailure
 }
 function Check([bool]$Condition, [string]$Message) {
@@ -87,6 +92,9 @@ function Await-State([string]$Expected) {
         $Result = Ctl 'status'
         if ($Result.Text -match 'state=(done|failed|cancelled)' -and $Result.Text -notmatch 'pending=| map=') {
             Check ($Result.Text -match $Expected) "request completes as $Expected with no callback/mapping left"
+            if ($ExpectPoll -and $Expected -eq 'state=done') {
+                Check ($Result.Text -match 'done=poll') 'completion uses sleepable controller poll'
+            }
             return $Result.Text
         }
         Start-Sleep -Milliseconds 100
@@ -97,20 +105,40 @@ function Verify-Marker([int]$TargetId, [int]$ThreadId) {
     $Text = (Invoke-Adb @('shell', 'run-as', $Package, 'cat', "files/hit_$TargetId")).Text
     Log ('marker: ' + $Text)
     Check ($Text -match "pid=$TargetId tid=$ThreadId marker=0x[0-9a-f]+") 'payload constructor witnessed in the exact target thread'
-    Check ((Invoke-Adb @('shell', 'pidof', $Package)).Text.Trim() -eq "$TargetId") 'app survives injection without process replacement'
+    $LiveIds = (Invoke-Adb @('shell', 'pidof', $Package) -AllowFailure).Text.Trim()
+    Check ($LiveIds -eq "$TargetId") "app survives injection without process replacement (expected=$TargetId actual=$LiveIds)"
 }
 function Inject-App([int]$TargetId, [int]$ThreadId, [string]$Flags, [string]$Payload = $Library) {
+    Invoke-Adb @('shell', 'run-as', $Package, 'rm', '-f', "files/hit_$TargetId") | Out-Null
     Ctl "inject,$ThreadId,$Payload$Flags" | Out-Null
     $Status = Await-State 'state=done'
-    Check ($Status -match 'via=__loader_dlopen' -and $Status -match 'loading=0') 'real Android linker used and loading count cleared'
+    $Via = if ($Backend -eq 'manual') { 'via=manual' } else { 'via=__loader_dlopen' }
+    Check ($Status -match $Via -and $Status -match 'loading=0') "$Backend backend used and loading count cleared"
+    Check ($Status -match 'done=(syscall|poll)') 'EL0 completion independently observed'
     Verify-Marker $TargetId $ThreadId
     $Maps = Root "cat /proc/$TargetId/maps"
     $PayloadName = [regex]::Escape(($Payload -split '/')[-1])
+    $Marker = (Invoke-Adb @('shell', 'run-as', $Package, 'cat', "files/hit_$TargetId")).Text
+    Check ($Marker -match 'marker=0x([0-9a-f]+)') 'fresh constructor address recorded'
+    $ConstructorPc = [Convert]::ToUInt64($Matches[1], 16)
+    $ConstructorMaps = @($Maps -split "`n" | Where-Object {
+        $_ -match '^([0-9a-f]+)-([0-9a-f]+) ' -and
+        [Convert]::ToUInt64($Matches[1], 16) -le $ConstructorPc -and
+        [Convert]::ToUInt64($Matches[2], 16) -gt $ConstructorPc
+    })
     if ($Flags -match ',unload') {
-        Check ($Status -match 'unload=ok rc=0') 'dlclose succeeded'
-        Check ($Maps -notmatch $PayloadName) 'payload mappings absent after dlclose'
+        Check ($Status -match 'unload=ok rc=0') 'payload finalization succeeded'
+        Check ($ConstructorMaps.Count -eq 0) 'constructor address unmapped after payload finalization'
+        if ($Backend -eq 'linker') { Check ($Maps -notmatch $PayloadName) 'payload file mappings absent after dlclose' }
+        if ($Backend -eq 'manual') {
+            Check ($Status -match 'refs=0 resident=0\+0') 'manual resident allocation reclaimed'
+            Check ((Ctl 'images').Text -match 'no manual images') 'manual image registry empty'
+        }
     } else {
-        Check ($Maps -match $PayloadName) 'normal injection retains payload mappings'
+        Check ($ConstructorMaps.Count -eq 1 -and $ConstructorMaps[0] -match ' r-xp ') 'retained constructor is mapped executable'
+        if ($Backend -eq 'manual') {
+            Check ($Status -match 'refs=1 resident=[1-9a-f][0-9a-f]*\+[1-9]\d*') 'normal injection retains a manual resident image'
+        } else { Check ($Maps -match $PayloadName) 'normal injection retains payload mappings' }
     }
     Ctl 'reap' | Out-Null
 }
@@ -142,16 +170,26 @@ try {
     Check ((Kpm @('list')).Text -notmatch '(?m)^kclf$') 'no pre-existing kclf module; other modules untouched'
     Log ((Invoke-Adb @('shell', 'uname', '-a')).Text)
     Log ('serial=' + $Serial)
-    Log ('module SHA256=' + (Get-FileHash -Algorithm SHA256 (Join-Path $ModuleDir 'kclf.kpm')).Hash)
+    Log ('backend=' + $Backend)
+    Log ('module SHA256=' + (Get-FileHash -Algorithm SHA256 $Kpm).Hash)
     Log ('APK SHA256=' + (Get-FileHash -Algorithm SHA256 $Apk).Hash)
     $BootBefore = Root 'cat /proc/sys/kernel/random/boot_id'
     $PolicyBefore = Root 'getenforce'
     $DmesgBefore = Root 'dmesg'
     $DmesgBefore | Set-Content -LiteralPath (Join-Path $Results 'dmesg-before.txt') -Encoding utf8
-    $CrashBefore = (Invoke-Adb @('logcat', '-b', 'crash', '-d')).Text
+    # libc can report Fatal signal in main before debuggerd produces a crash
+    # record. Its 15-byte thread name is om.kclf.apptest on this device.
+    $CrashBefore = (Invoke-Adb @('logcat', '-b', 'main', '-b', 'crash', '-d',
+        '-s', 'libc:F', 'DEBUG:F', 'AndroidRuntime:E')).Text
     $CrashBefore | Set-Content -LiteralPath (Join-Path $Results 'crash-before.txt') -Encoding utf8
 
-    $Install = Invoke-Adb @('install', '-r', '-t', $Apk)
+    Invoke-Adb @('shell', 'mkdir', $Remote) | Out-Null
+    if ($RootInstall) {
+        Invoke-Adb @('push', $Apk, "$Remote/app.apk") | Out-Null
+        $Install = @{ Text = (Root "pm install -r -t $Remote/app.apk") }
+    } else {
+        $Install = Invoke-Adb @('install', '-r', '-t', $Apk)
+    }
     Log $Install.Text
     Check ($Install.Text -match 'Success') 'freshly built APK installed without uninstalling or clearing app data'
     $TargetId = Start-App
@@ -166,13 +204,12 @@ try {
     Check ($AppStatus -match 'Seccomp:\s+2' -and $AppStatus -match 'Uid:\s+[1-9]\d+') 'ordinary non-root app retains zygote seccomp filter'
     Check ((Root "cat /proc/$TargetId/attr/current") -match 'untrusted_app') 'test app stays in untrusted_app SELinux domain'
 
-    Invoke-Adb @('shell', 'mkdir', $Remote) | Out-Null
-    Invoke-Adb @('push', (Join-Path $ModuleDir 'kclf.kpm'), "$Remote/kclf.kpm") | Out-Null
+    Invoke-Adb @('push', $Kpm, "$Remote/kclf.kpm") | Out-Null
     Kpm @('load', "$Remote/kclf.kpm") | Out-Null
     Check ((Kpm @('list')).Text -match '(?m)^kclf$') 'module really loaded (not just adb exit code)'
     $Loaded = $true
     $Probe = (Ctl 'probe').Text
-    Check ($Probe -match 'pt_regs=ok' -and $Probe -match 'hook=libc') 'register layout and libc completion hooks available'
+    Check ($Probe -match 'pt_regs=ok' -and $Probe -match 'completion=el0') 'register layout and EL0 completion available'
 
     Log 'CASE: main thread, wake + unload'
     Inject-App $TargetId $TargetId ',wake,unload'
@@ -219,7 +256,8 @@ try {
     Log 'CASE: truncated ELF reaches loader failure and restores app'
     Invoke-Adb @('shell', 'run-as', $Package, 'dd', "if=$Library", 'of=files/truncated.so', 'bs=64', 'count=1') | Out-Null
     Ctl "inject,$TargetId,/data/user/0/$Package/files/truncated.so,wake" | Out-Null
-    Check ((Await-State 'state=failed') -match 'stage=loader.*err=') 'loader failure is reported after context restoration'
+    $FailureStage = if ($Backend -eq 'manual') { 'prepare' } else { 'loader' }
+    Check ((Await-State 'state=failed') -match "stage=$FailureStage.*err=") 'invalid ELF fails at the selected backend stage'
     Check ((Invoke-Adb @('shell', 'pidof', $Package)).Text.Trim() -eq "$TargetId") 'app survives invalid payload'
     Ctl 'reap' | Out-Null
 
@@ -233,7 +271,9 @@ try {
     Ctl "inject,$TargetId,$Library,wake" | Out-Null
     Await-State 'state=done' | Out-Null
     Verify-Marker $TargetId $TargetId
-    Check ((Root "cat /proc/$TargetId/maps") -match 'libkclfapp_payload.so') 'normal load keeps the SO in the app'
+    if ($Backend -eq 'manual') {
+        Check ((Ctl 'images').Text -match 'state=live refs=1') 'normal load registers a live manual image'
+    } else { Check ((Root "cat /proc/$TargetId/maps") -match 'libkclfapp_payload.so') 'normal load keeps the SO in the app' }
     $OldTargetId = $TargetId
     $TargetId = Start-App
     Check ($TargetId -ne $OldTargetId) 'force-stop replaces the old process while completed request still exists'
@@ -282,12 +322,16 @@ try {
             $Begin -ge $MapStart -and $Begin -lt $MapEnd
         }
     })
-    Check ($MapSize -ge 10 * $PageSize -and $MapSize -le 25 * $PageSize) 'randomized transient region occupies 10..25 pages'
-    Check ($CodeStart -ge $MapStart -and $CodeStart + $PageSize -le $MapEnd -and
-           $GuardStart -ge $MapStart -and $GuardStart + $PageSize -le $MapEnd) 'code and guard lie inside the transient region'
+    Check ($CodeStart -ge $MapStart -and $CodeStart + $PageSize -le $MapEnd) 'code lies inside the transient region'
     Check (@($Range | Where-Object { $_ -match "^$CodeHex-$CodeEndHex r-xp " }).Count -eq 1) 'exactly one RX page at the reported random code offset'
-    Check (@($Range | Where-Object { $_ -match "^$GuardHex-$GuardEndHex ---p " }).Count -eq 1) 'PROT_NONE guard at the reported random position'
-    Check (@($Range | Where-Object { $_ -match "^$StackHex-\S+ rw-p " }).Count -eq 1) 'transient stack starts immediately above the guard'
+    if ($Running -match 'stack=task/') {
+        Check ($MapSize -ge 3 * $PageSize -and $MapSize -le 11 * $PageSize -and $GuardStart -eq 0) 'borrowed stack uses 3..11 transient pages without an extra guard'
+    } else {
+        Check ($MapSize -ge 10 * $PageSize -and $MapSize -le 28 * $PageSize) 'dedicated stack uses 10..28 transient pages'
+        Check ($GuardStart -ge $MapStart -and $GuardStart + $PageSize -le $MapEnd) 'guard lies inside the transient region'
+        Check (@($Range | Where-Object { $_ -match "^$GuardHex-$GuardEndHex ---p " }).Count -eq 1) 'PROT_NONE guard at the reported random position'
+        Check (@($Range | Where-Object { $_ -match "^$StackHex-\S+ rw-p " }).Count -eq 1) 'transient stack starts immediately above the guard'
+    }
     Check ($Maps -notmatch '(?m)^\S+ rwxp ') 'no RWX mapping in app'
     $Quiet = Ctl 'quiesce' -AllowFailure
     Check ($Quiet.Code -ne 0 -and $Quiet.Text -match 'quiesce=busy') 'busy quiesce keeps app completion hook alive'
@@ -327,6 +371,7 @@ try {
                 Check ((Kpm @('list')).Text -notmatch '(?m)^kclf$') 'test module safely drained and unloaded'
             } else { throw 'Module retained: callbacks not drained; DO NOT force unload.' }
         }
+        Invoke-Adb @('shell', 'am', 'force-stop', $Package) | Out-Null
         Check ((Root 'cat /proc/sys/kernel/random/boot_id') -eq $BootBefore) 'boot ID unchanged'
         Check ((Root 'getenforce') -eq $PolicyBefore) 'SELinux enforcement unchanged'
         $DmesgAfter = Root 'dmesg'
@@ -335,13 +380,14 @@ try {
             $_ -match 'BUG:|WARNING:|Oops:|Kernel panic' -and -not $DmesgBefore.Contains($_)
         })
         Check ($NewFaults.Count -eq 0) 'no new retained kernel BUG/WARNING/Oops/panic'
-        $CrashAfter = (Invoke-Adb @('logcat', '-b', 'crash', '-d')).Text
+        $CrashAfter = (Invoke-Adb @('logcat', '-b', 'main', '-b', 'crash', '-d',
+            '-s', 'libc:F', 'DEBUG:F', 'AndroidRuntime:E')).Text
         $CrashAfter | Set-Content -LiteralPath (Join-Path $Results 'crash-after.txt') -Encoding utf8
         $NewCrashes = @($CrashAfter -split "`n" | Where-Object {
-            $_ -match 'com.kclf.apptest' -and -not $CrashBefore.Contains($_)
+            $_ -match 'com\.kclf\.apptest|Fatal signal.*\(om\.kclf\.apptest\)' -and -not $CrashBefore.Contains($_)
         })
-        Check ($NewCrashes.Count -eq 0) 'no new test-app crash in crash log'
-        if ($Passed) { Log 'ALL APP CASES PASSED; APK retained, final app process left running.' }
+        Check ($NewCrashes.Count -eq 0) 'no new test-app fatal signal/Java crash in main or crash logs'
+        if ($Passed) { Log 'ALL APP CASES PASSED; APK retained, test app stopped.' }
     } catch {
         $CleanupFailed = $true
         Log ('FINAL VERIFICATION ERROR: ' + $_.Exception.Message)

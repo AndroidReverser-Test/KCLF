@@ -168,7 +168,7 @@ static int kclf_urds_u32(u64 addr, u32 *out)
 int kclf_uwr(u64 addr, const void *buf, int len)
 {
     if (kclf_user_tbi) addr &= 0x00ffffffffffffffULL;
-    if (!addr || len < 0 || (u64)len > KCLF_USER_MAX || addr > KCLF_USER_MAX - (u64)len) return -1;
+    if (len < 0 || !kclf_user_range(addr, (u64)len)) return -EFAULT;
     /* FOLL_WRITE=1 is stable on the supported kernels. GUP handles PAN,
      * cold pages and the mmap lock; never use a raw arch uaccess symbol. */
     return kclf_ks.access_process_vm(current, addr, (void *)buf, len, 1) == len ? 0 : -EFAULT;
@@ -957,6 +957,29 @@ static int kclf_choose_stack(struct kclf_req *r)
     return 0;
 }
 
+/* Initialize every field consumed by EL0, even on a branch that skips dlerror.
+ * Padding may be random; a result pointer must never be random. */
+static void kclf_init_params(struct kclf_req *r, u8 pbuf[KCLF_P_SIZE])
+{
+    int i;
+
+    for (i = 0; i < KCLF_P_SIZE / 8; i++) ((u64 *)pbuf)[i] = get_random_u64();
+    *(u64 *)(pbuf + KCLF_P_FN) = r->ld.fn;
+    *(u64 *)(pbuf + KCLF_P_DLERROR) = r->ld.dlerror;
+    *(u64 *)(pbuf + KCLF_P_DLCLOSE) = r->ld.dlclose;
+    *(u64 *)(pbuf + KCLF_P_CALLER) = r->ld.caller;
+    *(u64 *)(pbuf + KCLF_P_HANDLE) = 0;
+    *(u64 *)(pbuf + KCLF_P_ERRPTR) = 0;
+    *(u32 *)(pbuf + KCLF_P_FLAGS) = KCLF_RTLD_NOW;
+    *(u32 *)(pbuf + KCLF_P_UNLOAD) = !!(r->flags & KCLF_F_UNLOAD);
+    *(u32 *)(pbuf + KCLF_P_MANUAL) = 0;
+    /* r->path is a fixed, zero-initialized request field, not an unbounded
+     * user pointer. Copy its complete extent without strncpy truncation. */
+    memcpy(pbuf + KCLF_P_PATH, r->path, KCLF_PATH_MAX);
+    pbuf[KCLF_P_PATH + KCLF_PATH_MAX - 1] = 0;
+    if (!(r->flags & KCLF_F_LINKER)) kclf_manual_params(r, pbuf);
+}
+
 long kclf_exec_prepare(struct kclf_req *r)
 {
     struct mm_struct *mm = kclf_task_mm(current);
@@ -1085,23 +1108,7 @@ long kclf_exec_prepare(struct kclf_req *r)
     r->entry_pc = r->code_addr + prog.entry_off;
     kclf_ks.vfree(scratch);
 
-    /* The ABI page is initialized with random data, then the fields the
-     * generated program reads are written.  The unused bytes (and the whole
-     * page after completion) are not a recognizable zero-filled block. */
-    for (i = 0; i < (int)(sizeof(pbuf) / 8); i++) ((u64 *)pbuf)[i] = get_random_u64();
-    *(u64 *)(pbuf + KCLF_P_FN) = r->ld.fn;
-    *(u64 *)(pbuf + KCLF_P_DLERROR) = r->ld.dlerror;
-    *(u64 *)(pbuf + KCLF_P_DLCLOSE) = r->ld.dlclose;
-    *(u64 *)(pbuf + KCLF_P_CALLER) = r->ld.caller;
-    *(u32 *)(pbuf + KCLF_P_FLAGS) = KCLF_RTLD_NOW;
-    *(u32 *)(pbuf + KCLF_P_UNLOAD) = (r->flags & KCLF_F_UNLOAD) ? 1 : 0;
-    /* The ABI page is random-filled, so every field the generated program
-     * branches on must be written explicitly; an uninitialized "manual" flag
-     * would send a linker request down the manual path with garbage vectors. */
-    *(u32 *)(pbuf + KCLF_P_MANUAL) = 0;
-    strncpy((char *)pbuf + KCLF_P_PATH, r->path, KCLF_PATH_MAX - 1);
-    ((char *)pbuf)[KCLF_P_PATH + KCLF_PATH_MAX - 1] = 0;
-    if (!(r->flags & KCLF_F_LINKER)) kclf_manual_params(r, pbuf);
+    kclf_init_params(r, pbuf);
 
     if (kclf_uwr(r->param_addr, pbuf, sizeof(pbuf))) {
         kclf_set_err(r, "copy parameters failed");
@@ -1323,8 +1330,8 @@ int kclf_exec_hijack(struct kclf_req *r)
         return -EFAULT;
     }
 
-    /* only the values that select the payload are changed; the register file
-     * itself is restored verbatim on completion */
+    /* Only the values that select the payload are changed. The EL0 tail
+     * restores the interrupted register file except its return register x16. */
     regs->pc = r->entry_pc;
     regs->sp = r->stack_top;
     regs->pstate &= ~(3UL << 10); /* clear BTI branch type for the new entry */
@@ -1338,18 +1345,18 @@ int kclf_exec_hijack(struct kclf_req *r)
  * completion path in EL1 so the generated program never issues mprotect. */
 long kclf_apply_relro(struct kclf_req *r)
 {
-    int i;
-
-    if (r->relro_done) return 0;
-    r->relro_done = 1;
-    for (i = 0; i < (int)r->relro_count; i++) {
-        u64 start = r->relro[i][0];
-        u64 len = r->relro[i][1];
+    if (r->relro_count > KCLF_MAX_RELRO || r->relro_done > r->relro_count) return -EINVAL;
+    while (r->relro_done < r->relro_count) {
+        u64 start = r->relro[r->relro_done][0];
+        u64 len = r->relro[r->relro_done][1];
         long rc;
 
-        if (!len) continue;
-        rc = raw_syscall3(__NR_mprotect, (long)start, (long)len, KCLF_PROT_READ);
-        if (rc) return rc;
+        if (len) {
+            rc = raw_syscall3(__NR_mprotect, (long)start, (long)len, KCLF_PROT_READ);
+            if (rc) return rc;
+        }
+        /* Publish progress only after success; a failed range is retried. */
+        r->relro_done++;
     }
     return 0;
 }

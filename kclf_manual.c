@@ -12,7 +12,7 @@
 #include <uapi/asm-generic/unistd.h>
 #include <uapi/asm-generic/errno.h>
 
-#define KM_IMAGES 32
+#define KM_IMAGES KCLF_MAX_IMAGES
 #define KM_PROVIDERS 512
 #define KM_SCOPE 128
 #define KM_CALLS 128
