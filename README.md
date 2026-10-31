@@ -1,17 +1,5 @@
 # KCLF 1.5.4
 
-## 许可证 / License
-
-除另有声明的文件外，KCLF 按 GNU 通用公共许可证第 2 版或（由你选择）任何后续版本发布，
-SPDX 标识为 `GPL-2.0-or-later`。完整条款见 [LICENSE](LICENSE)；请保留已有的版权与许可声明。
-
-Unless a file states otherwise, KCLF is licensed under the GNU General Public
-License, version 2 or (at your option) any later version (`GPL-2.0-or-later`).
-See [LICENSE](LICENSE) for the full text. Existing copyright and license notices
-must be preserved.
-
-## 开发记录
-
 当前版本的普通 App 检测、准确性与业务影响评估见
 [1.5.4 检测分析与 Pixel 6 实测](DETECTION_ASSESSMENT_1.5.4_20261031.md)。
 148 次正式用例确认执行，通用上下文扫描/受控 x16 两规则共 59 检出、89 漏检；
