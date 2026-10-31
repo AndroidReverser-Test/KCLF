@@ -30,7 +30,9 @@ static int recognize(const uint32_t *words, size_t count, struct candidate *out)
 {
     const uint32_t mask = 0x003ffc00u;
     for (size_t end = 34; end < count; end++) {
-        if (words[end] != 0xd61f0200u) continue;
+        /* 1.5.1-1.5.3 use BR x16; 1.5.4 uses RET x16 for BTI-safe
+         * resumption. Neither opcode alone is sufficient evidence. */
+        if (words[end] != 0xd61f0200u && words[end] != 0xd65f0200u) continue;
         const uint32_t *t = words + end - 4, *w = t - 29;
         if ((t[0] & ~mask) != load_x(16, 10, 0) ||
             (t[1] & ~mask) != (0xf9000000u | (10u << 5) | 16u) ||

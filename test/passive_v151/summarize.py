@@ -31,23 +31,32 @@ def summarize(directory):
         if not phases:
             continue
         elapsed = sum(x["elapsed_ns"] for x in phases)
+        work_buckets = [x["work_p99_us"] for x in phases]
+        scan_buckets = [x["scan_p99_us"] for x in phases]
+        frame_buckets = [x["frame_p99_us"] for x in phases]
         perf.append(dict(enabled=enabled, phases=len(phases), seconds=elapsed / 1e9,
                          scanner_one_core_cpu_percent=100 * sum(x["cpu_ns"] for x in phases) / elapsed,
                          scanner_cpu_ms_per_scan=(sum(x["cpu_ns"] for x in phases) / 1e6 /
                                                   max(1, sum(x["scans"] for x in phases))),
                          workload_batches_per_second=sum(x["work"] for x in phases) / (elapsed / 1e9),
                          frames_per_second=sum(x["frames"] for x in phases) / (elapsed / 1e9),
-                         work_p99_us_by_phase=[x["work_p99_us"] for x in phases],
-                         median_work_p99_upper_us=statistics.median(x["work_p99_us"] for x in phases),
-                         frame_p99_upper_us_by_phase=[x["frame_p99_us"] for x in phases],
-                         scan_p99_upper_us_by_phase=[x["scan_p99_us"] for x in phases]))
+                         work_p99_bucket_us_by_phase=work_buckets,
+                         work_p99_saturated_by_phase=[x >= 6400 for x in work_buckets],
+                         median_work_p99_upper_us=(None if any(x >= 6400 for x in work_buckets)
+                                                  else statistics.median(work_buckets)),
+                         frame_p99_bucket_us_by_phase=frame_buckets,
+                         frame_p99_saturated_by_phase=[x >= 128000 for x in frame_buckets],
+                         scan_p99_bucket_us_by_phase=scan_buckets,
+                         scan_p99_saturated_by_phase=[x >= 12800 for x in scan_buckets]))
     return dict(evidence=str(directory), result=data["result"], period_ms=data.get("period_ms", 50),
                 cases=len(data["cases"]), outcomes=dict(collections.Counter(x["outcome"] for x in data["cases"])),
                 constructors=sum(x.get("constructor_end", False) for x in data["cases"]),
                 alive=sum(x.get("alive", False) for x in data["cases"]), groups=rows,
+                percentile_note="Saturated last histogram buckets are not upper bounds or exact percentiles.",
                 baseline=data["baseline"].get("stress", {}), performance=perf, recorded_totals=totals,
                 cleanup={k: data.get(k) for k in ("final_kpm_num", "test_app_uninstalled", "remote_test_files_removed",
-                                                 "boot_unchanged", "selinux_unchanged", "module_left_loaded")})
+                                                 "boot_unchanged", "selinux_unchanged", "module_left_loaded",
+                                                 "new_kernel_alerts", "kernel_check_error")})
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated passive KCLF 1.5.1 ordinary-App detection and overhead measurement.
+"""Isolated passive KCLF 1.5.x ordinary-App detection and overhead measurement.
 
 Never alters the injector. Only a previously absent test package and a unique
 remote directory are changed. KCLF_SUPERKEY is never persisted.
@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import shlex
 import shutil
@@ -30,10 +31,18 @@ def main():
     p.add_argument("--suite", choices=("pilot", "full", "bench"), default="pilot")
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--period-ms", type=int, choices=(50, 100, 250), default=50)
+    p.add_argument("--jitter-ms", type=int, default=0,
+                   help="Seeded pre-injection delay to vary the scanner phase (0..1000)")
+    p.add_argument("--seed", type=int, default=15420261031)
+    p.add_argument("--extended-linker", action="store_true",
+                   help="Also measure short and immediately unloaded linker injections")
     p.add_argument("--build-only", action="store_true")
     args = p.parse_args()
     if not 1 <= args.rounds <= 10:
         p.error("rounds must be 1..10")
+    if not 0 <= args.jitter_ms <= 1000:
+        p.error("jitter-ms must be 0..1000")
+    jitter = random.Random(args.seed)
     source = Path(__file__).resolve().parent
     module = source.parents[1]
     workspace = module.parents[1]
@@ -44,13 +53,21 @@ def main():
     for file in source.iterdir():
         if file.is_file():
             shutil.copy2(file, snapshot / file.name)
+    injector_snapshot = snapshot / "injector"
+    injector_snapshot.mkdir()
+    for name in ("kclf.kpm", "kclf_codegen.c", "kclf_codegen.h", "kclf_param.h"):
+        shutil.copy2(module / name, injector_snapshot / name)
     remote = "/data/local/tmp/" + output.name
     key = os.environ.get("KCLF_SUPERKEY", "")
     if not args.build_only and not re.fullmatch(r"[A-Za-z0-9_.+-]+", key):
         raise SystemExit("Set KCLF_SUPERKEY")
     summary = {"output": str(output), "package": PACKAGE, "suite": args.suite,
-               "rounds": args.rounds, "period_ms": args.period_ms, "cases": [], "commands": [], "baseline": {}}
+               "rounds": args.rounds, "period_ms": args.period_ms, "cases": [], "commands": [], "baseline": {},
+               "jitter_ms": args.jitter_ms, "seed": args.seed, "extended_linker": args.extended_linker,
+               "rule_name_note": "ctx_v151 is the historical label; parser accepts BR/RET x16"}
     installed = loaded = started = remote_created = False
+    kernel_before = None
+    kernel_alert = re.compile(r"\bBUG:|\bWARNING:|\bOops:|\bKernel panic|\bsoft lockup|\bhard LOCKUP|\brcu[^\n]*stall", re.I)
     print("Evidence: " + str(output), flush=True)
 
     def redact(s):
@@ -87,6 +104,27 @@ def main():
 
     def events():
         return root("cat " + shlex.quote(LOG), check=False)
+
+    def diagnostics(label):
+        text = root("dmesg", check=False)
+        save(label + ".dmesg.txt", text)
+        summary[label + "_dmesg_available"] = bool(text)
+        save(label + ".crash.txt", adb("shell", "logcat", "-d", "-v", "threadtime",
+             "-b", "main", "-b", "crash", "-s", "libc:F", "DEBUG:F", "AndroidRuntime:E", check=False).stdout)
+        save(label + ".exit-info.txt", adb("shell", "dumpsys", "activity", "exit-info", PACKAGE, check=False).stdout)
+        return text
+
+    def check_kernel():
+        if kernel_before is None:
+            return
+        text = root("dmesg", check=False)
+        if not text:
+            raise RuntimeError("Kernel diagnostic coverage lost; stopping device tests")
+        alerts = [line for line in text.splitlines() if line not in kernel_before and kernel_alert.search(line)]
+        if alerts:
+            save("kernel-alert.dmesg.txt", text)
+            summary["new_kernel_alerts"] = alerts
+            raise RuntimeError("New kernel warning/error; stopped further injections (causality not established)")
 
     def wait(action, predicate, seconds=20):
         deadline = time.monotonic() + seconds
@@ -144,6 +182,8 @@ def main():
             tid = tids[target]
             result.update(pid=pid, tid=tid, observer=tids["scanner"])
             save(name + ".before.txt", before)
+            result["pre_injection_jitter_ms"] = jitter.uniform(0, args.jitter_ms)
+            time.sleep(result["pre_injection_jitter_ms"] / 1000)
             result["queued"] = ctl(f"inject,{tid},{libs}/libpayload{hold}.so,{backend},wake" + (",unload" if unload else ""))
             if "queued id=" not in result["queued"]:
                 raise RuntimeError(result["queued"])
@@ -187,6 +227,7 @@ def main():
         finally:
             stop()
             persist()
+        check_kernel()
 
     try:
         sdk = Path(args.sdk)
@@ -237,7 +278,13 @@ def main():
             "kernel": adb("shell", "uname", "-a").stdout.strip(),
             "selinux": adb("shell", "getenforce").stdout.strip(),
             "boot_id": adb("shell", "cat", "/proc/sys/kernel/random/boot_id").stdout.strip(),
+            "serial": args.serial,
+            "fingerprint": adb("shell", "getprop", "ro.build.fingerprint").stdout.strip(),
         }
+        before_dmesg = diagnostics("before")
+        if not before_dmesg:
+            raise RuntimeError("Kernel diagnostics unavailable; refusing module test without coverage")
+        kernel_before = set(before_dmesg.splitlines())
         adb("shell", "mkdir", remote)
         remote_created = True
         adb("push", module / "kclf.kpm", remote + "/kclf.kpm")
@@ -281,6 +328,13 @@ def main():
         if args.suite == "full":
             for j in range(args.rounds):
                 case(len(matrix) + j + 1, "new", 200000, False, "linker")
+            if args.extended_linker:
+                for _ in range(args.rounds):
+                    for hold in (0, 20000, 200000):
+                        for unload in (False, True):
+                            if hold == 200000 and not unload:
+                                continue
+                            case(len(summary["cases"]) + 1, "new", hold, unload, "linker")
         summary["result"] = "completed_measurement"
     except Exception as error:
         summary["result"] = "test_error"
@@ -308,6 +362,7 @@ def main():
                 summary["cleanup_error"] = redact(str(error))
         if installed and not loaded:
             try:
+                diagnostics("after-test")
                 adb("uninstall", PACKAGE)
                 installed = False
                 summary["test_app_uninstalled"] = True
@@ -325,6 +380,11 @@ def main():
             summary["final_kpm_num"] = kpm("num", check=False)
             summary["boot_unchanged"] = adb("shell", "cat", "/proc/sys/kernel/random/boot_id").stdout.strip() == summary["device"]["boot_id"]
             summary["selinux_unchanged"] = adb("shell", "getenforce").stdout.strip() == summary["device"]["selinux"]
+            try:
+                check_kernel()
+                summary["new_kernel_alerts"] = []
+            except Exception as error:
+                summary["kernel_check_error"] = redact(str(error))
         summary["module_left_loaded"] = loaded
         summary["app_left_installed"] = installed
         persist()

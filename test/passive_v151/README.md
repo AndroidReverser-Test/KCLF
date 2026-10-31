@@ -1,8 +1,14 @@
-# KCLF 1.5.1 普通 App 被动检测夹具
+# KCLF 1.5.x 普通 App 被动检测夹具
+
+2026-10-31 已适配 1.5.4 的 `RET x16`，保留旧 `BR x16` 识别。当前 Pixel 6 / Android 16
+两组正式矩阵共 148 次确认执行：59 检出、89 漏检；受保护 x16 边界 24/24，不能外推全 App。
+50/250 ms 扫描实测分别占单核约 29.47%/6.91%。详见
+[1.5.4 完整分析](E:/KernelPatch/kpms/kclf/DETECTION_ASSESSMENT_1.5.4_20261031.md)。
+目录、包名和事件标签 `ctx_v151` 为兼容历史保留，不表示本轮加载旧版本。
 
 本目录只测试检测能力和开销，不修改注入器。测试包 `com.kclf.passive151` 为 non-debuggable、普通 App UID、无 capabilities、继承 zygote seccomp。
 
-当前结论与 128 例最终矩阵见 [真机报告](E:/KernelPatch/kpms/kclf/test/passive_v151/REPORT_20261031.md)。仍有短窗口/扫描线程自身漏检，未达到全进程可靠且零业务影响的验收要求。
+历史 1.5.1 的 128 例矩阵见 [历史真机报告](E:/KernelPatch/kpms/kclf/test/passive_v151/REPORT_20261031.md)，不是当前 1.5.4 的认证。两轮版本都未达到全进程可靠且零业务影响的验收要求。
 
 ## 两条规则
 
@@ -32,6 +38,11 @@ try {
 ```
 
 `--suite pilot` 做小矩阵；`--suite bench` 仅做无 KPM 的负对照与性能基准；`--period-ms 50|100|250` 控制扫描周期；`--build-only` 不操作设备。
+
+`--jitter-ms 250 --seed <整数>` 为注入前增加可复现相位扰动；`--extended-linker` 在 full
+矩阵中补测 linker 的短窗口和立即卸载。每例结束检查新增内核告警，有告警立即停止进一步
+注入并进入安全清理；保留前后 dmesg、App 退出记录和 fatal/Java crash 日志，不清空日志。
+证据中另保存原样 KPM 和生成器源码快照；直方图末桶饱和时汇总器不再将它误称为上界。
 
 要求初始 KPM 数量为 0、测试包不存在。不会覆盖已有包。原样加载工作区 `kclf.kpm`，记录哈希，不重新构建注入器。每轮仅停止自己启动的测试 App；最后 reap/quiesce，明确 idle 后才卸载。失败时保留诊断；不安全则保留模块，不能强行卸载。
 

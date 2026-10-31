@@ -17,8 +17,17 @@ int main(void)
             if(kclf_prog_build((u8 *)page,sizes[s],abi,priv,&pl,next_random(&rng),&result)||
                !recognize(page,sizes[s]/4,&c)||c.abi!=abi||c.priv!=priv||
                c.saved!=pl.saved||c.token!=pl.donetok||c.done!=pl.done) return 1;
+            unsigned tail=(result.entry_off-4+result.length)/4-1;
+            if(page[tail]!=0xd65f0200u) return 1;
+            /* Historical compatibility is tested on an in-memory fixture;
+             * the injector and its device artifact are never modified. */
+            page[tail]=0xd61f0200u;
+            if(!recognize(page,sizes[s]/4,&c)||c.abi!=abi||c.priv!=priv||
+               c.saved!=pl.saved||c.token!=pl.donetok||c.done!=pl.done) return 1;
+            page[tail]=0xd65f03c0u;
+            if(recognize(page,sizes[s]/4,&c)) return 1;
         }
-        printf("PASS size=%u generated=10000 recognized_and_decoded=10000\n",sizes[s]);
+        printf("PASS size=%u ret_x16=10000 historical_br_x16=10000 wrong_register_rejected=10000\n",sizes[s]);
     }
     for(unsigned i=0;i<10000;i++) {
         struct candidate c;
