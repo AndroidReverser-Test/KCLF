@@ -8,8 +8,10 @@
  *   target manager  -> slot table with pinned PID and borrowed mm identities
  *   request machine -> IDLE/ARMED/PREPARING/READY/RUNNING/DONE/FAILED
  *   execution       -> EL0 trampoline in a transient private mapping
- *   completion      -> real libc call (usleep/open) whose syscall is consumed
- *                      by the kernel hook; no svc in the generated page
+ *   completion      -> EL0 restores the register file itself and publishes a
+ *                      per-request token; ordinary target syscalls or the
+ *                      controller's poll observe it.  No syscall, signal or
+ *                      fault belongs to the framework's completion path
  */
 #ifndef _KCLF_INTERNAL_H_
 #define _KCLF_INTERNAL_H_
@@ -31,22 +33,22 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.5.0"
+#define KCLF_VER "1.5.1"
 
 #define KCLF_MAX_REQ 4
+/* GNU_RELRO ranges whose protection is applied from the kernel once the EL0
+ * phase finished (IFUNC results must be written before they turn read-only). */
+#define KCLF_MAX_RELRO 8
 
 /* mapping layout: one anonymous region whose blocks (RX code, RW ABI
  * parameter page, RW private parameter page and, only when the target's own
- * stack cannot be borrowed, a PROT_NONE guard + RW stack) are placed in a
- * random order with random pad pages between them.  The private page is
- * therefore not adjacent to the ABI page.  Sizes are randomized too. */
+ * stack cannot be borrowed, a PROT_NONE guard + RW
+ * stack) are placed in a random order with random pad pages between them.  The
+ * private page is therefore not adjacent to the ABI page.  Sizes are randomized
+ * too.  Every page that is not immediately overwritten carries random data. */
 #define KCLF_MIN_STACK_PAGES 6
 #define KCLF_STACK_PAGES_SPAN 9
 #define KCLF_STACK_HEADROOM 0x100
-
-#if KCLF_STACK_SLOT + 16 > KCLF_STACK_HEADROOM
-#error "completion stack slot does not fit in the reserved headroom"
-#endif
 
 /* request states, only mutated by the owner of the request */
 enum kclf_state
@@ -110,7 +112,6 @@ struct kclf_req
     int stage;
     int flags;
     u64 id;
-    u64 cookie;
     pid_t pid; /* thread the work is armed on */
     struct pid *pid_ref; /* stable identity across PID reuse and namespaces */
     u64 mm; /* identity only; never dereferenced after dropping the mm reference */
@@ -128,19 +129,17 @@ struct kclf_req
     u64 stack_top;
     u64 stack_ref_sp; /* user SP observed when stack_top was chosen */
     u64 entry_pc; /* where EL0 starts executing the generated program */
-    u64 bail_token; /* per-request EL0 recovery marker (never a fixed magic) */
-    u64 compl_fn[KCLF_COMPL_MAX]; /* resolved libc completion entries */
-    u64 compl_arg0[KCLF_COMPL_MAX]; /* matching harmless first argument */
-    u64 mprot_fn; /* resolved libc mprotect entry (manual RELRO) */
-    u64 compl_obs_pc; /* diagnostics: svc+4 observed by the completion hook */
-    u64 compl_obs_lr;
-    u64 compl_obs_sp;
-    u8 compl_nrs[KCLF_COMPL_MAX]; /* matching syscall numbers */
-    u8 compl_count;
+    u64 done_token; /* per-request EL0 completion marker (never a fixed magic) */
     u8 stack_borrowed; /* stack_top points into the interrupted thread stack */
     u8 stack_state; /* diagnostics: why borrowing succeeded/failed */
+    u8 completion_via; /* 1: watched syscall, 2: controller poll */
     u32 priv_layout_ok;
     struct kclf_priv_layout pl;
+
+    /* deferred GNU_RELRO protection (kernel-side, after the EL0 phase) */
+    u32 relro_count;
+    u32 relro_done;
+    u64 relro[KCLF_MAX_RELRO][2];
 
     struct kclf_loader ld;
     struct kclf_manual_image *image; /* transaction; never the sole resident owner */
@@ -171,6 +170,7 @@ struct kclf_req
     /* bookkeeping */
     int busy;
     int completing;
+    int poll_queued; /* one controller poll callback per request at a time */
     int finished;
     int cleanup_tries;
     int pending; /* queued + executing task_work references; acquire/release */
@@ -179,6 +179,7 @@ struct kclf_req
     struct callback_head work_prepare;
     struct callback_head work_hijack;
     struct callback_head work_cleanup;
+    struct callback_head work_poll;
 };
 
 static inline int kclf_state_load(const struct kclf_req *r)
@@ -236,9 +237,10 @@ extern int kclf_page_size;
 extern u64 kclf_user_limit;
 extern int kclf_user_tbi;
 extern int kclf_ready;
-/* randomized completion syscall pool, registered by kclf.c */
-extern const int kclf_compl_pool[];
-extern const int kclf_compl_pool_num;
+/* syscalls whose entry is used to observe the EL0 completion token; they are
+ * never consumed or modified, the callback only reads the private page */
+extern const int kclf_watch_pool[];
+extern const int kclf_watch_pool_num;
 
 /* kclf.c */
 int kclf_sym_lookup_all(void);
@@ -250,7 +252,7 @@ u64 kclf_now(void);
 /* kclf_exec.c */
 long kclf_exec_prepare(struct kclf_req *r);
 int kclf_exec_hijack(struct kclf_req *r);
-void kclf_exec_restore(struct kclf_req *r, struct pt_regs *regs);
+long kclf_apply_relro(struct kclf_req *r);
 long kclf_exec_finish(struct kclf_req *r, int capture_err);
 int kclf_exec_probe(char *out, int outlen);
 int kclf_exec_init(void);

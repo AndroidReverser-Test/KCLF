@@ -56,7 +56,6 @@ struct km_context {
     u64 *values;
     u8 *resolved;
     u64 fixups[KM_IFUNCS][3];
-    u64 protections[KE_PHNUM][2];
 };
 
 static struct kclf_manual_image images[KM_IMAGES];
@@ -524,21 +523,24 @@ static int protect_image(struct km_context *c)
         rc = raw_syscall3(__NR_mprotect, first, end - first, prot);
         if (rc) return (int)rc;
     }
+    /*
+     * GNU_RELRO is recorded here but applied later, from the completion path in
+     * EL1.  IFUNC resolvers run in EL0 and write their results into .got /
+     * .data.rel.ro, so those pages must still be writable during the EL0 phase.
+     * Applying the protection from the kernel also keeps the generated program
+     * free of any mprotect syscall or library call.
+     */
     for (i = 0; i < o->phnum; i++) {
         const struct ke_phdr *p = &o->ph[i];
         u64 first, end;
         if (p->type != 0x6474e552U || !p->memsz) continue;
         if (!ke_contains(o, o->bias + p->vaddr, p->memsz, 2)) return -ENOEXEC;
+        if (c->r->relro_count == KCLF_MAX_RELRO) return -E2BIG;
         first = (o->bias + p->vaddr) & ~(page - 1);
         end = (o->bias + p->vaddr + p->memsz + page - 1) & ~(page - 1);
-        if (c->r->ifunc_count) {
-            unsigned n = c->r->protect_count++;
-            c->protections[n][0] = first;
-            c->protections[n][1] = end - first;
-        } else {
-            rc = raw_syscall3(__NR_mprotect, first, end - first, 1);
-            if (rc) return (int)rc;
-        }
+        c->r->relro[c->r->relro_count][0] = first;
+        c->r->relro[c->r->relro_count][1] = end - first;
+        c->r->relro_count++;
     }
     /*
      * The randomized pad in front of the image takes the first load segment's
@@ -697,16 +699,15 @@ long kclf_manual_prepare(struct kclf_req *r)
     if ((rc = prepare_calls(c))) { step = "initializer/finalizer validation"; goto out; }
     if ((rc = protect_image(c))) { step = "segment protection/RELRO"; goto out; }
     {
+        /* The ABI page carries the initializer/finalizer vectors and the IFUNC
+         * triples.  RELRO ranges stay in kernel memory and are applied from the
+         * completion path, so they need no EL0 metadata at all. */
         u64 offset = KCLF_P_SIZE + (r->init_count + r->fini_count) * 8;
-        if (offset + r->ifunc_count * 24 + r->protect_count * 16 > (u64)kclf_page_size) {
+        if (offset + r->ifunc_count * 24 > (u64)kclf_page_size) {
             rc = -E2BIG; report(c, "initializer/IFUNC metadata exceeds parameter page", ""); step = "call metadata"; goto out;
         }
         if (r->ifunc_count && kclf_uwr(r->param_addr + offset, c->fixups, r->ifunc_count * 24)) {
             rc = -EFAULT; step = "IFUNC fixup export"; goto out;
-        }
-        offset += r->ifunc_count * 24;
-        if (r->protect_count && kclf_uwr(r->param_addr + offset, c->protections, r->protect_count * 16)) {
-            rc = -EFAULT; step = "RELRO metadata export"; goto out;
         }
     }
 out:
@@ -731,8 +732,6 @@ void kclf_manual_params(struct kclf_req *r, u8 *p)
     *(u64 *)(p + KCLF_P_IFARG) = 24;
     *(u64 *)(p + KCLF_P_IFARG + 8) = r->hwcap;
     *(u64 *)(p + KCLF_P_IFARG + 16) = r->hwcap2;
-    *(u64 *)(p + KCLF_P_PROTV) = *(u64 *)(p + KCLF_P_IFUNCV) + r->ifunc_count * 24;
-    *(u64 *)(p + KCLF_P_PROTN) = r->protect_count;
 }
 
 long kclf_manual_finish(struct kclf_req *r)

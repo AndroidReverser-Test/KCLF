@@ -8,21 +8,20 @@
  *   - entered at code_addr + entry_off through an exception return;
  *   - every General Purpose register is preserved except the ones the kernel
  *     itself restores on completion (the kernel restores the full pt_regs);
- *   - on success a libc completion call is consumed by the kernel hook, so the
- *     trampoline never returns;
- *   - if every completion attempt is converted into a signal (or otherwise not
- *     consumed), the program writes the per-request bail token, restores the
- *     original register file from the private parameter page and branches back
- *     to the interrupted PC.
+ *   - on success the program restores the interrupted register file in EL0,
+ *     publishes a per-request random token in the private page and branches
+ *     back to the interrupted PC itself.  There is no completion syscall, no
+ *     library call and no fault: the kernel notices the token when the thread
+ *     enters an ordinary watched syscall, or from a controller poll callback.
+ *     x16/IP0 cannot be restored because it carries the resume address; it is
+ *     caller-saved scratch in the supported ABI.
  *
  * Randomization per request: the code page is filled with random words, the
- * entry offset is random, the ten callee-saved register roles are assigned to a
+ * entry offset is random, the callee-saved register roles are assigned to a
  * random permutation of x19..x28, the 32 FPSIMD registers are stored under a
  * random pairing into random 32-byte slots, random filler instructions are
- * inserted, and the completion function addresses/arguments and syscall numbers
- * are read from the randomized private page instead of being encoded in the
- * program.  The generated page contains no svc at all: both completion and the
- * manual RELRO mprotect go through resolved libc entries.
+ * inserted, and the register restore order is shuffled.  The generated page
+ * contains no svc and no library call on the completion path.
  */
 #include "kclf_codegen.h"
 #include "kclf_param.h"
@@ -68,11 +67,9 @@ struct kce_roles
     int p; /* parameter page base */
     int pb; /* private parameter page base */
     int v; /* vector cursor */
-    int c; /* loop counter, later completion attempts */
-    int rc; /* completion rc (dlclose result / negative errno) */
+    int c; /* loop counter */
+    int rc; /* loader result (image id / negative errno) */
     int t0, t1, t2; /* temporaries */
-    int q; /* syscall list cursor */
-    int n; /* completion cookie */
 };
 
 /* ------------------------------------------------------------------ */
@@ -208,11 +205,6 @@ static u32 kce_ldr_w(int rt, int rn, u32 off)
     return 0xB9400000u | ((off / 4u) << 10) | ((u32)rn << 5) | (u32)rt;
 }
 
-static u32 kce_ldp_x_post(int rt, int rt2, int rn, u32 imm)
-{
-    return 0xA8C00000u | (((imm / 8u) & 0x7fu) << 15) | ((u32)rt2 << 10) | ((u32)rn << 5) | (u32)rt;
-}
-
 static u32 kce_stp_xzr_post(int rn, u32 imm)
 {
     return 0xA8800000u | (((imm / 8u) & 0x7fu) << 15) | (31u << 10) | ((u32)rn << 5) | 31u;
@@ -320,8 +312,8 @@ static void kce_shuffle(struct kce *c, int *values, int n)
 
 static void kce_roles_pick(struct kce *c, struct kce_roles *r)
 {
-    int pool[10] = { 19, 20, 21, 22, 23, 24, 25, 26, 27, 28 };
-    kce_shuffle(c, pool, 10);
+    int pool[8] = { 19, 20, 21, 22, 23, 24, 25, 26 };
+    kce_shuffle(c, pool, 8);
     r->p = pool[0];
     r->pb = pool[1];
     r->v = pool[2];
@@ -330,8 +322,6 @@ static void kce_roles_pick(struct kce *c, struct kce_roles *r)
     r->t0 = pool[5];
     r->t1 = pool[6];
     r->t2 = pool[7];
-    r->q = pool[8];
-    r->n = pool[9];
 }
 
 /* Filler instructions: they only touch dead temporaries, so they never change
@@ -387,19 +377,18 @@ static int kce_resolve(struct kce *c)
 }
 
 int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
-                    const struct kclf_priv_layout *pl, int compl_count, u64 seed, struct kclf_prog *out)
+                    const struct kclf_priv_layout *pl, u64 seed, struct kclf_prog *out)
 {
     struct kce c;
     struct kce_roles r;
     u64 state = seed ? seed : 0x6b636c66deadbeefULL;
     u32 *words = (u32 *)page;
     int qreg[32], qslot[16], order[31];
-    int entry_off, i, j;
-    int l_entry, l_manual, l_lok, l_lzero, l_ifunc, l_ifunc_err, l_prot, l_prot_loop;
-    int l_init, l_init_loop, l_fini, l_fini_loop, l_man_done, l_man_err, l_tail, l_wipe, l_bail;
+    int entry_off, i;
+    int l_entry, l_manual, l_lok, l_lzero, l_ifunc, l_ifunc_err;
+    int l_init, l_init_loop, l_fini, l_fini_loop, l_man_done, l_man_err, l_tail, l_wipe;
 
     if (!page || !out || !pl) return -1;
-    if (compl_count < 0 || compl_count > KCLF_COMPL_MAX) return -1;
     if (page_size < 2048 || (page_size & (page_size - 1))) return -1;
     if (pl->end > page_size) return -1;
     memset(&c, 0, sizeof(c));
@@ -433,8 +422,6 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
     l_lzero = kce_label(&c);
     l_ifunc = kce_label(&c);
     l_ifunc_err = kce_label(&c);
-    l_prot = kce_label(&c);
-    l_prot_loop = kce_label(&c);
     l_init = kce_label(&c);
     l_init_loop = kce_label(&c);
     l_fini = kce_label(&c);
@@ -443,7 +430,6 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
     l_man_err = kce_label(&c);
     l_tail = kce_label(&c);
     l_wipe = kce_label(&c);
-    l_bail = kce_label(&c);
 
     /* restart pad: a syscall restart may rewind the return PC by 4.  Emit one
      * random fall-through instruction that only touches a dead temporary, so
@@ -517,13 +503,13 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
     kce_emit(&c, kce_mov_reg(r.rc, 0));
     kce_b(&c, l_tail);
 
-    /* ---- manual backend: IFUNC, RELRO, constructors, finalizers ---- */
+    /* ---- manual backend: IFUNC, constructors, finalizers ---- */
     kce_bind(&c, l_manual);
     kce_junk(&c, &r, kce_below(&c, 2));
     kce_emit(&c, kce_ldr_x(r.v, r.p, KCLF_P_IFUNCV));
     kce_emit(&c, kce_ldr_x(r.c, r.p, KCLF_P_IFUNCN));
     kce_bind(&c, l_ifunc);
-    kce_cbz(&c, r.c, 1, l_prot);
+    kce_cbz(&c, r.c, 1, l_init);
     kce_emit(&c, kce_ldr_x(r.t0, r.v, 0));
     kce_emit(&c, kce_ldr_x(0, r.p, KCLF_P_IFARG + 8));
     kce_mov64(&c, r.t1, 0x4000000000000000ULL);
@@ -546,23 +532,6 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
     kce_emit(&c, kce_str_x(31, r.p, KCLF_P_HANDLE));
     kce_emit(&c, kce_mov_reg(r.rc, 0));
     kce_b(&c, l_tail);
-
-    kce_bind(&c, l_prot);
-    kce_emit(&c, kce_ldr_x(r.v, r.p, KCLF_P_PROTV));
-    kce_emit(&c, kce_ldr_x(r.c, r.p, KCLF_P_PROTN));
-    kce_bind(&c, l_prot_loop);
-    kce_cbz(&c, r.c, 1, l_init);
-    kce_emit(&c, kce_ldp_x_post(0, 1, r.v, 16));
-    kce_mov_const(&c, r.t0, 1);
-    kce_emit(&c, kce_mov_reg(2, r.t0));
-    /* Even the RELRO mprotect goes through libc, so the generated page holds
-     * no svc instruction at all.  The libc entry is randomized per request and
-     * stored in the private page. */
-    kce_emit(&c, kce_ldr_x(16, r.pb, pl->mprotfn));
-    kce_emit(&c, kce_blr(16));
-    kce_cbnz(&c, 0, 1, l_man_err);
-    kce_emit(&c, kce_sub_imm12(r.c, r.c, 1, 0));
-    kce_b(&c, l_prot_loop);
 
     kce_bind(&c, l_init);
     kce_junk(&c, &r, kce_below(&c, 2));
@@ -610,7 +579,7 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
 
     /* Scrub the whole ABI page.  There is no fixed "used length" field to
      * trust, and the generated program has already copied everything it needs
-     * (results, cookie, completion table) into the private page. */
+     * (results, completion token) into the private page. */
     kce_emit(&c, kce_mov_reg(r.t0, r.p));
     kce_add_imm(&c, r.t1, r.p, (u64)page_size);
     kce_bind(&c, l_wipe);
@@ -629,69 +598,18 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
     kce_emit(&c, kce_msr(KCE_FPSR, 11));
     kce_junk(&c, &r, kce_below(&c, 3));
 
-    /* Completion calls into real libc entries.  The ABI-visible state at the
-     * inner svc is that of a normal libc syscall: PC/LR in libc, x0..x5 holding
-     * the arguments the wrapper itself computes, x19..x29 the interrupted
-     * application values, and x6/x7 a per-request cookie that seccomp_data
-     * does not expose.  The kernel hook matches the cookie, not a code address.
-     *
-     * Keep the private page base in [sp,#KCLF_STACK_SLOT]: the libc call may
-     * clobber every caller-saved register, but it cannot touch this slot (its
-     * own frame is below SP).  The trampoline stack top leaves 0x100 bytes of
-     * headroom in the transient stack block, so this slot is always mapped. */
-    kce_emit(&c, kce_str_x(r.pb, 31, KCLF_STACK_SLOT));
-    kce_emit(&c, kce_mov_reg(9, r.pb));
-    for (i = 19; i <= 28; i++)
-        kce_emit(&c, kce_ldr_x(i, 9, pl->saved + (u32)i * 8u));
-    kce_emit(&c, kce_ldr_x(29, 9, pl->saved + 29u * 8u));
-
-    for (j = 0; j < compl_count; j++) {
-        switch (kce_below(&c, 3)) {
-        case 0:
-            kce_emit(&c, 0xD503201Fu); /* nop */
-            break;
-        case 1:
-            kce_emit(&c, kce_movz(10, (u32)kce_random(&c) & 0xffffu, 0));
-            break;
-        default:
-            kce_emit(&c, kce_eor_x(11, 11, 11));
-            break;
-        }
-        kce_emit(&c, kce_ldr_x(9, 31, KCLF_STACK_SLOT));
-        kce_emit(&c, kce_ldr_x(0, 9, pl->complarg0[j]));
-        kce_emit(&c, kce_ldr_x(16, 9, pl->complfn[j]));
-        kce_emit(&c, kce_ldr_x(6, 9, pl->cookie));
-        kce_emit(&c, kce_mov_reg(7, 6));
-        for (i = 1; i <= 5; i++)
-            kce_emit(&c, kce_mov_reg(i, 31)); /* x1..x5 = 0 */
-        for (i = 10; i <= 15; i++)
-            kce_emit(&c, kce_mov_reg(i, 31));
-        kce_emit(&c, kce_mov_reg(9, 31));
-        kce_emit(&c, kce_blr(16));
-    }
-
-    /* ---- EL0 recovery: restore the original register file and resume ---- */
-    kce_bind(&c, l_bail);
-    kce_emit(&c, kce_ldr_x(10, 31, KCLF_STACK_SLOT));
-    kce_emit(&c, kce_ldr_x(11, 10, pl->bailtok));
-    kce_emit(&c, kce_str_x(11, 10, pl->bail));
-
-    /* A failed libc completion call may have used the FP/SIMD registers, so
-     * restore the application's file once more before returning to EL0. */
-    kce_add_imm(&c, 11, 10, (u64)pl->qregs);
-    for (i = 0; i < 16; i++)
-        kce_emit(&c, kce_ldp_q(qreg[2 * i], qreg[2 * i + 1], 11, (u32)qslot[i] * 32u));
-    kce_emit(&c, kce_ldr_x(11, 10, pl->fpcr));
-    kce_emit(&c, kce_msr(KCE_FPCR, 11));
-    kce_emit(&c, kce_ldr_x(11, 10, pl->fpsr));
-    kce_emit(&c, kce_msr(KCE_FPSR, 11));
-
-    kce_emit(&c, kce_ldr_x(11, 10, pl->saved + KCLF_SAVED_SP));
+    /* Restore SP and NZCV first, then the general register file.  After the
+     * final restore only the token store and the return loads remain, so the
+     * thread cannot be observed inside a half-restored frame. */
+    kce_emit(&c, kce_ldr_x(11, r.pb, pl->saved + KCLF_SAVED_SP));
     kce_emit(&c, kce_add_imm12(31, 11, 0, 0)); /* mov sp, x11 */
-    kce_emit(&c, kce_ldr_x(11, 10, pl->saved + KCLF_SAVED_NZCV));
+    kce_emit(&c, kce_ldr_x(11, r.pb, pl->saved + KCLF_SAVED_NZCV));
     kce_emit(&c, kce_msr(KCE_NZCV, 11));
-    kce_emit(&c, kce_ldr_x(16, 10, pl->saved + KCLF_SAVED_PC));
 
+    /* x10 carries the private page base through the final sequence.  x16 is
+     * the one GPR that cannot be restored: it must hold the resume address for
+     * the final indirect branch.  It is caller-saved scratch in this ABI. */
+    kce_emit(&c, kce_mov_reg(10, r.pb));
     for (i = 0; i < 31; i++) order[i] = i;
     kce_shuffle(&c, order, 31);
     for (i = 0; i < 31; i++) {
@@ -699,6 +617,16 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
         if (reg == 10 || reg == 16) continue;
         kce_emit(&c, kce_ldr_x(reg, 10, pl->saved + (u32)reg * 8u));
     }
+
+    /* Publish the per-request random token.  This is the only completion
+     * event: an ordinary watched target syscall or the controller's poll
+     * callback compares it with the value exported by the kernel. */
+    kce_emit(&c, kce_ldr_x(16, 10, pl->donetok));
+    kce_emit(&c, kce_str_x(16, 10, pl->done));
+
+    /* Resume the interrupted PC from EL0.  No syscall, signal or fault is
+     * generated by the framework's completion path. */
+    kce_emit(&c, kce_ldr_x(16, 10, pl->saved + KCLF_SAVED_PC));
     kce_emit(&c, kce_ldr_x(10, 10, pl->saved + 10u * 8u));
     kce_emit(&c, kce_br(16));
 

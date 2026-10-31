@@ -1,9 +1,10 @@
 # 防检测可观测性验证
 
-> 1.5.0 说明：本目录的 Android 夹具仍是 1.4.x 的旧规则回归，未跟随新的 libc 完成
-> 路径更新。1.5.0 的主机验证见 `test/test_observability_signature.c`，真机
-> SIGSYS 现场验证见 `test/seccomp_probe.c`；当前结论以
-> [1.5.0 检测点](../../DETECTION_POINTS.md) 为准。
+> 1.5.1 说明：本目录的 Android 夹具仍是 1.4.x/1.5.0 的旧规则回归，只用于证明旧规则
+> 不再命中。1.5.1 已把 probe 断言更新为 `completion=el0`/`done=`，去掉了 1.5.0 的
+> `hook=libc`、`pool=9`、`compl=` 和完成候选 101/56 断言。当前结论以
+> [1.5.1 检测点](../../DETECTION_POINTS_20261031.md) 为准；主机验证见
+> `test/test_observability_signature.c`。
 
 当前结论以 [1.5.0 检测点与稳定性评估](../../DETECTION_POINTS.md) 为准。此目录的
 Android 夹具仍是有限旧规则回归，**未实现新的 208 字节尾段/运行期 ABI 检测**。

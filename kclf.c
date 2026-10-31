@@ -10,8 +10,8 @@
  *     and audit output are kept.
  *   - The framework runs entirely from a loadable module, so the fault-time
  *     dispatch point (handle_mm_fault) of kclf-shadow-design.md is not
- *     available. The trigger uses task_work (the target already entered the
- *     kernel: no ptrace or SIGSTOP). Preparation and loading may sleep, and
+ *     available. A request is armed with task_work (the target already entered
+ *     the kernel: no ptrace or SIGSTOP). Preparation and loading may sleep, and
  *     the return-to-user register file redirects one thread to the trampoline.
  *   - Cleanup attempts to remove the transient trampoline mapping and now
  *     verifies the munmap result instead of clearing the bookkeeping
@@ -20,10 +20,12 @@
  *     which case the trampoline calls __loader_dlclose after the constructors
  *     ran. Other threads can still observe changes to the shared address
  *     space during loading.
- *   - Syscall based completion replaces a write-fault trap. Its cookie lives
- *     in target memory only until the trampoline scrubs its parameter page;
- *     the loader result is handed back in x1/x2/x3. Correlation is not a
- *     security boundary.
+ *   - Completion is EL0 only: the generated program restores the interrupted
+ *     register file and publishes a per-request random token, then branches
+ *     back to the interrupted PC.  No syscall, signal or library call belongs
+ *     to the framework's completion path.  The token is observed at an
+ *     ordinary watched target syscall entry or by a controller poll callback,
+ *     and cleanup then runs in the target's context as task_work.
  */
 #include <kclf_internal.h>
 #include <common.h>
@@ -54,7 +56,6 @@ int kclf_ready;
 int kclf_mm_off = -1;
 
 static u64 kclf_next_id = 1;
-static int kclf_hook_ok;
 static int kclf_control_busy;
 static void (*kclf_rcu_read_lock)(void);
 static void (*kclf_rcu_read_unlock)(void);
@@ -282,6 +283,8 @@ static int kclf_queue_work(struct kclf_req *r, struct task_struct *task, struct 
 static void kclf_work_prepare(struct callback_head *head);
 static void kclf_work_hijack(struct callback_head *head);
 static void kclf_work_cleanup(struct callback_head *head);
+static void kclf_work_poll(struct callback_head *head);
+static void kclf_read_results(struct kclf_req *r);
 
 static void kclf_slot_reset(struct kclf_req *r)
 {
@@ -297,6 +300,7 @@ static void kclf_slot_reset(struct kclf_req *r)
     r->work_prepare.func = kclf_work_prepare;
     r->work_hijack.func = kclf_work_hijack;
     r->work_cleanup.func = kclf_work_cleanup;
+    r->work_poll.func = kclf_work_poll;
 }
 
 static int kclf_slot_reclaimable(struct kclf_req *r)
@@ -480,12 +484,21 @@ static void kclf_work_cleanup_body(struct callback_head *head)
 {
     struct kclf_req *r = local_container_of(head, struct kclf_req, work_cleanup);
     int st = kclf_state_load(r);
-    s64 handle = r->handle;
+    s64 handle;
     long rc = 0;
 
     r->busy = 1;
+    r->completing = 0;
     if ((u64)kclf_task_mm(current) == r->mm) {
         if (r->map_addr) {
+            if (st == KCLF_DONE) {
+                /* Results were already sampled by kclf_complete(); re-read
+                 * them here because this callback is the first and only place
+                 * that applies the deferred RELRO and releases the image. */
+                kclf_read_results(r);
+                rc = kclf_apply_relro(r);
+                if (rc) kclf_set_err(r, "RELRO protection failed rc=%ld", rc);
+            }
             rc = kclf_exec_finish(r, 1);
             if (rc && ++r->cleanup_tries <= 8) {
                 if (!kclf_queue_work(r, current, &r->work_cleanup, KCLF_TWA_RESUME)) {
@@ -503,9 +516,10 @@ static void kclf_work_cleanup_body(struct callback_head *head)
     }
     __atomic_store_n(&r->finished, !r->map_addr, __ATOMIC_RELEASE);
 
+    handle = r->handle;
     if (st == KCLF_RUNNING) {
-        /* trampoline finished but the completion trap was not consumed */
-        kclf_fail(r, KCLF_FAILED, KCLF_ST_RESTORE, -EPROTO, "completion trap missed");
+        /* trampoline finished but the completion token was never observed */
+        kclf_fail(r, KCLF_FAILED, KCLF_ST_RESTORE, -EPROTO, "completion token not observed");
     } else if (st == KCLF_DONE && !handle) {
         /* the framework restored the target, the loader itself failed */
         kclf_fail(r, KCLF_FAILED, KCLF_ST_LOADER, 0, "");
@@ -529,124 +543,173 @@ KCLF_WORK_WRAPPER(hijack)
 KCLF_WORK_WRAPPER(cleanup)
 
 /* ------------------------------------------------------------------ */
-/* completion trap                                                      */
+/* EL0 completion observation                                           */
 /*                                                                      */
-/* The generated program has no svc.  It calls a real libc entry          */
-/* (usleep()/open()) whose internal nanosleep/openat syscall carries the  */
-/* per-request cookie in x6/x7.  The kernel consumes the attempt whose    */
-/* scratch cookie and syscall number match the armed request; the PC and  */
-/* LR at that point belong to libc, so there is no anonymous-page         */
-/* completion address to recognize.  The remaining pool entries keep the  */
-/* EL0 bail token observable on ordinary target syscalls.                 */
+/* The generated program issues no syscall and calls no library          */
+/* function.  It restores the interrupted register file in EL0, writes a */
+/* per-request random completion token into its private page and        */
+/* branches back to the interrupted PC itself.  There is therefore no    */
+/* completion syscall, no signal, no library frame carrying a return    */
+/* address into the transient code page, no fixed call stub and no      */
+/* private-page pointer in a fixed stack slot for an observer to        */
+/* anchor on.                                                           */
+/*                                                                      */
+/* The token is noticed from two independent places, neither of which   */
+/* touches the target's register file:                                  */
+/*                                                                      */
+/*   - watched syscalls: a before-hook on a set of ordinary app        */
+/*     syscalls checks the token whenever the hijacked thread enters    */
+/*     the kernel;                                                      */
+/*   - controller poll: status/reap/quiesce queue a poll callback on    */
+/*     the target thread, so a thread that issues no watched syscall is */
+/*     still drained and the transient mapping is torn down.            */
+/*                                                                      */
+/* Both paths then queue the cleanup callback in the target's context,  */
+/* which collects the payload result, applies the deferred RELRO        */
+/* protection and releases the transient mapping.                       */
 /* ------------------------------------------------------------------ */
 
-static void kclf_completion_bailed(struct kclf_req *r)
+#define KCLF_VIA_NONE 0
+#define KCLF_VIA_SYSCALL 1
+#define KCLF_VIA_POLL 2
+#define KCLF_WATCH_MAX 96
+
+static int kclf_hook_ok; /* watched-syscall observation installed */
+static u8 kclf_watch_installed[KCLF_WATCH_MAX];
+static int kclf_watch_installed_num;
+static u64 kclf_token_hits;
+
+/* Results are written by the generated program into the private page just
+ * before it completes.  Reading them is only safe from sleepable target
+ * context (a task_work callback or a syscall hook). */
+static void kclf_read_results(struct kclf_req *r)
 {
     u64 handle = 0, errp = 0, rc = 0;
-    int ok = r->priv_layout_ok;
 
-    ok = ok && !kclf_urd(r->priv_addr + r->pl.handle, &handle, 8);
-    ok = ok && !kclf_urd(r->priv_addr + r->pl.errptr, &errp, 8);
-    ok = ok && !kclf_urd(r->priv_addr + r->pl.rc, &rc, 8);
-
-    if (ok) {
-        /* The payload really ran; EL0 already restored the register file. */
-        r->handle = (s64)handle;
-        r->err_user = errp;
-        r->unload_rc = (s32)rc;
-        if (r->flags & KCLF_F_UNLOAD) r->unloaded = r->handle && (r->unload_rc == 0);
-        r->stage = KCLF_ST_RESTORE;
-        r->j_done = kclf_now();
-        kclf_state_store(r, KCLF_DONE);
-        kclf_set_err(r, "completion blocked; EL0 restored the original register file");
-    } else {
-        kclf_fail(r, KCLF_FAILED, KCLF_ST_RESTORE, -EPROTO, "EL0 recovery metadata unreadable");
-    }
-    __atomic_sub_fetch(&kclf_loading_num, 1, __ATOMIC_SEQ_CST);
-    /* The recovery was noticed inside a syscall that may now block for a long
-     * time (e.g. epoll_pwait), so force the drain instead of waiting for the
-     * target to return on its own. */
-    if (kclf_queue_work(r, current, &r->work_cleanup,
-                        kclf_wake_supported ? KCLF_TWA_SIGNAL : KCLF_TWA_RESUME))
-        kclf_set_err(r, "cleanup queue rejected; mapping retained");
+    if (!r->priv_layout_ok) return;
+    if (!kclf_urd(r->priv_addr + r->pl.handle, &handle, 8)) r->handle = (s64)handle;
+    if (!kclf_urd(r->priv_addr + r->pl.errptr, &errp, 8)) r->err_user = errp;
+    if (!kclf_urd(r->priv_addr + r->pl.rc, &rc, 8)) r->unload_rc = (s32)rc;
+    if (r->flags & KCLF_F_UNLOAD) r->unloaded = r->handle && (r->unload_rc == 0);
 }
 
-static void kclf_completion_before(hook_fargs4_t *args, void *udata)
+/* Learn the pt_regs frame size from an EL0 syscall frame on kernels without
+ * BTF (the KPM cannot assume the host knows the layout). */
+static void kclf_learn_regs_size(struct pt_regs *regs)
+{
+    u64 top = (u64)get_stack(current) + (u64)thread_size;
+    u64 size;
+
+    if (!regs || __atomic_load_n(&kclf_regs_size, __ATOMIC_RELAXED)) return;
+    if ((u64)regs >= top) return;
+    size = top - (u64)regs;
+    if (size >= 288 && size <= 512 && !(size & 15)) __atomic_store_n(&kclf_regs_size, (int)size, __ATOMIC_RELEASE);
+}
+
+/* Finish a request after its token was observed in target context. */
+static void kclf_complete(struct kclf_req *r, int via, int force_drain)
+{
+    if (kclf_state_load(r) != KCLF_RUNNING) return;
+    r->completion_via = (u8)via;
+    r->completing = 1;
+    kclf_read_results(r);
+    r->stage = KCLF_ST_RESTORE;
+    r->j_done = kclf_now();
+    kclf_state_store(r, KCLF_DONE);
+    __atomic_sub_fetch(&kclf_loading_num, 1, __ATOMIC_SEQ_CST);
+    if (kclf_queue_work(r, current, &r->work_cleanup,
+                        force_drain ? (kclf_wake_supported ? KCLF_TWA_SIGNAL : KCLF_TWA_RESUME) : KCLF_TWA_RESUME)) {
+        /* Nothing will tear the transient mapping down for this request.  Do
+         * not leave it marked as an in-flight completion, so reap/quiesce can
+         * still report (and release) the slot. */
+        r->completing = 0;
+        kclf_set_err(r, "cleanup queue rejected; mapping retained");
+    }
+}
+
+/* Observation point 1: any watched syscall entered by the hijacked thread after
+ * the EL0 phase finished.  The callback never consumes or modifies the syscall;
+ * it only reads the token from the private page. */
+static void kclf_token_before(hook_fargs4_t *args, void *udata)
 {
     struct pt_regs *regs;
     struct kclf_req *r;
-    u64 bail = 0, handle = 0, errp = 0, rcval = 0;
-    int i;
+    u64 done = 0;
 
     (void)udata;
     if (!has_syscall_wrapper) return;
     regs = (struct pt_regs *)args->args[0];
     if (!regs) return;
-    /* Learn the actual frame from a syscall wrapper on non-BTF kernels. */
-    if (!kclf_regs_size) {
-        u64 top = (u64)get_stack(current) + (u64)thread_size;
-        u64 size = top - (u64)regs;
-        if (size >= 288 && size <= 512 && !(size & 15)) __atomic_store_n(&kclf_regs_size, (int)size, __ATOMIC_RELEASE);
-    }
-    if (!kclf_loading_num) return;
+    kclf_learn_regs_size(regs);
+#ifdef KCLF_TEST_NO_TOKEN_HOOK
+    /* Test build: the hooks are installed only to learn pt_regs.  Completion
+     * must be observed by the controller poll path. */
+    return;
+#endif
+    if (!__atomic_load_n(&kclf_loading_num, __ATOMIC_RELAXED)) return;
     r = kclf_slot_by_task(current);
-    if (!r || !r->saved_valid || kclf_state_load(r) != KCLF_RUNNING) return;
-    if (!r->priv_layout_ok) return;
-
-    /* The completion call passes the per-request cookie in the caller-saved
-     * x6/x7 scratch registers.  seccomp_data never exposes those, and the
-     * instruction pointer/link register at the svc belong to the libc wrapper
-     * that issued it, so the old "svc in the transient code page" anchor no
-     * longer exists.  Any other syscall while the generated program is running
-     * is the payload's own business; only the EL0 bail token is interesting. */
-    if (regs->regs[6] != r->cookie && regs->regs[7] != r->cookie) {
-        if (!kclf_urd(r->priv_addr + r->pl.bail, &bail, 8) && bail == r->bail_token)
-            kclf_completion_bailed(r);
-        return;
-    }
-    for (i = 0; i < r->compl_count; i++)
-        if ((u8)regs->regs[8] == r->compl_nrs[i]) break;
-    if (i == r->compl_count) return;
+    if (!r || !r->saved_valid || !r->priv_layout_ok) return;
     if ((u64)kclf_task_mm(current) != r->mm) return;
-    /* The trampoline passes the loader result in the private page because its
-     * ABI parameter page has already been scrubbed. */
-    if (!kclf_urd(r->priv_addr + r->pl.handle, &handle, 8)) r->handle = (s64)handle;
-    if (!kclf_urd(r->priv_addr + r->pl.errptr, &errp, 8)) r->err_user = errp;
-    if (!kclf_urd(r->priv_addr + r->pl.rc, &rcval, 8)) r->unload_rc = (s32)rcval;
-    if (r->flags & KCLF_F_UNLOAD) r->unloaded = r->handle && (r->unload_rc == 0);
-    r->compl_obs_pc = regs->pc;
-    r->compl_obs_lr = regs->regs[30];
-    r->compl_obs_sp = regs->sp;
-    r->completing = 1;
-    args->skip_origin = 1;
-    args->ret = 0;
+    if (kclf_urd(r->priv_addr + r->pl.done, &done, 8)) return;
+    if (!r->done_token || done != r->done_token) return;
+    __atomic_add_fetch(&kclf_token_hits, 1, __ATOMIC_RELAXED);
+    kclf_complete(r, KCLF_VIA_SYSCALL, 1);
 }
 
-static void kclf_completion_after(hook_fargs4_t *args, void *udata)
+/* Observation point 2: the controller queues this callback on the target thread
+ * (status/reap/quiesce).  It runs in target context at the next return-to-user
+ * boundary, so it can read the private page safely even when the thread never
+ * issues a watched syscall. */
+static void kclf_work_poll_body(struct callback_head *head)
 {
-    struct pt_regs *regs;
-    struct kclf_req *r;
+    struct kclf_req *r = local_container_of(head, struct kclf_req, work_poll);
+    u64 done = 0;
 
-    (void)udata;
-    if (!kclf_loading_num) return;
-    r = kclf_slot_by_task(current);
-    if (!r || !r->completing) return;
-    r->completing = 0;
-    regs = (struct pt_regs *)args->args[0];
-    if (!regs) {
-        kclf_fail(r, KCLF_FAILED, KCLF_ST_RESTORE, -EPROTO, "no register frame on completion");
-        return;
+    r->busy = 1;
+    if (kclf_state_load(r) != KCLF_RUNNING) return;
+    if ((u64)kclf_task_mm(current) != r->mm) return;
+    if (!r->priv_layout_ok) return;
+    if (kclf_urd(r->priv_addr + r->pl.done, &done, 8)) return;
+    if (!r->done_token || done != r->done_token) return;
+    kclf_complete(r, KCLF_VIA_POLL, 0);
+}
+
+/* Wrapper for the poll callback.  The head must stay marked in flight until the
+ * callback actually ran, otherwise a controller polling faster than the target
+ * returns to user could queue the same callback_head twice. */
+static void kclf_work_poll(struct callback_head *head)
+{
+    struct kclf_req *r = local_container_of(head, struct kclf_req, work_poll);
+
+    kclf_work_poll_body(head);
+    __atomic_store_n(&r->poll_queued, 0, __ATOMIC_RELEASE);
+    r->busy = 0;
+    __atomic_sub_fetch(&r->pending, 1, __ATOMIC_RELEASE);
+}
+
+/* Ask every live request's thread to check its token.  Called from the control
+ * plane; the memory access happens in the callback, in the target's context. */
+static void kclf_poll_running(void)
+{
+    int i;
+
+    for (i = 0; i < KCLF_MAX_REQ; i++) {
+        struct kclf_req *r = &kclf_reqs[i];
+        struct task_struct *task;
+
+        if (kclf_state_load(r) != KCLF_RUNNING) continue;
+        if (__atomic_exchange_n(&r->poll_queued, 1, __ATOMIC_ACQ_REL)) continue;
+        kclf_rcu_read_lock();
+        task = r->pid_ref ? kclf_ks.pid_task(r->pid_ref, 0) : 0;
+        if (task && (u64)task == r->task) {
+            if (!kclf_queue_work(r, task, &r->work_poll, KCLF_TWA_RESUME)) {
+                kclf_rcu_read_unlock();
+                continue;
+            }
+        }
+        kclf_rcu_read_unlock();
+        __atomic_store_n(&r->poll_queued, 0, __ATOMIC_RELEASE);
     }
-    kclf_exec_restore(r, regs);
-    /* the wrapper writes its return value into x0 after this hook; hand it the
-     * value the interrupted program must observe */
-    args->ret = regs->regs[0];
-    kclf_state_store(r, KCLF_DONE);
-    r->stage = KCLF_ST_RESTORE;
-    r->j_done = kclf_now();
-    __atomic_sub_fetch(&kclf_loading_num, 1, __ATOMIC_SEQ_CST);
-    if (kclf_queue_work(r, current, &r->work_cleanup, KCLF_TWA_RESUME))
-        kclf_set_err(r, "cleanup queue rejected; mapping retained");
 }
 
 static int kclf_hook_install(void)
@@ -654,26 +717,24 @@ static int kclf_hook_install(void)
     int i;
 
     if (!has_syscall_wrapper) {
-        logkw("kclf: no syscall wrapper, completion backend unavailable\n");
+        logkw("kclf: no syscall wrapper, watched-syscall completion unavailable\n");
         return 0;
     }
-    /* hook_syscalln is part of the oldest supported host ABI.  Newer hosts
-     * honour skip_origin (the completion syscall is then never executed); on
-     * older ones the call runs to completion and the after hook overwrites its
-     * result with the restored register file.  Every pool syscall fails before
-     * touching target memory with the arguments the trampoline passes. */
-    for (i = 0; i < kclf_compl_pool_num; i++) {
-        hook_err_t rc = hook_syscalln(kclf_compl_pool[i], 0, kclf_completion_before, kclf_completion_after, 0);
-        if (rc) {
-            int j;
-            logke("kclf: hook syscall %d failed: %d\n", kclf_compl_pool[i], rc);
-            for (j = 0; j < i; j++)
-                unhook_syscalln(kclf_compl_pool[j], kclf_completion_before, kclf_completion_after);
-            return rc;
-        }
+    if (kclf_watch_pool_num > KCLF_WATCH_MAX) return -E2BIG;
+    /* A syscall number that the running kernel does not implement simply does
+     * not install; the rest of the watch set stays usable. */
+    for (i = 0; i < kclf_watch_pool_num; i++) {
+        if (hook_syscalln(kclf_watch_pool[i], 0, kclf_token_before, 0, 0)) continue;
+        kclf_watch_installed[i] = 1;
+        kclf_watch_installed_num++;
+    }
+    if (!kclf_watch_installed_num) {
+        logke("kclf: no watched syscall could be installed\n");
+        return -ENOENT;
     }
     kclf_hook_ok = 1;
-    logki("kclf: completion hooks installed on %d candidate/guard syscalls\n", kclf_compl_pool_num);
+    logki("kclf: EL0 completion watch installed on %d of %d syscalls\n", kclf_watch_installed_num,
+          kclf_watch_pool_num);
     return 0;
 }
 
@@ -682,8 +743,9 @@ static void kclf_hook_remove(void)
     int i;
 
     if (!kclf_hook_ok) return;
-    for (i = 0; i < kclf_compl_pool_num; i++)
-        unhook_syscalln(kclf_compl_pool[i], kclf_completion_before, kclf_completion_after);
+    for (i = 0; i < kclf_watch_pool_num; i++)
+        if (kclf_watch_installed[i]) unhook_syscalln(kclf_watch_pool[i], kclf_token_before, 0);
+    kclf_watch_installed_num = 0;
     kclf_hook_ok = 0;
 }
 
@@ -704,21 +766,12 @@ static void kclf_status_line(char *out, int outlen, int *off, struct kclf_req *r
         return;
     }
     if (kclf_state_load(r) == KCLF_DONE) {
-        *off += kclf_scnprintf(out + *off, outlen - *off, " handle=%llx", (unsigned long long)r->handle);
-        if (r->compl_obs_pc)
-            *off += kclf_scnprintf(out + *off, outlen - *off, " svc=%llx lr=%llx sp=%llx",
-                                   (unsigned long long)r->compl_obs_pc,
-                                   (unsigned long long)r->compl_obs_lr,
-                                   (unsigned long long)r->compl_obs_sp);
+        *off += kclf_scnprintf(out + *off, outlen - *off, " handle=%llx done=%s", (unsigned long long)r->handle,
+                               r->completion_via == KCLF_VIA_SYSCALL ? "syscall" :
+                               (r->completion_via == KCLF_VIA_POLL ? "poll" : "?"));
         *off += kclf_scnprintf(out + *off, outlen - *off, " stack=%s/%u",
                                r->stack_borrowed ? "task" : "transient", r->stack_state);
         if (r->ld.sym) *off += kclf_scnprintf(out + *off, outlen - *off, " via=%s", r->ld.sym);
-        if (r->compl_count) {
-            int k;
-            *off += kclf_scnprintf(out + *off, outlen - *off, " compl=");
-            for (k = 0; k < r->compl_count; k++)
-                *off += kclf_scnprintf(out + *off, outlen - *off, "%s%u", k ? "," : "", (unsigned)r->compl_nrs[k]);
-        }
         if (!(r->flags & KCLF_F_LINKER))
             *off += kclf_scnprintf(out + *off, outlen - *off, " image=%llu refs=%u resident=%llx+%llu hdr=%s",
                                   (unsigned long long)r->image_id, r->image_refs,
@@ -752,11 +805,14 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
     struct task_struct *task;
     struct mm_struct *mm;
     struct pid *pid_ref;
-    u64 cookie;
     int rc;
 
-    if (!kclf_hook_ok) {
-        *off += kclf_scnprintf(out + *off, outlen - *off, "error: completion backend unavailable\n");
+    /* The controller poll path is sufficient only when the pt_regs frame is
+     * already known (BTF).  Without BTF the first watched syscall is what
+     * teaches kclf_regs_size, so there is no safe return boundary to hijack. */
+    if (!kclf_hook_ok && !kclf_regs_size) {
+        *off += kclf_scnprintf(out + *off, outlen - *off,
+                               "error: no completion observation (watch unavailable, no BTF pt_regs)\n");
         return -EOPNOTSUPP;
     }
     if (kclf_unloading && !release) {
@@ -865,8 +921,6 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
     r->stage = KCLF_ST_QUEUE;
     snprintf(r->comm, sizeof(r->comm), "%s", get_task_comm(task));
     strncpy(r->path, path, sizeof(r->path) - 1);
-    cookie = get_random_u64();
-    r->cookie = cookie ? cookie : 0x6b636c66deadbeefULL;
     r->j_queued = kclf_now();
     kclf_state_store(r, KCLF_ARMED);
 
@@ -909,6 +963,10 @@ static long kclf_cmd_cancel(char *tok[], int ntok, char *out, int outlen, int *o
 static long kclf_cmd_status(char *out, int outlen, int *off)
 {
     int i, n = 0;
+
+    /* A polling controller is itself a completion observer: ask every live
+     * request's thread to check its token at its next return-to-user boundary. */
+    kclf_poll_running();
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
         if (kclf_state_load(r) == KCLF_IDLE) continue;
@@ -916,14 +974,17 @@ static long kclf_cmd_status(char *out, int outlen, int *off)
         n++;
     }
     if (!n) *off += kclf_scnprintf(out + *off, outlen - *off, "no requests\n");
-    *off += kclf_scnprintf(out + *off, outlen - *off, "hook=%s loading=%d page=%d\n",
-                           kclf_hook_ok ? "libc" : "none", kclf_loading_num, kclf_page_size);
+    *off += kclf_scnprintf(out + *off, outlen - *off, "watch=%s installed=%d/%d loading=%d page=%d\n",
+                           kclf_hook_ok ? "on" : "off", kclf_watch_installed_num, kclf_watch_pool_num,
+                           kclf_loading_num, kclf_page_size);
     return 0;
 }
 
 static long kclf_cmd_reap(char *out, int outlen, int *off)
 {
     int i;
+
+    kclf_poll_running();
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
         struct task_struct *task;
@@ -979,6 +1040,7 @@ static long kclf_cmd_quiesce(char *out, int outlen, int *off)
             __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
         }
     }
+    kclf_poll_running();
     kclf_manual_reap();
     busy = kclf_has_work();
     *off += kclf_scnprintf(out + *off, outlen - *off, "quiesce=%s; new requests disabled\n",
@@ -1106,8 +1168,10 @@ static long kclf_ctl0(const char *args, char *__user out_msg, int outlen)
     } else if (!strcmp(tok[0], "probe")) {
         int n = kclf_exec_probe(out, sizeof(out) - 64);
         if (n > 0) off = n;
-        off += kclf_scnprintf(out + off, sizeof(out) - off, "hook=%s syscall_wrapper=%d pool=%d\n",
-                              kclf_hook_ok ? "libc" : "none", has_syscall_wrapper, kclf_compl_pool_num);
+        off += kclf_scnprintf(out + off, sizeof(out) - off,
+                              "completion=el0 watch=%s installed=%d/%d syscall_wrapper=%d tokens=%llu\n",
+                              kclf_hook_ok ? "on" : "off", kclf_watch_installed_num, kclf_watch_pool_num,
+                              has_syscall_wrapper, (unsigned long long)kclf_token_hits);
     } else if (!strcmp(tok[0], "inject") || !strcmp(tok[0], "release")) {
         rc = kclf_cmd_inject(tok, ntok, out, sizeof(out), &off);
     } else if (!strcmp(tok[0], "images")) {
@@ -1181,8 +1245,10 @@ static long kclf_init(const char *args, const char *event, void *reserved)
 
     rc = kclf_hook_install();
     if (rc) {
-        /* keep the module loaded so the failure is inspectable */
-        logkw("kclf: running without completion backend\n");
+        /* Keep the module loaded so the failure is inspectable.  The controller
+         * poll path can still finish requests on kernels where BTF already
+         * describes pt_regs; without BTF there is no safe hijack boundary. */
+        logkw("kclf: watched-syscall completion unavailable (%d); controller poll only\n", rc);
     }
 
     kclf_ready = 1;

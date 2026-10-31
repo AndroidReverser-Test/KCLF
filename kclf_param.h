@@ -7,10 +7,14 @@
  * by the position independent trampoline emitted by kclf_codegen.c; both
  * include this header, so the layout can only change in one place.
  *
- * The trampoline scrubs the whole ABI page before the completion call; results
- * and the randomized completion table live in a separate private page
- * (kclf_codegen.h struct kclf_priv_layout).  The completion itself is a libc
- * call, so the ABI page never has to carry a syscall number or cookie.
+ * The trampoline scrubs the whole ABI page before it finishes; results and the
+ * randomized private page (kclf_codegen.h struct kclf_priv_layout) live in a
+ * separate mapping.  Completion never issues a syscall: the program restores
+ * the original register file in EL0, writes a per-request random token into the
+ * private page and branches back to the interrupted PC.  The kernel notices the
+ * token on the thread's next watched syscall or from a controller poll.  The
+ * ABI page therefore never carries a syscall number, cookie, completion
+ * function or stack slot an observer could anchor on.
  */
 #ifndef _KCLF_PARAM_H_
 #define _KCLF_PARAM_H_
@@ -33,8 +37,6 @@
 #define KCLF_P_IFUNCV 0x178 /* resolver, destination, addend triples */
 #define KCLF_P_IFUNCN 0x180
 #define KCLF_P_IFARG 0x188 /* AArch64 __ifunc_arg_t: size, hwcap, hwcap2 */
-#define KCLF_P_PROTV 0x1a0 /* RELRO address,length pairs, applied after IFUNC */
-#define KCLF_P_PROTN 0x1a8
 #define KCLF_P_SIZE 0x1c0
 
 #define KCLF_PATH_MAX 256

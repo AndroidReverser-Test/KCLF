@@ -29,6 +29,12 @@ static int contains(const unsigned char *haystack, size_t size, const char *need
     return 0;
 }
 
+static unsigned word_at(const unsigned char *code, unsigned i)
+{
+    return (unsigned)code[i] | ((unsigned)code[i + 1] << 8) | ((unsigned)code[i + 2] << 16) |
+           ((unsigned)code[i + 3] << 24);
+}
+
 static unsigned char page[65536];
 
 int main(int argc, char **argv)
@@ -56,49 +62,30 @@ int main(int argc, char **argv)
         pl.qregs = 0x140;
         pl.fpcr = 0x360;
         pl.fpsr = 0x368;
-        pl.bail = 0x370;
-        pl.bailtok = 0x378;
-        pl.nrkey = 0x380;
-        pl.nrcnt = 0x384;
-        pl.nrs = 0x388;
-        pl.handle = 0x3c0;
-        pl.errptr = 0x3c8;
-        pl.rc = 0x3d0;
-        pl.cookie = 0x3d8;
-        pl.mprotfn = 0x3e0;
-        pl.complfn[0] = 0x3e8;
-        pl.complfn[1] = 0x3f0;
-        pl.complfn[2] = 0x3f8;
-        pl.complarg0[0] = 0x400;
-        pl.complarg0[1] = 0x408;
-        pl.complarg0[2] = 0x410;
-        pl.path = 0x418;
-        pl.end = 0x458;
+        pl.done = 0x370;
+        pl.donetok = 0x378;
+        pl.handle = 0x380;
+        pl.errptr = 0x388;
+        pl.rc = 0x390;
+        pl.end = 0x398;
 
         memset(page, 0, sizeof(page));
-        if (kclf_prog_build(page, page_size, 0x7f12345000ULL, 0x7f12347000ULL, &pl, 2, seed, &prog)) {
+        if (kclf_prog_build(page, page_size, 0x7f12345000ULL, 0x7f12347000ULL, &pl, seed, &prog)) {
             fprintf(stderr, "seed %u: build failed\n", seed);
             return 1;
         }
         code = page + prog.entry_off - 4;
         if (prog.entry_off < 8 || (prog.entry_off & 15) || prog.entry_off >= (u32)page_size) failures++;
         if (prog.length < 200 || prog.length > (u32)page_size) failures++;
-        /* The generated page must contain no svc at all: completion and RELRO
-         * both go through libc entries, so a seccomp observer never sees a
-         * syscall whose resume PC is in the transient code page. */
-        for (i = 0; i + 4 <= prog.length; i += 4) {
-            unsigned word = (unsigned)code[i] | ((unsigned)code[i + 1] << 8) |
-                            ((unsigned)code[i + 2] << 16) | ((unsigned)code[i + 3] << 24);
-            if (word == 0xd4000001u) svc++;
-        }
+        /* The generated page must contain no svc at all: completion is an EL0
+         * token store plus an indirect branch, so a seccomp observer never
+         * sees a syscall whose PC is in the transient code page. */
+        for (i = 0; i + 4 <= prog.length; i += 4)
+            if (word_at(code, i) == 0xd4000001u) svc++;
         if (svc) failures++;
         /* the entry is preceded by a random fall-through restart pad, not by a
          * fixed branch instruction */
-        {
-            unsigned word = (unsigned)code[0] | ((unsigned)code[1] << 8) |
-                            ((unsigned)code[2] << 16) | ((unsigned)code[3] << 24);
-            if (!restart_pad_ok(word)) failures++;
-        }
+        if (!restart_pad_ok(word_at(code, 0))) failures++;
         /* no embedded framework tag */
         if (contains(page, (size_t)page_size, "KCLFBAIL")) failures++;
         /* unused code-page bytes stay randomized */

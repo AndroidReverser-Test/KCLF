@@ -1,23 +1,31 @@
-# KCLF 1.5.0
+# KCLF 1.5.1
 
-当前普通 App 检测结论见 [检测点与稳定性评估](DETECTION_POINTS.md)。1.5.0 重写了完成
-路径：生成页中不再包含任何 `svc`，完成改为调用真实 libc `usleep()`/`open()` 包装函数，
-私有参数页布局每请求随机化，并优先借用被中断线程自己的栈。1.4.3 的 208 字节完成尾段
-事件判据因此不再适用；但这仍不是“不可检测”证明。
+当前普通 App 检测结论见 [1.5.1 检测点与稳定性评估](DETECTION_POINTS_20261031.md)。1.5.1 的完成路径
+是纯 EL0：生成页不执行任何 `svc`、不调用任何库函数、不产生故障或信号。程序恢复被
+中断线程的整份寄存器（唯一例外是作为分支寄存器的 x16/IP0）、FPSIMD、SP 和 NZCV，
+向私有参数页写入每请求随机 token，然后直接 `br` 回被中断 PC。内核只在 70 个普通
+系统调用入口的 before hook，或控制器 `status`/`reap`/`quiesce` 排队的 poll 回调里
+观察 token；随后由目标上下文的 cleanup task_work 应用延迟 RELRO 并回收临时映射。
 
-* 生成程序不再嵌入固定的 `KCLFBAIL` 标记。EL0 恢复路径使用内核写入私有参数页的
-  每请求随机 token，扫描匿名可执行内存找不到框架字面量。
-* 1.5.0 删除生成页中的全部 `svc`：manual RELRO 的 `mprotect` 也调用 libc；完成候选
-  只通过 libc 的 `usleep(0)`（`nanosleep`）和 `open()`（`openat`）发出。
-* 私有参数页与 ABI 页改为独立随机块；私有页的保存寄存器、FPSIMD、cookie、函数表、
-  密钥、结果槽和 bail token 每个字段都有独立随机偏移；ABI 页完成前整页清零。
-* 完成调用前恢复 x19–x29 为原中断值，cookie 放在 seccomp BPF 不可见的 x6/x7；内核
-  hook 按 cookie 和候选 syscall 号消费，不再匹配代码页 PC。
-* 临时映射优先借用目标线程自己的栈；借用成功时 SP 和 `usleep` 的 timespec 指针都在
-  正常线程栈内；找不到 pt_regs 或栈空间不足时回退到专用临时栈。
+1.5.0 的“真实 libc `usleep()`/`open()` 完成调用 + x6/x7 cookie + 72 字节调用结构”链
+已被删除。`test/selfcheck_v15` 的 full 套件在 1.5.0 上 45/45 用例检出；1.5.1 为
+45/45 **detections=0**，45/45 `done=syscall`，构造函数/析构函数正常执行、目标存活、
+`quiesce=idle`、`kpm num=0`。另用 `KCLF_TEST_NO_TOKEN_HOOK` 构建验证了 `done=poll`
+的控制器轮询路径。**这仍不是“不可检测”证明**。
+
+* 生成页没有 `svc`、没有库调用、没有故意缺页的写；完成不产生 syscall、信号或库
+  调用现场，因此不存在可被 seccomp/SIGSYS 捕获的完成事件。
+* 私有参数页与 ABI 页是独立随机块；保存寄存器、FPSIMD、token、结果槽每个字段都有
+  独立随机偏移；ABI 页完成前整页清零。程序不再嵌入 `KCLFBAIL` 等固定字面量。
+* 私有页只保存恢复现场和结果；生成程序不再保留完成候选表、cookie、函数表或栈槽。
+  `status` 的 `done=syscall|poll` 记录 token 由哪条观察路径命中。
+* manual 的 GNU_RELRO 由内核在 cleanup 回调里调用 `mprotect` 应用，生成程序不再
+  调用 libc `mprotect`；构造函数执行期间 RELRO 页仍可写。
+* 临时映射优先借用目标线程自己的栈；找不到 pt_regs 或栈空间不足时回退到专用临时栈
+  （`status` 显示 `stack=transient`）。
 * 入口前的重启填充指令、寄存器角色、FPSIMD 槽位和恢复顺序继续随机化。
 
-1.4.2 已改变 1.4.1 两项检测规则所依赖的固定跳板/getpid 和 ELF 头锚点；当前测试
+1.4.2 已改变 1.4.1 两项检测规则所依赖的固定跳板/getpid 和 ELF 头锚点；1.4.x 夹具
 只保留旧方法 B，旧方法 A 的完整实现已删除，不能把无事件当作它的重新实测。1.4.3
 继续收紧静态标记和部分布局锚点。检测边界和
 残余可观测面见 [1.4.2/1.4.3 加固报告](OBSERVABILITY_HARDENING_20261030.md) 与
@@ -52,11 +60,11 @@ linker 的替代品；导入 IFUNC 时仍需执行提供库中的 resolver，不
 完整变更、审计和验证边界见 [1.3.1 审计](COMPATIBILITY_1.3.1.md)。
 
 KCLF 是一个 ARM64 Android 的 KernelPatch 模块：在目标线程下一次返回用户态时重定向
-`pt_regs`，用一段按请求生成的 EL0 程序在目标进程里完成所选后端的用户态步骤，再调用
-libc `usleep()` 或 `open()` 包装函数，由 libc 内部的 `nanosleep`/`openat` syscall
-交回内核并恢复寄存器。生成页本身不含 `svc`，完成现场 PC/LR 属于 libc，cookie 放在
-seccomp BPF 不可见的 x6/x7。它不使用 ptrace、不暂停目标、不安装信号处理器、不在注入
-路径上调用 `getpid`。
+`pt_regs`，用一段按请求生成的 EL0 程序在目标进程里完成所选后端的用户态步骤。完成后
+程序在 EL0 恢复被中断线程的寄存器/FPSIMD/SP/NZCV，向私有页写入每请求随机 token，并
+直接 `br` 回被中断 PC；框架完成路径不发出 syscall、不产生信号、不调用库函数。token
+由目标线程之后的普通 syscall 入口观察，或由控制器 `status`/`reap`/`quiesce` 的 poll
+观察。它不使用 ptrace、不暂停目标、不安装信号处理器、不在注入路径上调用 `getpid`。
 
 1.3.0 起支持**普通 64 位 Android 应用进程**：zygote fork 出来、带 seccomp 过滤器、
 运行在 `untrusted_app` 域里的第三方应用可以直接作为目标；同时也仍然支持自有 native
@@ -93,10 +101,11 @@ adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf probe
 adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf sym
 ```
 
-`probe` 会打印内核版本、BTF 布局、`pt_regs` 大小、页大小、wake 能力、hook 状态和
-随机完成候选池大小。有 BTF 时验证结构偏移；没有 BTF 时通过内核 accessor 和目标自身的
-`/proc/thread-self/maps` 读取，不猜结构偏移。无 BTF 的 `pt_regs` 大小由实际
-syscall wrapper 帧学习。必需符号/宿主能力仍需满足。
+`probe` 会打印内核版本、BTF 布局、`pt_regs` 大小、页大小、wake 能力、完成观察状态
+（`completion=el0 watch=on|off installed=<n>/<m> tokens=<n>`）。有 BTF 时验证结构
+偏移；没有 BTF 时通过内核 accessor 和目标自身的 `/proc/thread-self/maps` 读取，
+不猜结构偏移。无 BTF 的 `pt_regs` 大小由实际 syscall wrapper 帧学习。必需符号/
+宿主能力仍需满足。
 
 ## 控制接口
 
@@ -154,10 +163,9 @@ adb shell ls /proc/<pid>/task
 
 普通应用进程有两点与自有 native 测试进程不同：
 
-* **seccomp**：zygote 给每个 app 安装的过滤器允许完成候选池中的普通系统调用
-  （`read`/`write`/`futex`/`clock_gettime`/`ioctl`/`epoll_pwait`/`nanosleep`/
-  `sched_yield`）。框架已不再依赖 `getpid` 完成自陷；1.3.0 起不因为 `TIF_SECCOMP`
-  拒绝普通 app。
+* **seccomp**：1.5.1 的框架完成路径不发出任何 syscall，因此不依赖某个 syscall
+  被过滤器允许；payload 自己的调用仍受 zygote 过滤器和应用附加过滤器约束。
+  1.3.0 起不因为 `TIF_SECCOMP` 拒绝普通 app。
 * **VMA 很多**：app 常有 2000+ 个 VMA，扫描上限已提高，并会扫描到高地址的
   `/apex/.../linker64` 与 `libc.so`。
 
@@ -202,7 +210,7 @@ adb shell /data/local/tmp/kpatch $KEY kpm ctl0 kclf status
 成功后 `status` 类似：
 
 ```text
-#0 id=1 pid=7844(com.example.app) state=done stage=restore handle=1 via=manual image=1 refs=1 resident=...+...
+#0 id=1 pid=7844(com.example.app) state=done stage=restore handle=1 done=syscall via=manual image=1 refs=1 resident=...+...
 ```
 
 ### 4. payload 约束
@@ -244,22 +252,22 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
 1. **仅 64 位目标**。32 位 app 在 hijack 阶段以 `32-bit target unsupported` 拒绝。
 2. **不绕过调试/跟踪**。`TIF_SYSCALL_TRACE`、`SYSCALL_EMU`、`SINGLESTEP`、`UPROBE`
    仍拒绝；ptrace 调试器、strace 等场景不支持。
-3. **seccomp 允许，但不是任意过滤器的保证**。标准 zygote app 策略允许完成候选
-   `nanosleep`/`openat`；若一个候选被 TRAP，EL0 会尝试另一个候选，全部失败后走
-   bail 并报告 `completion blocked`。KILL_THREAD/KILL_PROCESS 或未处理的致命 SIGSYS
-   不可能这样恢复；应急路径的 `br x16` 在 BTI 强制设备上仍受目标 PC 是否为合法落点
-   约束。manual 的 IFUNC/RELRO 路径也通过 libc 调用 `mprotect`。框架不绕过、不修改
-   目标的 seccomp 策略。
+3. **seccomp 允许，但不是任意过滤器的保证**。1.5.1 的框架完成路径本身不再发出
+   syscall，因此不可能被 seccomp 拦截；payload 自己的系统调用仍受目标策略约束。
+   `SECCOMP_RET_KILL_*` 或未处理的致命 SIGSYS 只会影响 payload/目标，不会把框架的
+   token 观察变成检测阳性。框架不绕过、不修改目标的 seccomp 策略。
 4. **SVE/SME 状态仍拒绝**；FPSIMD（q0–q31、FPCR/FPSR）在 EL0 程序中保存恢复。
 5. **注入是异步的**：目标线程可能停在任意内核返回点。安全点判断只是启发式，不能
    证明用户态锁未被持有；`force` 只用于排障。
 6. **不冻结进程**：其他线程仍可并发 `mmap`/`munmap`、修改 linker 状态或发信号。
 7. **不保证不可观测**：临时/驻留映射、linker 模式的 loader 记录、构造函数副作用和
-   时序都可被目标观察；manual 不注册到 bionic 的 soinfo/调试/展开元数据。1.5.0
-   消除了 1.4.3 的页内完成 `svc`、208 字节尾段、固定私有 ABI 和“私有页=ABI+页”关系，
-   并优先把 SP 放回线程栈；但仍保留匿名 RX 代码页、随机私有状态页、可读 payload 内容
-   和回退栈暴露面。遇到持续 trap 完成候选的 SIGSYS handler 时，hijack 可能无法取得
-   pt_regs，属于拒绝服务/未覆盖，不应写成检测阳性。
+   时序都可被目标观察；manual 不注册到 bionic 的 soinfo/调试/展开元数据。1.5.1
+   消除了 1.5.0 的完成 syscall、libc 调用帧、x6/x7 cookie 和 72 字节固定调用结构，
+   但仍保留匿名 RX 代码页、随机私有状态页、可读 payload 内容和回退栈暴露面。
+   完成回收窗口延长到目标线程下一次被观察系统调用或控制器下一次 poll。EL0 完成
+   路径不恢复 x16/IP0（分支寄存器），其余 30 个 GPR 和 FPSIMD/SP/NZCV 精确恢复。
+   遇到持续 trap 或过滤掉框架观察点的环境时，请求可能停留到控制器 poll，属于功能
+   失败/未覆盖，不应写成检测阳性。
 8. **目标退出时**：请求持有 `struct pid` 身份但不长期持有 `mm`，避免延后 `exit_mmap`
    导致 ActivityManager 收不到进程死亡；目标消失后由 `reap` 清槽，旧 mm 中的临时映射
    随最后使用者退出。
@@ -272,16 +280,30 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
 11. **不绕过 non-dumpable/ptrace 策略**：App 被系统标记为 non-dumpable 时，
     `/proc/self/auxv`、`/proc/self/mem` 对 App 自身凭据也可能是 `EACCES`。框架用
     内核 accessor 解决自己的 `AT_HWCAP` 需求，但不会替 payload 打开这些文件。
-12. **没有覆盖所有内核**：1.5.0 已在无 BTF 的 Android 12 / 5.10.66 / 4K 上实测；
+12. **没有覆盖所有内核**：1.5.1 已在无 BTF 的 Android 12 / 5.10.66 / 4K 上实测；
     其他 5.x、6.x、16K/64K 页仍需同一产物的真机回归。历史版本结果不是当前版本验收。
 13. **借用栈有回退**：只有能找到 pt_regs、栈 VMA 足够大且距 guard 有余量时才借用
     线程栈；否则回退到临时栈块，`status` 会显示 `stack=transient`。深栈、altstack
     或找不到 syscall 帧的目标可能走回退路径。
+14. **BTI 落点未全面验收**：EL0 完成用 `br x16` 返回被中断 PC；若设备对该映射强制
+    BTI 且该 PC 不是合法 landing pad，会触发分支目标异常。当前 Android 12 /
+    5.10.66 设备未触发，但未在 BTI 强制设备上验证。
 
 ## 测试
 
-防检测回归（普通 App 自检夹具：旧方法 A/B、ELF 头页级扫描、残余内容扫描、
-`KCLFBAIL` 字面量扫描、系统调用 guard、`keepelf` 对照）：
+1.5.1 普通 App 自检（关键验收；full 45 个用例，期望 `detections=0`、
+`done=syscall`、构造函数/析构函数执行、`quiesce=idle`、`kpm num=0`）：
+
+```powershell
+$env:KCLF_SUPERKEY = Read-Host 'KernelPatch superkey'
+python kpms/kclf/test/selfcheck_v15/run.py --serial '<SERIAL>' --suite full --rounds 5
+Remove-Item Env:KCLF_SUPERKEY
+```
+
+说明见 [test/selfcheck_v15/README.md](test/selfcheck_v15/README.md)。
+
+防检测回归（旧方法 A/B、ELF 头页级扫描、残余内容扫描、`KCLFBAIL` 字面量扫描、
+系统调用 guard、`keepelf` 对照）：
 
 ```powershell
 $env:KCLF_SUPERKEY = Read-Host 'KernelPatch superkey'
@@ -291,7 +313,7 @@ Remove-Item Env:KCLF_SUPERKEY
 
 说明与规则边界见 [test/observability/README.md](test/observability/README.md)。
 
-1.5.0 主机结构审计（生成页无 `svc`、1.4.3 尾段 0 命中、随机布局）：
+1.5.1 主机结构审计（生成页无 `svc`、1.4.3 尾段/1.5.0 完成 stub 0 命中、随机布局）：
 
 ```sh
 gcc -std=c11 -O2 -Wall -Wextra -Werror -DKCLF_CODEGEN_HOST \
@@ -314,8 +336,9 @@ gcc -std=c11 -O2 -Wall -Wextra -Werror -DKCLF_CODEGEN_HOST \
 adb push build/seccomp_probe /data/local/tmp/kclf-v15-test/
 ```
 
-注入后读取 `/data/local/tmp/kclf-seccomp.log`；1.5.0 的完成现场应为
-`in_libc=11 in_stack=1`（PC/LR 在 libc、SP 在线程栈），而不是匿名代码页。
+注入后读取 `/data/local/tmp/kclf-seccomp.log`。1.5.1 不应产生框架完成 syscall；
+探针只用于确认目标自身/payload 的 `openat` 现场是普通 libc 帧，且不存在 1.5.0 的
+72 字节完成 stub。
 
 默认 manual 后端（需要先构建 KPM；`--app` 仅使用已安装且停止的自有测试 App）：
 
@@ -375,10 +398,14 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 
 ## 文档
 
-- [DETECTION_POINTS.md](DETECTION_POINTS.md)：当前 1.5.0 检测点、libc 完成路径、
-  主机 30,000 样本审计、真机 SIGSYS 现场与残余暴露。
-- [test/seccomp_probe.c](test/seccomp_probe.c)：真机 openat SIGSYS 现场探针（PC/LR/SP、
-  x6/x7 cookie）。
+- [DETECTION_POINTS_20261031.md](DETECTION_POINTS_20261031.md)：当前 1.5.1 检测点、
+  纯 EL0 完成协议、45/45 自检结果、poll 路径、残余可观测面与边界。
+- [DETECTION_POINTS.md](DETECTION_POINTS.md)：1.5.0 历史基线（libc 完成调用、
+  主机 30,000 样本审计、真机 SIGSYS 现场），不代表当前实现。
+- [HARDENING_PLAN_20261031.md](HARDENING_PLAN_20261031.md)：1.5.1 改造方案、
+  逐项实现进度、真机证据与代价。
+- [test/seccomp_probe.c](test/seccomp_probe.c)：真机 openat SIGSYS 现场探针
+  （用于确认 1.5.1 不再出现框架完成调用/72 字节 stub）。
 - [MANUAL_LOADER.md](MANUAL_LOADER.md)：手动加载、依赖来源选择、随机 pad/ELF 头擦除、
   `keepelf`、边界与验证记录。
 - [OBSERVABILITY_HARDENING_20261030.md](OBSERVABILITY_HARDENING_20261030.md)：1.4.2/1.4.3

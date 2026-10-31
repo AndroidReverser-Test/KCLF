@@ -238,8 +238,9 @@ def main():
         loaded = True
         probe = ctl("probe")
         save("probe.txt", probe)
-        check("pt_regs=ok" in probe and "hook=libc" in probe and "pool=9" in probe,
-              "fresh KPM completion backend is ready (libc candidates)")
+        check("pt_regs=ok" in probe and "completion=el0" in probe and "watch=on" in probe
+              and re.search(r"installed=\d+/\d+", probe) is not None,
+              "fresh KPM EL0 completion backend is ready (watched syscalls)")
 
         for backend in ("manual", "linker"):
             for unload in (False, True):
@@ -256,9 +257,9 @@ def main():
                     check(f"pid={tid}" in status and "state=done" in status,
                           name + ": injection completed")
                     if backend == "manual" and not unload:
-                        match = re.search(r"compl=([\d,]+)", status)
+                        match = re.search(r"done=(syscall|poll)", status)
                         check(match is not None and "hdr=scrubbed" in status,
-                              name + ": randomized completion list and scrubbed ELF header")
+                              name + ": EL0 completion path and scrubbed ELF header")
                         if match:
                             completions.append(match[1])
                     time.sleep(1.2)
@@ -333,9 +334,8 @@ def main():
             cases.append({"case": name, "pass": True, "pid": pid, "tid": tid})
             stop_app()
 
-        numbers = {nr for item in completions for nr in item.split(",")}
-        check({"101", "56"} <= numbers,
-              "completion candidates include both libc entries: " + ",".join(sorted(numbers)))
+        check("syscall" in completions,
+              "EL0 completion was observed at a watched syscall: " + ",".join(sorted(set(completions))))
 
         pid, tid, libraries = start_app("plain")
         ctl(f"inject,{tid},{libraries}/libobsother.so,manual,wake")
@@ -395,7 +395,7 @@ def main():
             except Exception as error:
                 metadata["postcheck_error"] = str(error)
         metadata["cases"] = cases
-        metadata["completion_lists"] = sorted(set(completions))
+        metadata["completion_paths"] = sorted(set(completions))
         metadata["module_left_loaded"] = loaded
         save("results.json", json.dumps(events, ensure_ascii=False, indent=2))
         save("summary.json", json.dumps(metadata, ensure_ascii=False, indent=2))

@@ -6,9 +6,11 @@
  * The engine runs with the request's pinned PID/mm identity and never stops the target:
  *   - preparation runs from a task_work callback (sleepable, target context),
  *   - the register file is only touched at the return-to-user boundary,
- *   - the payload is entered once through a per-request generated EL0 program
- *     and gives control back through one of the randomized completion syscalls,
- *     after which the original register file is restored.
+ *   - the payload is entered once through a per-request generated EL0 program,
+ *     which restores the interrupted register file in EL0 and publishes a
+ *     per-request token.  Ordinary target syscalls (or the controller's poll)
+ *     observe that token; no syscall, signal, library call or kernel fault
+ *     belongs to the framework's completion path.
  */
 #include <kclf_internal.h>
 #include <common.h>
@@ -142,7 +144,7 @@ static int kclf_user_range(u64 addr, u64 len)
     return addr && addr < KCLF_USER_MAX && len <= KCLF_USER_MAX - addr;
 }
 
-/* Completion hooks cannot fault. Keep this API separate from the sleepable
+/* Watched-syscall hooks cannot fault. Keep this API separate from the sleepable
  * GUP accessor: nofault returns 0/-errno, access_process_vm returns bytes. */
 int kclf_urd(u64 addr, void *buf, int len)
 {
@@ -674,48 +676,100 @@ int kclf_exec_init(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* completion syscall selection                                         */
+/* EL0 completion                                                      */
 /* ------------------------------------------------------------------ */
 
-/*
- * The completion is a real libc call, never an svc in the generated page.
- * These two entries are C wrappers whose own code performs the syscall after a
- * nested call, so the kernel-visible link register points into libc as well:
+/* The completion path makes no syscall and calls no library function: the
+ * generated program restores the interrupted register file itself, publishes a
+ * per-request random token in its private page and branches back to the
+ * interrupted PC.  A seccomp filter, a ptrace tracer or a library interposer
+ * therefore has no completion event to observe.
  *
- *   usleep(0)  -> libc usleep calls nanosleep@plt; svc #101, x0 is a normal
- *                 timespec pointer on the trampoline stack, x1 is NULL.
- *   open(NULL) -> libc open calls __openat; svc #56, AT_FDCWD, NULL path,
- *                 O_RDONLY.  If it ever executes for real it fails with EFAULT.
- *
- * The per-request cookie travels in x6/x7, which seccomp_data does not expose
- * at all.  Both wrappers preserve those scratch registers up to the svc on the
- * supported bionic builds; the kernel hook accepts either one.
- */
-static const struct
-{
-    const char *sym;
-    u8 nr;
-} kclf_compl_cands[] = {
-    { "usleep", 101 },
-    { "open", 56 },
-};
-#define KCLF_COMPL_CAND_NUM ((int)(sizeof(kclf_compl_cands) / sizeof(kclf_compl_cands[0])))
-
-/* syscalls the completion dispatcher watches.  The 1.4.3 pool entries remain
- * registered so the EL0 bail token is noticed on any ordinary target syscall;
- * openat is added because it is now a completion candidate. */
-const int kclf_compl_pool[] = {
-    63, /* read */
-    64, /* write */
-    98, /* futex */
+ * The kernel notices the token from an ordinary syscall entry of the hijacked
+ * thread (the list below) or from the controller's status/reap/quiesce poll.
+ * Neither path consumes or modifies the syscall, and neither touches the
+ * target's register file.  A gated host (syscall-hook callbacks restricted to
+ * privileged UIDs) simply never fires these; the controller poll and the
+ * watched set are independent of each other. */
+const int kclf_watch_pool[] = {
+    /* metadata / process state */
+    17,  /* getcwd */
+    172, /* getpid */
+    173, /* getppid */
+    174, /* getuid */
+    175, /* geteuid */
+    176, /* getgid */
+    177, /* getegid */
+    178, /* gettid */
+    160, /* uname */
+    134, /* rt_sigaction */
+    135, /* rt_sigprocmask */
+    139, /* rt_sigreturn */
+    130, /* tkill */
+    131, /* tgkill */
+    129, /* kill */
+    /* memory */
+    214, /* brk */
+    215, /* munmap */
+    216, /* mremap */
+    222, /* mmap */
+    226, /* mprotect */
+    233, /* madvise */
+    278, /* getrandom */
+    279, /* memfd_create */
+    /* file descriptor and path traffic */
+    56,  /* openat */
+    57,  /* close */
+    59,  /* pipe2 */
+    61,  /* getdents64 */
+    62,  /* lseek */
+    63,  /* read */
+    64,  /* write */
+    65,  /* readv */
+    66,  /* writev */
+    67,  /* pread64 */
+    68,  /* pwrite64 */
+    79,  /* newfstatat */
+    80,  /* fstat */
+    82,  /* fsync */
+    35,  /* unlinkat */
+    23,  /* dup */
+    25,  /* fcntl */
+    /* waiting, timers and scheduler */
+    22,  /* epoll_pwait */
+    441, /* epoll_pwait2 */
+    20,  /* epoll_create1 */
+    21,  /* epoll_ctl */
+    72,  /* pselect6 */
+    73,  /* ppoll */
+    98,  /* futex */
+    449, /* futex_waitv */
+    101, /* nanosleep */
     113, /* clock_gettime */
-    29, /* ioctl */
-    22, /* epoll_pwait */
-    101, /* nanosleep: usleep() candidate */
+    115, /* clock_nanosleep */
     124, /* sched_yield */
-    56, /* openat: open() candidate */
+    260, /* wait4 */
+    /* binder / sockets / ioctl */
+    29,  /* ioctl */
+    198, /* socket */
+    200, /* bind */
+    201, /* listen */
+    202, /* accept */
+    203, /* connect */
+    204, /* getsockname */
+    205, /* getpeername */
+    206, /* sendto */
+    207, /* recvfrom */
+    208, /* setsockopt */
+    209, /* getsockopt */
+    210, /* shutdown */
+    211, /* sendmsg */
+    212, /* recvmsg */
+    /* exit */
+    93,  /* exit */
+    94,  /* exit_group */
 };
-const int kclf_compl_pool_num = (int)(sizeof(kclf_compl_pool) / sizeof(kclf_compl_pool[0]));
+const int kclf_watch_pool_num = (int)(sizeof(kclf_watch_pool) / sizeof(kclf_watch_pool[0]));
 
 static int kclf_rand_below(int n)
 {
@@ -767,23 +821,11 @@ static int kclf_layout_try(struct kclf_priv_layout *pl, u64 *state)
         { KCLF_QREGS_BYTES, 16, &pl->qregs },
         { 8, 8, &pl->fpcr },
         { 8, 8, &pl->fpsr },
-        { 8, 8, &pl->bail },
-        { 8, 8, &pl->bailtok },
-        { 4, 4, &pl->nrkey },
-        { 4, 4, &pl->nrcnt },
-        { 16 * 4, 4, &pl->nrs },
+        { 8, 8, &pl->done },
+        { 8, 8, &pl->donetok },
         { 8, 8, &pl->handle },
         { 8, 8, &pl->errptr },
         { 8, 8, &pl->rc },
-        { 8, 8, &pl->cookie },
-        { 8, 8, &pl->mprotfn },
-        { 8, 8, &pl->complfn[0] },
-        { 8, 8, &pl->complfn[1] },
-        { 8, 8, &pl->complfn[2] },
-        { 8, 8, &pl->complarg0[0] },
-        { 8, 8, &pl->complarg0[1] },
-        { 8, 8, &pl->complarg0[2] },
-        { KCLF_COMPL_PATH, 8, &pl->path },
     };
     int n = (int)(sizeof(slots) / sizeof(slots[0]));
     int i, cursor;
@@ -825,209 +867,32 @@ static int kclf_layout_init(struct kclf_req *r, u64 seed)
     r->pl.qregs = 0x120;
     r->pl.fpcr = 0x320;
     r->pl.fpsr = 0x328;
-    r->pl.bail = 0x330;
-    r->pl.bailtok = 0x338;
-    r->pl.nrkey = 0x340;
-    r->pl.nrcnt = 0x344;
-    r->pl.nrs = 0x348;
-    r->pl.handle = 0x388;
-    r->pl.errptr = 0x390;
-    r->pl.rc = 0x398;
-    r->pl.cookie = 0x3a0;
-    r->pl.mprotfn = 0x3a8;
-    r->pl.complfn[0] = 0x3b0;
-    r->pl.complfn[1] = 0x3b8;
-    r->pl.complfn[2] = 0x3c0;
-    r->pl.complarg0[0] = 0x3c8;
-    r->pl.complarg0[1] = 0x3d0;
-    r->pl.complarg0[2] = 0x3d8;
-    r->pl.path = 0x3e0;
-    r->pl.end = 0x420;
+    r->pl.done = 0x330;
+    r->pl.donetok = 0x338;
+    r->pl.handle = 0x340;
+    r->pl.errptr = 0x348;
+    r->pl.rc = 0x350;
+    r->pl.end = 0x358;
     r->priv_layout_ok = 1;
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* libc completion resolver                                             */
+/* private page export                                                  */
 /* ------------------------------------------------------------------ */
 
-struct kclf_libc_probe
-{
-    struct kclf_elf libc;
-    struct kclf_dyninfo di;
-    const char *skip_path;
-    int found;
-};
-
-static int kclf_libc_visit(u64 start, const char *path, void *context)
-{
-    struct kclf_libc_probe *p = context;
-    struct kclf_elf ei;
-    struct kclf_dyninfo di;
-    char soname[64];
-
-    if (p->found) return 1;
-    if (path && *path) {
-        if (p->skip_path && !strcmp(path, p->skip_path)) return 0;
-        if (!strstr(path, "libc.so")) return 0;
-    }
-    if (kclf_elf_open(start, &ei)) return 0;
-    if (kclf_elf_dyninfo(&ei, &di)) return 0;
-    if (kclf_elf_soname(&ei, &di, soname, sizeof(soname))) return 0;
-    if (strcmp(soname, "libc.so")) return 0;
-    p->libc = ei;
-    p->di = di;
-    p->found = 1;
-    return 1;
-}
-
-static int kclf_find_libc(struct kclf_req *r, struct kclf_libc_probe *p)
-{
-    int rc;
-
-    memset(p, 0, sizeof(*p));
-    p->skip_path = r->path;
-    /* The private page is still random filler here; it is used as the procfs
-     * read scratch instead of the ABI page, whose manual metadata is already
-     * populated by the backend. */
-    rc = kclf_walk_vmas(r->priv_addr, kclf_libc_visit, p);
-    if (rc == 1) rc = 0;
-    if (p->found) return 0;
-    return rc ? rc : -ENOENT;
-}
-
-/* Pick up to two distinct libc entries, in random order, and resolve the libc
- * mprotect entry used by the manual RELRO pass.  No fallback to an in-page svc:
- * the whole point is that no such instruction exists in the generated page. */
-static int kclf_resolve_completion(struct kclf_req *r)
-{
-    struct kclf_libc_probe p;
-    int order[KCLF_COMPL_CAND_NUM];
-    int i, rc;
-
-    rc = kclf_find_libc(r, &p);
-    if (rc) {
-        kclf_set_err(r, "completion libc not found rc=%d", rc);
-        return rc;
-    }
-    for (i = 0; i < KCLF_COMPL_CAND_NUM; i++) order[i] = i;
-    for (i = KCLF_COMPL_CAND_NUM - 1; i > 0; i--) {
-        int j = kclf_rand_below(i + 1), t = order[i];
-        order[i] = order[j];
-        order[j] = t;
-    }
-    r->compl_count = 0;
-    for (i = 0; i < KCLF_COMPL_CAND_NUM; i++) {
-        u64 addr = 0;
-        int k = order[i];
-        int slot = r->compl_count;
-        if (kclf_elf_lookup(&p.libc, &p.di, kclf_compl_cands[k].sym, &addr)) continue;
-        r->compl_fn[slot] = addr;
-        r->compl_nrs[slot] = kclf_compl_cands[k].nr;
-        r->compl_arg0[slot] = 0;
-        /* open(path, O_RDONLY): a plausible first argument.  The kernel hook
-         * still consumes the syscall; if it ever executes, the random
-         * /proc/self/fd/<n>/<x> path fails without leaking a descriptor. */
-        if (!strcmp(kclf_compl_cands[k].sym, "open") && r->priv_layout_ok)
-            r->compl_arg0[slot] = r->priv_addr + r->pl.path;
-        r->compl_count++;
-    }
-    if (!r->compl_count) {
-        kclf_set_err(r, "no libc completion entry resolved");
-        return -EOPNOTSUPP;
-    }
-    if (!(r->flags & KCLF_F_LINKER)) {
-        u64 mprot = 0;
-        if (kclf_elf_lookup(&p.libc, &p.di, "mprotect", &mprot)) {
-            kclf_set_err(r, "libc mprotect not resolved");
-            return -ENOENT;
-        }
-        r->mprot_fn = mprot;
-    }
-    return 0;
-}
-
-/* two or three distinct attempts, in random order */
-static void kclf_pick_completion(struct kclf_req *r)
-{
-    int i;
-
-    r->bail_token = get_random_u64();
-    if (!r->bail_token) r->bail_token = 1;
-    if (r->compl_count > KCLF_COMPL_MAX) r->compl_count = KCLF_COMPL_MAX;
-    for (i = 0; i < r->compl_count; i++) {
-#ifdef KCLF_TEST_COMPLETION_FIRST_MISS
-        if (i == 0) r->compl_nrs[0] = 174; /* getuid: not consumed */
-#endif
-#ifdef KCLF_TEST_COMPLETION_ALL_MISS
-        r->compl_nrs[i] = 174;
-#endif
-    }
-}
-
-/* export the completion table and layout into the private page */
-static int kclf_export_completion(struct kclf_req *r)
+/* Export the per-request completion token and the randomized field layout.
+ * The saved register file is copied in later, at the hijack boundary, because
+ * only then are the interrupted registers known.  Results (handle/errptr/rc)
+ * are written by the generated program just before it completes. */
+static int kclf_export_private(struct kclf_req *r)
 {
     u64 page = (u64)kclf_page_size;
-    u32 key = (u32)get_random_u64();
-    int i, n;
+    u64 tok = r->done_token;
 
     if (!r->priv_layout_ok || r->pl.end > page) return -EINVAL;
     if (kclf_fill_random(r->priv_addr, page)) return -EFAULT;
-
-#define KCLF_PUT32(off, val)                                                                  \
-    do {                                                                                      \
-        u32 v_ = (u32)(val);                                                                  \
-        if (kclf_uwr(r->priv_addr + (u64)(off), &v_, sizeof(v_))) return -EFAULT;              \
-    } while (0)
-#define KCLF_PUT64(off, val)                                                                  \
-    do {                                                                                      \
-        u64 v_ = (u64)(val);                                                                  \
-        if (kclf_uwr(r->priv_addr + (u64)(off), &v_, sizeof(v_))) return -EFAULT;              \
-    } while (0)
-
-    KCLF_PUT32(r->pl.nrkey, key);
-    KCLF_PUT32(r->pl.nrcnt, r->compl_count);
-    for (i = 0; i < r->compl_count; i++)
-        KCLF_PUT32(r->pl.nrs + (u32)i * 4u, (u32)r->compl_nrs[i] ^ key);
-    KCLF_PUT64(r->pl.bailtok, r->bail_token);
-    KCLF_PUT64(r->pl.cookie, r->cookie);
-    for (i = 0; i < r->compl_count; i++)
-        KCLF_PUT64(r->pl.complfn[i], r->compl_fn[i]);
-    for (i = 0; i < r->compl_count; i++)
-        KCLF_PUT64(r->pl.complarg0[i], r->compl_arg0[i]);
-    if (!(r->flags & KCLF_F_LINKER))
-        KCLF_PUT64(r->pl.mprotfn, r->mprot_fn);
-
-    /* A plausible, non-existent path for the fallback open() candidate.  The
-     * kernel hook consumes the call before it executes; if it is ever allowed
-     * through, resolving the random fd component below /proc/self/fd still
-     * fails (ENOENT/ENOTDIR) and no file descriptor is leaked. */
-    {
-        char path[KCLF_COMPL_PATH];
-        u64 rnd = get_random_u64();
-        int at = 0;
-        static const char prefix[] = "/proc/self/fd/";
-        memcpy(path, prefix, sizeof(prefix) - 1);
-        at = (int)(sizeof(prefix) - 1);
-        n = (int)(rnd % 1000000000ULL);
-        if (n < 100000) n += 100000;
-        path[at++] = (char)('0' + n / 100000000 % 10);
-        path[at++] = (char)('0' + n / 10000000 % 10);
-        path[at++] = (char)('0' + n / 1000000 % 10);
-        path[at++] = (char)('0' + n / 100000 % 10);
-        path[at++] = (char)('0' + n / 10000 % 10);
-        path[at++] = (char)('0' + n / 1000 % 10);
-        path[at++] = (char)('0' + n / 100 % 10);
-        path[at++] = (char)('0' + n / 10 % 10);
-        path[at++] = (char)('0' + n % 10);
-        path[at++] = '/';
-        path[at++] = (char)('a' + (int)((rnd >> 32) % 26));
-        path[at++] = 0;
-        if (kclf_uwr(r->priv_addr + r->pl.path, path, (int)strlen(path) + 1)) return -EFAULT;
-    }
-#undef KCLF_PUT32
-#undef KCLF_PUT64
+    if (kclf_uwr(r->priv_addr + r->pl.donetok, &tok, sizeof(tok))) return -EFAULT;
     return 0;
 }
 
@@ -1122,8 +987,8 @@ long kclf_exec_prepare(struct kclf_req *r)
 
     /* The transient region is one anonymous mapping whose blocks are placed in
      * a random order with random pad pages between them: RX code (1 page), RW
-     * ABI parameters (1 page), RW private parameters (1 page), and — only when
-     * the thread's own stack cannot be borrowed — PROT_NONE guard + RW stack
+     * ABI parameters (1 page), RW private parameters (1 page) and, only when
+     * the thread's own stack cannot be borrowed, a PROT_NONE guard + RW stack
      * (1 + S pages, S = 6..14).  The code page is therefore not the region
      * base, the private page is an independent block rather than ABI+page, the
      * guard position and the total length are unpredictable, and every page
@@ -1135,8 +1000,9 @@ long kclf_exec_prepare(struct kclf_req *r)
     }
     stack_pages = KCLF_MIN_STACK_PAGES + kclf_rand_below(KCLF_STACK_PAGES_SPAN);
     {
-        int order[4] = { 0, 1, 2, 3 }; /* code, ABI, private, guard+stack */
-        u64 block[4];
+        /* code, ABI, private, guard+stack */
+        int order[4] = { 0, 1, 2, 3 };
+        u64 block[4] = { 0, 0, 0, 0 };
         u64 cursor;
         int pads[5];
         int nblocks = r->stack_borrowed ? 3 : 4;
@@ -1174,9 +1040,9 @@ long kclf_exec_prepare(struct kclf_req *r)
         r->priv_addr = block[2];
         if (!r->stack_borrowed) {
             r->guard_addr = block[3];
-            /* Reserve 0x100 bytes of headroom at the stack top: the generated
-             * program keeps its private-page pointer in [sp,#KCLF_STACK_SLOT]
-             * across libc calls, and a callee's frame starts below SP. */
+            /* Leave a little slack above the trampoline's initial SP: its own
+             * frame is empty, but the payload's constructors run on this stack
+             * and a callee's frame starts below SP. */
             r->stack_top = block[3] + (u64)(1 + stack_pages) * page - KCLF_STACK_HEADROOM;
         }
     }
@@ -1193,23 +1059,18 @@ long kclf_exec_prepare(struct kclf_req *r)
         if (!r->err[0]) kclf_set_err(r, "resolve loader failed rc=%ld", rc);
         return rc;
     }
-    rc = kclf_resolve_completion(r);
-    if (rc) {
-        if (!r->err[0]) kclf_set_err(r, "completion resolver failed rc=%ld", rc);
-        return rc;
-    }
-    kclf_pick_completion(r);
+    r->done_token = get_random_u64();
+    if (!r->done_token) r->done_token = 1;
 
-    /* Per-request generated trampoline: no fixed blob, no fixed entry or
-     * completion offset, no in-page syscall instruction. */
+    /* Per-request generated trampoline: no fixed blob, no fixed entry, no
+     * syscall, no library call and no faulting store. */
     scratch = kclf_ks.vmalloc((unsigned long)page);
     if (!scratch) {
         kclf_set_err(r, "trampoline allocation failed");
         rc = -ENOMEM;
         goto fail;
     }
-    if (kclf_prog_build(scratch, (int)page, r->param_addr, r->priv_addr, &r->pl,
-                        r->compl_count, seed, &prog)) {
+    if (kclf_prog_build(scratch, (int)page, r->param_addr, r->priv_addr, &r->pl, seed, &prog)) {
         kclf_ks.vfree(scratch);
         kclf_set_err(r, "trampoline generation failed");
         rc = -EFAULT;
@@ -1248,9 +1109,9 @@ long kclf_exec_prepare(struct kclf_req *r)
         goto fail;
     }
 
-    /* completion table, key and saved-register layout live in the private page */
-    if (kclf_export_completion(r)) {
-        kclf_set_err(r, "copy completion state failed");
+    /* per-request completion token and randomized private layout */
+    if (kclf_export_private(r)) {
+        kclf_set_err(r, "copy private completion state failed");
         rc = -EFAULT;
         goto fail;
     }
@@ -1278,8 +1139,8 @@ fail:
     return rc;
 }
 
-/* Copy the saved register file into the private page so the EL0 recovery path
- * can resume the interrupted PC even if no completion syscall is delivered. */
+/* Copy the saved register file into the private page so the EL0 path can
+ * restore the interrupted context itself before branching back to it. */
 static int kclf_export_saved(struct kclf_req *r)
 {
     u64 buf[34];
@@ -1320,7 +1181,7 @@ static int kclf_regs_sane(struct pt_regs *regs, u64 stack_top)
      * before task_work ran, the frame is a signal-handler entry and the
      * register file no longer has a 1:1 syscall-number/x8 relationship. The
      * frame address itself is exact (BTF-validated or learned from the first
-     * syscall wrapper frame observed by the completion hook). */
+     * syscall wrapper frame observed by the watched-syscall hook). */
     return 1;
 }
 
@@ -1420,11 +1281,11 @@ int kclf_exec_hijack(struct kclf_req *r)
         return -EOPNOTSUPP;
     }
 
-    /* A tracer or syscall emulator can consume/alter the completion syscall,
-     * so do not redirect a thread while one is attached. A seccomp filter is
-     * *not* a refusal: ordinary Android app processes always have the zygote
-     * filter installed, and its policy allows the completion syscall. A filter
-     * that kills/errno's that syscall is outside the supported contract. */
+    /* A tracer or syscall emulator can alter the target's return path and
+     * observe the transient mapping, so do not redirect a thread while one is
+     * attached. A seccomp filter is *not* a refusal: ordinary Android app
+     * processes always have the zygote filter installed, and the framework's
+     * completion path no longer depends on any syscall being allowed. */
     if (tif & (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_EMU | _TIF_SINGLESTEP | _TIF_UPROBE)) {
         kclf_set_err(r, "traced/emulated target unsupported");
         return -EOPNOTSUPP;
@@ -1444,9 +1305,9 @@ int kclf_exec_hijack(struct kclf_req *r)
     r->saved_orig_x0 = regs->orig_x0;
     r->saved_valid = 1;
 
-    /* The EL0 recovery path needs the original register file inside the target
-     * mapping: it may have to resume the interrupted PC without any kernel
-     * completion trap (e.g. when every completion syscall is trapped). */
+    /* The EL0 completion path needs the original register file inside the
+     * target mapping: it restores the interrupted context and branches back to
+     * the interrupted PC without any kernel completion event. */
     if (kclf_export_saved(r)) {
         r->saved_valid = 0;
         kclf_set_err(r, "export saved register file failed");
@@ -1463,53 +1324,25 @@ int kclf_exec_hijack(struct kclf_req *r)
     return 0;
 }
 
-#define KCLF_SVC0 0xd4000001u
-
-/* is the instruction at @addr a syscall instruction? */
-static int kclf_is_svc(u64 addr)
+/* Apply the deferred GNU_RELRO protection.  It has to wait until the EL0 phase
+ * (IFUNC resolution) has written its results, and it is applied from the
+ * completion path in EL1 so the generated program never issues mprotect. */
+long kclf_apply_relro(struct kclf_req *r)
 {
-    u32 insn = 0;
+    int i;
 
-    if (!addr || addr >= KCLF_USER_MAX) return 0;
-    if (kclf_urd(addr, &insn, sizeof(insn))) return 0;
-    return insn == KCLF_SVC0;
-}
+    if (r->relro_done) return 0;
+    r->relro_done = 1;
+    for (i = 0; i < (int)r->relro_count; i++) {
+        u64 start = r->relro[i][0];
+        u64 len = r->relro[i][1];
+        long rc;
 
-void kclf_exec_restore(struct kclf_req *r, struct pt_regs *regs)
-{
-    s64 x0 = (s64)r->saved.regs[0];
-
-    if (!r->saved_valid) return;
-    memcpy(&regs->regs[0], &r->saved.regs[0], 31 * sizeof(u64));
-    regs->sp = r->saved.sp;
-    regs->pc = r->saved.pc;
-    regs->pstate = r->saved.pstate;
-
-    /*
-     * The trampoline ran from the signal boundary. If the interrupted syscall
-     * returned one of the restart codes, arm64 do_signal() has usually already
-     * rewound pc to the svc and reset x0 to orig_x0 before get_signal() is
-     * entered; rewinding a second time would resume in the middle of the call
-     * sequence. Tell the two cases apart by looking at the instruction the
-     * saved pc points to.
-     */
-    regs->orig_x0 = r->saved_orig_x0;
-    regs->syscallno = r->saved_syscallno;
-    if (r->saved_syscallno >= 0 && (x0 == -512 || x0 == -513 || x0 == -514 || x0 == -516)) {
-        if (kclf_is_svc(r->saved.pc)) {
-            /* already rewound: keep as is, re-executes the svc */
-        } else if (kclf_is_svc(r->saved.pc - 4)) {
-            regs->pc = r->saved.pc - 4;
-            regs->regs[0] = r->saved_orig_x0;
-            if (x0 == -516) regs->regs[8] = 219; /* __NR_restart_syscall */
-            /* do_signal() would otherwise rewind a second time for this frame */
-            regs->syscallno = -1;
-        } else {
-            /* neither position looks like a syscall: hand back the return
-             * value the program would have seen */
-            regs->regs[0] = -4; /* EINTR */
-        }
+        if (!len) continue;
+        rc = raw_syscall3(__NR_mprotect, (long)start, (long)len, KCLF_PROT_READ);
+        if (rc) return rc;
     }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
