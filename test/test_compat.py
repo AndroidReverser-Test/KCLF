@@ -14,6 +14,7 @@ source = (MODULE / "kclf_compat.c").read_text()
 implementation = source[source.index("int kclf_regs_size;"):]
 PRELUDE = r'''
 #include <assert.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -21,8 +22,11 @@ PRELUDE = r'''
 #include <stdlib.h>
 #include <string.h>
 #include "kclf_btf.h"
+#include "test/btf_fixture.h"
 #define VERSION(a,b,c) (((a) << 16) | ((b) << 8) | (c))
 #define logki(...) ((void)0)
+typedef uint64_t u64;
+struct callback_head { int unused; } work;
 struct mm_struct { int unused; } target_mm;
 struct task_struct { unsigned char bytes[16384]; } task;
 #define current (&task)
@@ -30,6 +34,9 @@ static unsigned int kver;
 static int kclf_mm_off = -1, gets, puts_count;
 static unsigned char *btf;
 static size_t btf_len;
+static int cancel_symbol;
+static struct callback_head *fake_cancel(struct task_struct *p, void (*fn)(struct callback_head *))
+{ (void)p; (void)fn; return &work; }
 static struct mm_struct *fake_get(struct task_struct *p) { assert(p == current); gets++; return &target_mm; }
 static void fake_put(struct mm_struct *mm) { assert(mm == &target_mm); puts_count++; }
 static void fake_lock(void *p) { (void)p; }
@@ -40,8 +47,12 @@ static struct {
     void (*down_read)(void *), (*up_read)(void *);
     void (*mmap_read_lock)(struct mm_struct *), (*mmap_read_unlock)(struct mm_struct *);
     void *find_vma;
-} kclf_ks = {fake_get, fake_put, fake_lock, fake_lock, NULL, NULL, (void *)1};
+    struct callback_head *(*task_work_cancel_func)(struct task_struct *, void (*)(struct callback_head *));
+    void *task_work_cancel_match;
+    bool (*task_work_cancel_object)(struct task_struct *, struct callback_head *);
+} kclf_ks = { .get_task_mm = fake_get, .mmput_async = fake_put };
 static unsigned long kclf_lookup(const char *name) {
+    if (!strcmp(name, "task_work_cancel")) return cancel_symbol ? (unsigned long)fake_cancel : 0;
     if (!btf) return 0;
     if (!strcmp(name, "__start_BTF")) return (unsigned long)btf;
     if (!strcmp(name, "__stop_BTF")) return (unsigned long)(btf + btf_len);
@@ -53,6 +64,11 @@ static void reset(unsigned int version) {
     kver = version;
     kclf_mm_off = kclf_vma_start_off = kclf_vma_end_off = kclf_mmap_lock_off = -1;
     kclf_btf_ok = kclf_regs_size = kclf_vma_direct = kclf_wake_supported = 0;
+    kclf_wake_abi = "version";
+    kclf_ks.task_work_cancel_match = (void *)1;
+    kclf_ks.task_work_cancel_func = NULL;
+    kclf_ks.task_work_cancel_object = NULL;
+    cancel_symbol = 1;
     kclf_ks.down_read = kclf_ks.up_read = fake_lock;
     kclf_ks.mmap_read_lock = kclf_ks.mmap_read_unlock = NULL;
     kclf_ks.find_vma = (void *)1;
@@ -60,16 +76,61 @@ static void reset(unsigned int version) {
 }
 int main(int argc, char **argv) {
     const unsigned int versions[] = { VERSION(5,0,0), VERSION(5,4,0), VERSION(5,7,0), VERSION(5,8,0),
-        VERSION(5,10,66), VERSION(5,11,0), VERSION(5,15,0), VERSION(6,1,0), VERSION(6,6,0), VERSION(6,12,0) };
+        VERSION(5,10,66), VERSION(5,11,0), VERSION(5,12,0), VERSION(5,13,0), VERSION(5,15,0), VERSION(5,19,0), VERSION(6,1,0), VERSION(6,6,0),
+        VERSION(6,12,0), VERSION(6,15,0), VERSION(6,16,0), VERSION(6,18,0) };
     for (unsigned int i = 0; i < sizeof(versions) / sizeof(versions[0]); i++) {
         reset(versions[i]);
         assert(!kclf_compat_init());
         assert(!kclf_btf_ok && !kclf_vma_direct && !kclf_regs_size && kclf_mm_off == -1);
         assert(kclf_wake_supported == (kver >= VERSION(5,8,0)));
+        assert(kclf_trace_mask & (1ULL << (kver >= VERSION(6,16,0) ? 5 : 4)));
+        assert(!(kclf_trace_mask & (1ULL << (kver >= VERSION(6,16,0) ? 4 : 3))));
+        assert(kclf_trace_mask & (1ULL << 21));
+        assert(!(kclf_trace_mask & (1ULL << 11))); /* seccomp stays allowed */
+        assert(kclf_vector_mask == ((1ULL << 23) | (1ULL << 27)));
         assert(kclf_task_mm(current) == &target_mm);
         assert(gets == puts_count && gets > 0);
     }
-    puts("5.0/5.4/5.7/5.8/5.10/5.11/5.15/6.1/6.6/6.12 selection: PASS (mock versions, not devices)");
+    puts("5.0-6.18 notify/TIF selection: PASS (mock versions, not devices)");
+    reset(VERSION(4,19,0)); assert(kclf_compat_init() == -EOPNOTSUPP);
+    reset(VERSION(7,0,0)); assert(kclf_compat_init() == -EOPNOTSUPP);
+    reset(VERSION(5,4,0));
+    kclf_ks.task_work_cancel_match = NULL;
+    assert(!kclf_compat_init() && kclf_ks.task_work_cancel_func);
+    reset(VERSION(5,11,0));
+    kclf_ks.task_work_cancel_match = NULL;
+    assert(!kclf_compat_init() && kclf_ks.task_work_cancel_func);
+    reset(VERSION(5,12,0));
+    kclf_ks.task_work_cancel_match = NULL;
+    assert(!kclf_compat_init() && kclf_ks.task_work_cancel_func);
+    reset(VERSION(5,13,0));
+    kclf_ks.task_work_cancel_match = NULL;
+    assert(kclf_compat_init() == -EOPNOTSUPP);
+    reset(VERSION(6,6,0));
+    kclf_ks.task_work_cancel_match = NULL;
+    assert(kclf_compat_init() == -EOPNOTSUPP);
+    reset(VERSION(5,4,0));
+    kclf_ks.task_work_cancel_match = NULL; cancel_symbol = 0;
+    assert(kclf_compat_init() == -EOPNOTSUPP);
+    puts("missing/ambiguous cancel symbol fails closed: PASS");
+    struct btf_fixture fixture;
+    for (int notify = 0; notify < 4; notify++) {
+        for (int cancel = 1; cancel <= 3; cancel++) {
+            btf_len = bf_build(&fixture, notify, cancel); btf = fixture.bytes;
+            reset(notify == 2 ? VERSION(5,4,0) : VERSION(6,18,0));
+            kclf_ks.task_work_cancel_match = NULL;
+            if (notify == 3 || cancel == 3) {
+                assert(kclf_compat_init() == -EOPNOTSUPP);
+            } else {
+                assert(!kclf_compat_init());
+                assert(kclf_wake_supported == (notify != 0));
+                assert(!!kclf_ks.task_work_cancel_func == (cancel == 1));
+                assert(!!kclf_ks.task_work_cancel_object == (cancel == 2));
+                assert(!strcmp(kclf_wake_abi, notify == 1 ? "version" : "btf"));
+            }
+        }
+    }
+    puts("BTF wins over version labels; bool/enum backports and both cancel ABIs: PASS");
     struct {
         struct kclf_btf_header h;
         char strings[4];

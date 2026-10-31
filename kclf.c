@@ -167,16 +167,15 @@ int kclf_sym_lookup_all(void)
      * object->bool. Prefer the unambiguous match/func APIs, not a version test. */
     kclf_ks.task_work_cancel_match = (typeof(kclf_ks.task_work_cancel_match))kclf_lookup("task_work_cancel_match");
     kclf_ks.task_work_cancel_func = (typeof(kclf_ks.task_work_cancel_func))kclf_lookup("task_work_cancel_func");
-    if (!kclf_ks.task_work_cancel_func && !kclf_ks.task_work_cancel_match)
-        kclf_ks.task_work_cancel_func = (typeof(kclf_ks.task_work_cancel_func))kclf_lookup("task_work_cancel");
-    if (!kclf_ks.task_work_cancel_func && !kclf_ks.task_work_cancel_match) missing = "task_work_cancel*";
+    /* Ambiguous task_work_cancel is selected only after BTF/ABI validation. */
     KCLF_KS(find_get_pid, "find_get_pid");
     KCLF_KS(pid_task, "pid_task");
     KCLF_KS(put_pid, "put_pid");
     kclf_ks.get_task_pid = (typeof(kclf_ks.get_task_pid))kclf_lookup("get_task_pid");
     kclf_ks.vmalloc = (typeof(kclf_ks.vmalloc))kclf_lookup("vmalloc");
     if (!kclf_ks.vmalloc) kclf_ks.vmalloc = (typeof(kclf_ks.vmalloc))kclf_lookup("vmalloc_noprof");
-    kclf_ks.vfree = (typeof(kclf_ks.vfree))kclf_lookup("vfree");
+    if (!kclf_ks.vmalloc && !missing) missing = "vmalloc/vmalloc_noprof";
+    KCLF_KS(vfree, "vfree");
     kclf_ks.vfs_llseek = (typeof(kclf_ks.vfs_llseek))kclf_lookup("vfs_llseek");
     KCLF_KS(vm_mmap, "vm_mmap");
     KCLF_KS(vm_munmap, "vm_munmap");
@@ -188,6 +187,9 @@ int kclf_sym_lookup_all(void)
     kclf_ks.copy_from_user_nofault = (typeof(kclf_ks.copy_from_user_nofault))kclf_lookup("copy_from_user_nofault");
     if (!kclf_ks.copy_from_user_nofault)
         kclf_ks.copy_from_user_nofault = (typeof(kclf_ks.copy_from_user_nofault))kclf_lookup("probe_user_read");
+#ifdef KCLF_TEST_NO_NOFAULT
+    kclf_ks.copy_from_user_nofault = 0; /* exercise the sleepable poll fallback */
+#endif
     KCLF_KS(access_process_vm, "access_process_vm");
     KCLF_KS(get_task_mm, "get_task_mm");
     KCLF_KS(mmput_async, "mmput_async");
@@ -262,6 +264,8 @@ static int kclf_cancel_work(struct kclf_req *r, struct callback_head *work)
     if (task && (u64)task == r->task) {
         if (kclf_ks.task_work_cancel_match)
             removed = kclf_ks.task_work_cancel_match(task, kclf_work_matches, work);
+        else if (kclf_ks.task_work_cancel_object)
+            removed = kclf_ks.task_work_cancel_object(task, work) ? work : 0;
         else
             removed = kclf_ks.task_work_cancel_func(task, work->func);
     }
@@ -284,7 +288,7 @@ static void kclf_work_prepare(struct callback_head *head);
 static void kclf_work_hijack(struct callback_head *head);
 static void kclf_work_cleanup(struct callback_head *head);
 static void kclf_work_poll(struct callback_head *head);
-static void kclf_read_results(struct kclf_req *r);
+static int kclf_read_results(struct kclf_req *r, int sleepable);
 
 static void kclf_slot_reset(struct kclf_req *r)
 {
@@ -495,7 +499,7 @@ static void kclf_work_cleanup_body(struct callback_head *head)
                 /* Results were already sampled by kclf_complete(); re-read
                  * them here because this callback is the first and only place
                  * that applies the deferred RELRO and releases the image. */
-                kclf_read_results(r);
+                (void)kclf_read_results(r, 1);
                 rc = kclf_apply_relro(r);
                 if (rc) kclf_set_err(r, "RELRO protection failed rc=%ld", rc);
             }
@@ -579,18 +583,21 @@ static u8 kclf_watch_installed[KCLF_WATCH_MAX];
 static int kclf_watch_installed_num;
 static u64 kclf_token_hits;
 
-/* Results are written by the generated program into the private page just
- * before it completes.  Reading them is only safe from sleepable target
- * context (a task_work callback or a syscall hook). */
-static void kclf_read_results(struct kclf_req *r)
+/* Syscall hooks use only nofault access; task_work can fault pages in through
+ * GUP. Publish a complete result, never a partial or fabricated zero result. */
+static int kclf_read_results(struct kclf_req *r, int sleepable)
 {
     u64 handle = 0, errp = 0, rc = 0;
+    int (*read)(u64, void *, int) = sleepable ? kclf_urds : kclf_urd;
 
-    if (!r->priv_layout_ok) return;
-    if (!kclf_urd(r->priv_addr + r->pl.handle, &handle, 8)) r->handle = (s64)handle;
-    if (!kclf_urd(r->priv_addr + r->pl.errptr, &errp, 8)) r->err_user = errp;
-    if (!kclf_urd(r->priv_addr + r->pl.rc, &rc, 8)) r->unload_rc = (s32)rc;
+    if (!r->priv_layout_ok) return -EINVAL;
+    if (read(r->priv_addr + r->pl.handle, &handle, 8) ||
+        read(r->priv_addr + r->pl.errptr, &errp, 8) || read(r->priv_addr + r->pl.rc, &rc, 8)) return -EFAULT;
+    r->handle = (s64)handle;
+    r->err_user = errp;
+    r->unload_rc = (s32)rc;
     if (r->flags & KCLF_F_UNLOAD) r->unloaded = r->handle && (r->unload_rc == 0);
+    return 0;
 }
 
 /* Learn the pt_regs frame size from an EL0 syscall frame on kernels without
@@ -610,9 +617,9 @@ static void kclf_learn_regs_size(struct pt_regs *regs)
 static void kclf_complete(struct kclf_req *r, int via, int force_drain)
 {
     if (kclf_state_load(r) != KCLF_RUNNING) return;
+    if (kclf_read_results(r, via == KCLF_VIA_POLL)) return; /* retry from poll */
     r->completion_via = (u8)via;
     r->completing = 1;
-    kclf_read_results(r);
     r->stage = KCLF_ST_RESTORE;
     r->j_done = kclf_now();
     kclf_state_store(r, KCLF_DONE);
@@ -669,8 +676,9 @@ static void kclf_work_poll_body(struct callback_head *head)
     if (kclf_state_load(r) != KCLF_RUNNING) return;
     if ((u64)kclf_task_mm(current) != r->mm) return;
     if (!r->priv_layout_ok) return;
-    if (kclf_urd(r->priv_addr + r->pl.done, &done, 8)) return;
+    if (kclf_urds(r->priv_addr + r->pl.done, &done, 8)) return;
     if (!r->done_token || done != r->done_token) return;
+    if (!kclf_exec_poll_ready(r)) return;
     kclf_complete(r, KCLF_VIA_POLL, 0);
 }
 

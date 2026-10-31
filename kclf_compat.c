@@ -14,6 +14,8 @@ int kclf_vma_end_off = -1;
 int kclf_mmap_lock_off = -1;
 int kclf_vma_direct;
 int kclf_wake_supported;
+u64 kclf_trace_mask, kclf_vector_mask;
+const char *kclf_wake_abi = "version";
 
 struct mm_struct *kclf_task_mm(struct task_struct *task)
 {
@@ -63,17 +65,37 @@ int kclf_compat_init(void)
     unsigned long end = kclf_lookup("__stop_BTF");
     struct kclf_btf b;
     struct mm_struct *mm;
-    int valid;
+    int valid, cancel_abi = 0;
+
+#ifdef KCLF_TEST_NO_BTF
+    start = end = 0; /* exercise accessor/procfs/wrapper fallback on a BTF kernel */
+#endif
 
     /* Supported ABI family, not a promise for every vendor configuration. */
     if (kver < VERSION(5, 0, 0) || kver >= VERSION(7, 0, 0)) return -EOPNOTSUPP;
     /* Upstream 5.8 already has the integer TWA_SIGNAL ABI. Older bool
      * implementations only understand RESUME=1. Do not pass 2 to those. */
     kclf_wake_supported = kver >= VERSION(5, 8, 0);
+    /* TIF_* are macros, not BTF data. arm64 lazy preemption moved UPROBE
+     * from bit 4 to bit 5 in 6.16. Do not use the build host's old headers.
+     * A vendor that backports this renumbering needs its own verified profile. */
+    kclf_trace_mask = (1ULL << 8) | (1ULL << 12) | (1ULL << 21) |
+                      (1ULL << (kver >= VERSION(6, 16, 0) ? 5 : 4));
+    /* Bit 27 is reserved before SME; checking it unconditionally also covers
+     * vendor SME backports. The generated code only preserves base FPSIMD. */
+    kclf_vector_mask = (1ULL << 23) | (1ULL << 27);
     if (start && end) {
         const struct kclf_btf_type *t;
+        int signal_abi;
         if (end <= start || end - start > 64 * 1024 * 1024 || kclf_btf_open(&b, (const void *)start, end - start))
             return -EOPNOTSUPP;
+        signal_abi = kclf_btf_signal_abi(&b);
+        if (signal_abi == -2) return -EOPNOTSUPP;
+        if (signal_abi >= 0) {
+            kclf_wake_supported = signal_abi;
+            kclf_wake_abi = "btf";
+        }
+        cancel_abi = kclf_btf_cancel_abi(&b);
         kclf_mm_off = kclf_btf_member_range(&b, "task_struct", "mm", 8, 8);
         kclf_vma_start_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_start", 8, 8);
         kclf_vma_end_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_end", 8, 8);
@@ -92,7 +114,23 @@ int kclf_compat_init(void)
             kclf_btf_member_offset(&b, "pt_regs", "syscallno") != 280))
             return -EOPNOTSUPP;
         if (t) kclf_regs_size = t->size;
+        t = kclf_btf_find(&b, "thread_info", 0);
+        if (t && kclf_btf_member_range(&b, "thread_info", "flags", 8, 8) != 0)
+            return -EOPNOTSUPP;
         kclf_btf_ok = 1;
+    }
+    if (!kclf_ks.task_work_cancel_match && !kclf_ks.task_work_cancel_func) {
+        unsigned long cancel = kclf_lookup("task_work_cancel");
+        if (cancel_abi == 2)
+            kclf_ks.task_work_cancel_object = (typeof(kclf_ks.task_work_cancel_object))cancel;
+        else if (cancel_abi == 1 || (!cancel_abi && kver < VERSION(5, 13, 0)))
+            kclf_ks.task_work_cancel_func = (typeof(kclf_ks.task_work_cancel_func))cancel;
+        /* After upstream 5.13 introduced cancel_match, missing both unambiguous
+         * names is not evidence that the remaining symbol has the old ABI. */
+        if (!kclf_ks.task_work_cancel_object && !kclf_ks.task_work_cancel_func) {
+            logki("kclf: task_work_cancel ABI unavailable/unsupported\n");
+            return -EOPNOTSUPP;
+        }
     }
     /* Old hosts can export a shorter task_struct_offset table. Do not read
      * newer fields from that host object: no BTF means accessor-only mm. */

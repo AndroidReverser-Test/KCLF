@@ -24,12 +24,17 @@ def main():
     ap.add_argument("--serial", required=True)
     ap.add_argument("--clang", required=True)
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--kpm", type=Path, help="test a separately built module without replacing the release artifact")
+    ap.add_argument("--expect-poll", action="store_true", help="require all successful requests to complete via poll")
     ap.add_argument("--app", action="store_true", help="also exercise the installed, stopped com.kclf.apptest fixture")
     args = ap.parse_args()
     key = os.environ.get("KCLF_SUPERKEY", "")
     if not re.fullmatch(r"[A-Za-z0-9_.+-]+", key):
         raise SystemExit("Set a shell-safe KCLF_SUPERKEY")
     module = Path(__file__).resolve().parents[1]
+    kpm_file = (args.kpm or module / "kclf.kpm").resolve()
+    if not kpm_file.is_file():
+        raise SystemExit("KPM file does not exist")
     run_id = "kclf-manual-" + uuid.uuid4().hex[:12]
     output = module.parents[1] / "build" / run_id
     output.mkdir(parents=True)
@@ -72,6 +77,8 @@ def main():
         while time.monotonic() < until:
             last = ctl("status")
             if f"state={state}" in last and "pending=" not in last and " map=" not in last:
+                if args.expect_poll and state == "done":
+                    check("done=poll" in last, "request completed through sleepable poll")
                 return last
             if state == "done" and "state=failed" in last:
                 raise AssertionError(last)
@@ -85,7 +92,18 @@ def main():
     def start(mode="normal"):
         pid = int(root(f"sh {remote}/launch.sh {mode}"))
         targets.append(pid)
-        return pid
+        # launch.sh returns before dlopen/stdio startup finishes. Arm only
+        # after this owned fixture reaches its advertised idle point; otherwise
+        # a correct safe-point refusal becomes a timing-dependent test failure.
+        until = time.monotonic() + 10
+        while time.monotonic() < until:
+            fields = root(f"cat /proc/{pid}/syscall", check=False).split()
+            if fields and fields[0].isdigit() and int(fields[0]) in (101, 115):
+                check("kclf-target dlopen(libdl.so)=0x" in root(f"cat {remote}/{mode}.log"),
+                      "owned target initialized and reached nanosleep idle point")
+                return pid
+            time.sleep(.05)
+        raise TimeoutError("owned target did not reach its nanosleep idle point")
 
     def inject(pid, name="libkclf_payload.so", flags="", expected="done"):
         ctl(f"inject,{pid},{remote}/{name}{flags}")
@@ -132,7 +150,9 @@ def main():
 
     try:
         check("kclf" not in kpm("list")[1].splitlines(), "no pre-existing kclf module")
-        events.append({"kpm_sha256": hashlib.sha256((module / "kclf.kpm").read_bytes()).hexdigest()})
+        events.append({"kpm_sha256": hashlib.sha256(kpm_file.read_bytes()).hexdigest(),
+                       "kernel": adb("shell", "uname", "-a")[1],
+                       "page_size": adb("shell", "getconf", "PAGESIZE")[1]})
         if args.app:
             check(not adb("shell", "pidof", package, check=False)[1], "test app was stopped; no existing app session is interrupted")
             apk = adb("shell", "pm", "path", package)[1].removeprefix("package:")
@@ -142,7 +162,8 @@ def main():
         baseline = root("dmesg")
         (output / "dmesg-before.txt").write_text(baseline, encoding="utf-8")
         adb("shell", "mkdir", remote)
-        for local in (module / "kclf.kpm", module / "test/kclf_target", module / "test/libkclf_payload.so",
+        adb("push", str(kpm_file), remote + "/kclf.kpm")
+        for local in (module / "test/kclf_target", module / "test/libkclf_payload.so",
                       module / "test/launch.sh"):
             adb("push", str(local), remote + "/" + local.name)
         adb("shell", "chmod", "755", remote + "/kclf_target")

@@ -1,6 +1,15 @@
-# KCLF 1.5.1
+# KCLF 1.5.2
 
-当前普通 App 检测结论见 [1.5.1 检测点与稳定性评估](DETECTION_POINTS_20261031.md)。1.5.1 的完成路径
+1.5.2 是内核兼容性修订：修正 6.16+ 的 UPROBE 标志位；用 BTF 验证 task_work
+通知/取消 ABI；缺少 nofault accessor 时使用可睡眠 GUP 轮询；补齐必需符号检查，
+降低内核栈用量，并避免轮询在返回 PC 尚处于临时映射时回收它。
+详见 [5.x / 6.x 兼容性实现与验证](COMPATIBILITY_1.5.2.md)。
+
+**不是所有 5.x / 6.x 均已认证。** 本轮真机是 Android 16 / 6.1.134 / ARM64 / 4K。
+5.x、其他 6.x、16K/64K 页仍需同一产物的设备回归。无 BTF/nofault 测试构建验证了
+回退机制，但它仍运行在 6.1 上，不等于 5.x 实测。下文的 1.5.1 测试数字是历史结果。
+
+1.5.1 的普通 App 检测结论见 [1.5.1 检测点与稳定性评估](DETECTION_POINTS_20261031.md)。1.5.1 的完成路径
 是纯 EL0：生成页不执行任何 `svc`、不调用任何库函数、不产生故障或信号。程序恢复被
 中断线程的整份寄存器（唯一例外是作为分支寄存器的 x16/IP0）、FPSIMD、SP 和 NZCV，
 向私有参数页写入每请求随机 token，然后直接 `br` 回被中断 PC。内核只在 70 个普通
@@ -55,7 +64,7 @@ linker 的替代品；导入 IFUNC 时仍需执行提供库中的 resolver，不
 
 1.3.1 已补齐无 BTF 的内核路径：`get_task_mm` accessor + 目标上下文 proc maps
 迭代器；开启 upstream 5.8–5.10 已有的 `TWA_SIGNAL`，兼容旧 procfs `read` ABI。
-当前 Android 12 / 5.10.66 / ARM64 / 4K 设备已完成普通 App 全流程与 native 回归。
+1.3.1 当时在 Android 12 / 5.10.66 / ARM64 / 4K 设备完成普通 App 全流程与 native 回归。
 没有新增包名、UID、签名、授权名单等注入策略限制；原有架构/状态检查保持不变。
 完整变更、审计和验证边界见 [1.3.1 审计](COMPATIBILITY_1.3.1.md)。
 
@@ -106,6 +115,10 @@ adb shell /data/local/tmp/kpatch <KEY> kpm ctl0 kclf sym
 偏移；没有 BTF 时通过内核 accessor 和目标自身的 `/proc/thread-self/maps` 读取，
 不猜结构偏移。无 BTF 的 `pt_regs` 大小由实际 syscall wrapper 帧学习。必需符号/
 宿主能力仍需满足。
+
+1.5.2 另显示 `wake_abi=btf|version`、`trace_mask`、`vector_mask`、`nofault`、
+`poll_io=gup`。`nofault=0` 时普通 syscall hook 仅用于学习寄存器帧，完成依赖控制端
+调用 `status`/`reap`/`quiesce` 排队的目标线程 poll；不会在 hook 内调用可睡眠 GUP。
 
 ## 控制接口
 
@@ -280,8 +293,10 @@ adb shell /data/local/tmp/kpatch $KEY kpm unload kclf
 11. **不绕过 non-dumpable/ptrace 策略**：App 被系统标记为 non-dumpable 时，
     `/proc/self/auxv`、`/proc/self/mem` 对 App 自身凭据也可能是 `EACCES`。框架用
     内核 accessor 解决自己的 `AT_HWCAP` 需求，但不会替 payload 打开这些文件。
-12. **没有覆盖所有内核**：1.5.1 已在无 BTF 的 Android 12 / 5.10.66 / 4K 上实测；
-    其他 5.x、6.x、16K/64K 页仍需同一产物的真机回归。历史版本结果不是当前版本验收。
+12. **没有覆盖所有内核**：1.5.2 本轮设备为 Android 16 / 6.1.134 / 4K；
+    其他 5.x、6.x、16K/64K 页仍需同一产物的真机回归。1.5.1 的无 BTF 5.10.66
+    结果不能当作 1.5.2 验收。厂商回移 TIF 位号、隐藏必需符号、宿主不支持该内核
+    时，仍可能需要适配；不推测未知函数 ABI 或结构偏移。
 13. **借用栈有回退**：只有能找到 pt_regs、栈 VMA 足够大且距 guard 有余量时才借用
     线程栈；否则回退到临时栈块，`status` 会显示 `stack=transient`。深栈、altstack
     或找不到 syscall 帧的目标可能走回退路径。
@@ -388,6 +403,8 @@ KPM，恢复 App 停止状态。测试不清空 App 数据。证据保存在 `bu
 python3 kpms/kclf/test/test_helpers.py
 python3 kpms/kclf/test/test_maps.py
 python3 kpms/kclf/test/test_compat.py
+python3 kpms/kclf/test/test_symbols.py
+python3 kpms/kclf/test/test_completion.py
 python3 kpms/kclf/test/test_manual_elf.py
 python3 kpms/kclf/test/test_provider.py
 # 可选：末尾传入保存的 vmlinux BTF 文件，验证其真实布局选择
@@ -398,7 +415,8 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 
 ## 文档
 
-- [DETECTION_POINTS_20261031.md](DETECTION_POINTS_20261031.md)：当前 1.5.1 检测点、
+- [COMPATIBILITY_1.5.2.md](COMPATIBILITY_1.5.2.md)：当前实现、5.x/6.x 兼容修订、真机证据与未验证范围。
+- [DETECTION_POINTS_20261031.md](DETECTION_POINTS_20261031.md)：历史 1.5.1 检测点、
   纯 EL0 完成协议、45/45 自检结果、poll 路径、残余可观测面与边界。
 - [DETECTION_POINTS.md](DETECTION_POINTS.md)：1.5.0 历史基线（libc 完成调用、
   主机 30,000 样本审计、真机 SIGSYS 现场），不代表当前实现。

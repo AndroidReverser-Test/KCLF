@@ -381,6 +381,7 @@ static int read_hwcap(struct km_context *c)
         c->r->hwcap2 = kclf_ks.cpu_get_elf_hwcap2 ? kclf_ks.cpu_get_elf_hwcap2() : 0;
         return 0;
     }
+    if (!kclf_ks.vfs_read) { report(c, "target auxv reader unavailable", ""); return -EOPNOTSUPP; }
     f = kclf_ks.filp_open("/proc/thread-self/auxv", 0, 0);
     if (!f) { report(c, "cannot open target auxv", ""); return -ENOENT; }
     if ((unsigned long)f >= (unsigned long)-4095) {
@@ -581,16 +582,23 @@ static int scrub_headers(struct km_context *c)
 {
     struct ke_object *o = &c->object;
     struct ke_ehdr eh;
-    u8 zeros[sizeof(struct ke_ehdr) + KE_PHNUM * sizeof(struct ke_phdr)];
+    u8 zeros[256];
+    const u64 header_limit = sizeof(struct ke_ehdr) + KE_PHNUM * sizeof(struct ke_phdr);
     u64 total = sizeof(eh);
 
     if (kclf_urds(o->header, &eh, sizeof(eh))) return -EFAULT;
     if (eh.phoff >= sizeof(eh) && eh.phnum && eh.phnum <= KE_PHNUM && eh.phentsize == sizeof(struct ke_phdr)) {
         u64 end = eh.phoff + (u64)eh.phnum * sizeof(struct ke_phdr);
-        if (end <= (u64)kclf_page_size && end <= (u64)sizeof(zeros)) total = end;
+        if (end <= (u64)kclf_page_size && end <= header_limit) total = end;
     }
     memset(zeros, 0, sizeof(zeros));
-    return kclf_uwr(o->header, zeros, (int)total);
+    for (u64 offset = 0; offset < total;) {
+        int n = total - offset > sizeof(zeros) ? (int)sizeof(zeros) : (int)(total - offset);
+        int rc = kclf_uwr(o->header + offset, zeros, n);
+        if (rc) return rc;
+        offset += (u64)n;
+    }
+    return 0;
 }
 
 static int reserve_image(struct kclf_req *r)

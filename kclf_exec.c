@@ -1198,6 +1198,15 @@ static struct pt_regs *kclf_find_regs(void)
     return kclf_regs_sane(regs, top) ? regs : 0;
 }
 
+/* A timer interrupt can run poll task_work between the EL0 token store and
+ * the final branch. Do not reclaim the instruction/private pages until the
+ * interrupted PC has left the transient allocation. */
+int kclf_exec_poll_ready(const struct kclf_req *r)
+{
+    struct pt_regs *regs = kclf_find_regs();
+    return regs && !(regs->pc >= r->map_addr && regs->pc - r->map_addr < r->map_len);
+}
+
 /* Heuristic only: syscall numbers cannot prove that a userspace lock is not
  * held. Use an application-controlled idle point for reliable loading.
  *
@@ -1276,7 +1285,7 @@ int kclf_exec_hijack(struct kclf_req *r)
     /* FPSIMD is preserved by the trampoline, but SVE/SME scalable state is
      * not. Reject it even with force. Real pending signals are handled by the
      * exception return path; they are not ignored (see README). */
-    if ((tif & _TIF_SVE) || (kver >= VERSION(5, 19, 0) && (tif & (1UL << TIF_SME)))) {
+    if (tif & kclf_vector_mask) {
         kclf_set_err(r, "SVE/SME target state unsupported");
         return -EOPNOTSUPP;
     }
@@ -1286,7 +1295,7 @@ int kclf_exec_hijack(struct kclf_req *r)
      * attached. A seccomp filter is *not* a refusal: ordinary Android app
      * processes always have the zygote filter installed, and the framework's
      * completion path no longer depends on any syscall being allowed. */
-    if (tif & (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_EMU | _TIF_SINGLESTEP | _TIF_UPROBE)) {
+    if (tif & kclf_trace_mask) {
         kclf_set_err(r, "traced/emulated target unsupported");
         return -EOPNOTSUPP;
     }
@@ -1401,8 +1410,11 @@ int kclf_exec_probe(char *out, int outlen)
     off += kclf_scnprintf(out + off, outlen - off, "vma_backend=%s mm_access=%s\n",
                           kclf_vma_direct ? "locked" : "proc_maps", kclf_mm_off > 0 ? "offset" : "get_task_mm");
     off += kclf_scnprintf(out + off, outlen - off, "cancel=%s user_io=access_process_vm wake=%s quiescing=%d\n",
-                          kclf_ks.task_work_cancel_match ? "match" : "func",
+                          kclf_ks.task_work_cancel_match ? "match" : (kclf_ks.task_work_cancel_object ? "object" : "func"),
                           kclf_wake_supported ? "task_work_signal" : "unsupported", kclf_unloading);
+    off += kclf_scnprintf(out + off, outlen - off, "wake_abi=%s trace_mask=%llx vector_mask=%llx nofault=%d poll_io=gup\n",
+                          kclf_wake_abi, (unsigned long long)kclf_trace_mask, (unsigned long long)kclf_vector_mask,
+                          !!kclf_ks.copy_from_user_nofault);
     if (kclf_ks.cpu_get_elf_hwcap)
         off += kclf_scnprintf(out + off, outlen - off, "hwcap=%llx hwcap2=%llx source=kernel\n",
                               (unsigned long long)kclf_ks.cpu_get_elf_hwcap(),

@@ -33,7 +33,7 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.5.1"
+#define KCLF_VER "1.5.2"
 
 #define KCLF_MAX_REQ 4
 /* GNU_RELRO ranges whose protection is applied from the kernel once the EL0
@@ -199,6 +199,7 @@ struct kclf_syms
     struct callback_head *(*task_work_cancel_func)(struct task_struct *task, void (*func)(struct callback_head *));
     struct callback_head *(*task_work_cancel_match)(struct task_struct *task,
                                                     bool (*match)(struct callback_head *, void *), void *data);
+    bool (*task_work_cancel_object)(struct task_struct *task, struct callback_head *work);
     struct pid *(*find_get_pid)(int nr);
     struct task_struct *(*pid_task)(struct pid *pid, int type);
     void (*put_pid)(struct pid *pid);
@@ -252,6 +253,7 @@ u64 kclf_now(void);
 /* kclf_exec.c */
 long kclf_exec_prepare(struct kclf_req *r);
 int kclf_exec_hijack(struct kclf_req *r);
+int kclf_exec_poll_ready(const struct kclf_req *r);
 long kclf_apply_relro(struct kclf_req *r);
 long kclf_exec_finish(struct kclf_req *r, int capture_err);
 int kclf_exec_probe(char *out, int outlen);
@@ -279,6 +281,8 @@ extern int kclf_vma_start_off, kclf_vma_end_off, kclf_mmap_lock_off;
 extern int kclf_btf_ok;
 extern int kclf_vma_direct;
 extern int kclf_wake_supported;
+extern u64 kclf_trace_mask, kclf_vector_mask;
+extern const char *kclf_wake_abi;
 unsigned long kclf_lookup(const char *name);
 int kclf_compat_init(void);
 void kclf_mmap_read_lock(struct mm_struct *mm);

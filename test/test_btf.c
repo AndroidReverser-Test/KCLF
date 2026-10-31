@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../kclf_btf.h"
+#include "btf_fixture.h"
 
 int main(int argc, char **argv)
 {
@@ -60,6 +61,19 @@ int main(int argc, char **argv)
     }
     puts("synthetic BTF bounds/kinds/members: PASS");
 
+    for (int notify = 0; notify < 4; notify++) {
+        for (int cancel = 1; cancel <= 3; cancel++) {
+            struct btf_fixture f;
+            size_t len = bf_build(&f, notify, cancel);
+            assert(!kclf_btf_open(&b, f.bytes, len));
+            assert(kclf_btf_cancel_abi(&b) == (cancel == 3 ? -1 : cancel));
+            assert(kclf_btf_signal_abi(&b) == (notify == 0 ? 0 : notify == 1 ? -1 : notify == 2 ? 1 : -2));
+            assert(!kclf_btf_func_proto(&b, "missing"));
+            assert(!kclf_btf_resolve(&b, 999999));
+        }
+    }
+    puts("BTF bool/int/enum notify and old/new/incompatible cancel prototypes: PASS");
+
     if (argc == 2) {
         FILE *f = fopen(argv[1], "rb");
         long len;
@@ -83,6 +97,7 @@ int main(int argc, char **argv)
                kclf_btf_member_offset(&b, "vm_area_struct", "vm_end"));
         assert(kclf_btf_member_offset(&b, "pt_regs", "orig_x0") == 272);
         assert(kclf_btf_member_offset(&b, "pt_regs", "syscallno") == 280);
+        printf("device task_work signal_abi=%d cancel_abi=%d\n", kclf_btf_signal_abi(&b), kclf_btf_cancel_abi(&b));
         free(data);
         puts("device BTF: PASS");
     }

@@ -159,4 +159,95 @@ static int kclf_btf_member_range(const struct kclf_btf *b, const char *type, con
         return -1;
     return off;
 }
+
+/* Resolve typedef/qualifier chains, including type tags, with a cycle bound. */
+static inline const struct kclf_btf_type *kclf_btf_resolve(const struct kclf_btf *b, uint32_t id)
+{
+    int depth;
+    for (depth = 0; id && depth < 16; depth++) {
+        const struct kclf_btf_type *t = kclf_btf_find(b, 0, id);
+        unsigned int kind;
+        if (!t) return 0;
+        kind = (t->info >> 24) & 31;
+        if (kind != 8 && kind != 9 && kind != 10 && kind != 11 && kind != 18) return t;
+        id = t->size;
+    }
+    return 0;
+}
+
+static inline const struct kclf_btf_type *kclf_btf_func_proto(const struct kclf_btf *b, const char *name)
+{
+    size_t off = 0, size;
+    while (off < b->type_len) {
+        const struct kclf_btf_type *t = (const void *)(b->types + off);
+        size = kclf_btf_record(t, b->type_len - off);
+        if (!size) return 0;
+        if (((t->info >> 24) & 31) == 12 && !strcmp(kclf_btf_name(b, t->name), name)) {
+            t = kclf_btf_resolve(b, t->size);
+            return t && ((t->info >> 24) & 31) == 13 ? t : 0;
+        }
+        off += size;
+    }
+    return 0;
+}
+
+static inline int kclf_btf_is_bool(const struct kclf_btf_type *t)
+{
+    return t && ((t->info >> 24) & 31) == 1 && t->size == 1 &&
+           (*(const uint32_t *)(t + 1) >> 24 & 4);
+}
+
+static inline int kclf_btf_points_to(const struct kclf_btf *b, const struct kclf_btf_type *t,
+                                   const char *name)
+{
+    if (!t || ((t->info >> 24) & 31) != 2) return 0;
+    t = kclf_btf_resolve(b, t->size);
+    return t && ((t->info >> 24) & 31) == 4 && !strcmp(kclf_btf_name(b, t->name), name);
+}
+
+/* task_work_cancel has two incompatible ABIs under the SAME symbol name.
+ * 0: no prototype; -1: unknown prototype; 1: function -> pointer; 2: work -> bool. */
+static inline int kclf_btf_cancel_abi(const struct kclf_btf *b)
+{
+    const struct kclf_btf_type *p = kclf_btf_func_proto(b, "task_work_cancel"), *ret, *arg;
+    const uint32_t *params;
+    if (!p) return 0;
+    if ((p->info & 0xffff) != 2) return -1;
+    params = (const void *)(p + 1); /* name/type pairs */
+    if (!kclf_btf_points_to(b, kclf_btf_resolve(b, params[1]), "task_struct")) return -1;
+    ret = kclf_btf_resolve(b, p->size);
+    arg = kclf_btf_resolve(b, params[3]);
+    if (kclf_btf_is_bool(ret) && kclf_btf_points_to(b, arg, "callback_head")) return 2;
+    if (!kclf_btf_points_to(b, ret, "callback_head") || !arg || ((arg->info >> 24) & 31) != 2) return -1;
+    p = kclf_btf_resolve(b, arg->size);
+    if (!p || ((p->info >> 24) & 31) != 13 || (p->info & 0xffff) != 1 || p->size) return -1;
+    params = (const void *)(p + 1);
+    return kclf_btf_points_to(b, kclf_btf_resolve(b, params[1]), "callback_head") ? 1 : -1;
+}
+
+/* -1 means unavailable/int ABI (use the upstream version baseline), -2 is
+ * an incompatible prototype. BTF takes precedence over vendor version labels. */
+static inline int kclf_btf_signal_abi(const struct kclf_btf *b)
+{
+    const struct kclf_btf_type *p = kclf_btf_func_proto(b, "task_work_add"), *t;
+    const uint32_t *params, *values;
+    unsigned int kind, i;
+    int resume = -1, signal = -1;
+    if (!p) return -1;
+    if ((p->info & 0xffff) != 3) return -2;
+    params = (const void *)(p + 1);
+    t = kclf_btf_resolve(b, params[5]);
+    if (kclf_btf_is_bool(t)) return 0;
+    if (!t) return -2;
+    kind = (t->info >> 24) & 31;
+    if (kind == 1 && t->size == 4) return -1; /* 5.8-5.10 use int + macros */
+    if (kind != 6 || t->size != 4) return -2;
+    values = (const void *)(t + 1);
+    for (i = 0; i < (t->info & 0xffff); i++) {
+        const char *name = kclf_btf_name(b, values[2 * i]);
+        if (!strcmp(name, "TWA_RESUME")) resume = (int)values[2 * i + 1];
+        if (!strcmp(name, "TWA_SIGNAL")) signal = (int)values[2 * i + 1];
+    }
+    return resume == 1 && signal == 2 ? 1 : -2;
+}
 #endif
