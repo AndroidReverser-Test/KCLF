@@ -131,15 +131,71 @@ int ke_file_layout(struct ke_io *io, struct ke_object *o, u64 size, u64 page)
     return 0;
 }
 
+/* Aligned small reads avoid crossing a page just to read ahead of a NUL.
+ * Every mode validates through NUL, even after a comparison differs. No mode
+ * reads beyond DT_STRSZ or accepts a truncated name as an exact match. */
+static int string_walk(struct ke_io *io, const struct ke_object *o, u32 off,
+                       char *out, u64 capacity, const char *expected, u64 *size)
+{
+    u64 used = 0, left;
+    int match = 1;
+    char block[64];
+    if (off >= o->strsz) return fail(io, -ENOEXEC, "string offset outside DT_STRTAB");
+    left = o->strsz - off;
+    while (used < left) {
+        u64 at;
+        unsigned i, n;
+        if (off > io->limit || o->strtab >= io->limit - off ||
+            used >= io->limit - o->strtab - off)
+            return fail(io, -ENOEXEC, "ELF string address overflow");
+        at = o->strtab + off + used;
+        n = sizeof(block) - (unsigned)(at & (sizeof(block) - 1));
+        if ((u64)n > left - used) n = (unsigned)(left - used);
+        if (io->string_budget) {
+            if (*io->string_budget < n)
+                return fail(io, -E2BIG, "ELF string scan budget exhausted");
+            *io->string_budget -= n;
+        }
+        if (objrd(io, o, at, block, n)) return -ENOEXEC;
+        for (i = 0; i < n; i++) {
+            if (out) {
+                if (used + i >= capacity) return fail(io, -E2BIG, "ELF string exceeds output capacity");
+                out[used + i] = block[i];
+            }
+            /* Once expected ended or differed, do not index past its NUL. */
+            if (expected && match && block[i] != expected[used + i]) match = 0;
+            if (!block[i]) {
+                if (size) *size = used + i + 1;
+                return expected ? match : 0;
+            }
+        }
+        used += n;
+    }
+    return fail(io, -ENOEXEC, "ELF string has no NUL inside DT_STRTAB");
+}
+
+int ke_string_size(struct ke_io *io, const struct ke_object *o, u32 off, u64 *size)
+{
+    if (!size) return -EINVAL;
+    *size = 0;
+    return string_walk(io, o, off, 0, 0, 0, size);
+}
+
+int ke_string_copy(struct ke_io *io, const struct ke_object *o, u32 off, char *out, u64 capacity)
+{
+    if (!out || !capacity) return -EINVAL;
+    return string_walk(io, o, off, out, capacity, 0, 0);
+}
+
+int ke_string_equal(struct ke_io *io, const struct ke_object *o, u32 off, const char *expected)
+{
+    if (!expected) return -EINVAL;
+    return string_walk(io, o, off, 0, 0, expected, 0);
+}
+
 int ke_string(struct ke_io *io, const struct ke_object *o, u32 off, char out[KE_NAME])
 {
-    unsigned i;
-    if (off >= o->strsz) return fail(io, -ENOEXEC, "string offset outside DT_STRTAB");
-    for (i = 0; i < KE_NAME; i++) {
-        if (i >= o->strsz - off || objrd(io, o, o->strtab + off + i, out + i, 1)) return -ENOEXEC;
-        if (!out[i]) return 0;
-    }
-    return fail(io, -E2BIG, "ELF symbol/SONAME/version name exceeds 255 bytes");
+    return ke_string_copy(io, o, off, out, KE_NAME);
 }
 
 static int symcount(struct ke_io *io, struct ke_object *o)
@@ -338,14 +394,13 @@ static u32 elf_hash(const char *name)
 static int candidate(struct ke_io *io, const struct ke_object *o, u32 index, const char *name,
                      const char *version, u32 hash, struct ke_sym *s, u64 *address)
 {
-    char actual[KE_NAME];
     int v;
     unsigned type, bind;
     if (ke_symbol(io, o, index, s)) return -ENOEXEC;
     bind = s->info >> 4; type = s->info & 15;
     if (!s->shndx || (bind != 1 && bind != 2 && bind != 10) || (s->other & 3) == 1 || (s->other & 3) == 2) return 0;
-    if (ke_string(io, o, s->name, actual)) return -ENOEXEC;
-    if (strcmp(actual, name)) return 0;
+    v = ke_string_equal(io, o, s->name, name);
+    if (v <= 0) return v;
     v = version_match(io, o, index, version, hash);
     if (v <= 0) return v;
     if (bind == 10 || (type != 0 && type != 1 && type != 2 && type != 10)) {

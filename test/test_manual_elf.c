@@ -11,11 +11,13 @@
 static unsigned char memory[CAP], snapshot[CAP];
 static size_t file_size;
 static int file_mode, errors, resolutions;
+static u64 read_failure;
 static int deferred, defer_error;
 static char last_error[512];
 static int read_mem(void *c, u64 at, void *out, unsigned long n)
 {
     (void)c;
+    if (read_failure && at <= read_failure && n > read_failure - at) return -1;
     if (file_mode) {
         if (at > file_size || n > file_size - at) return -1;
         memcpy(out, snapshot + at, n);
@@ -38,7 +40,7 @@ static void error(void *c, const char *why, const char *detail)
     errors++;
     snprintf(last_error, sizeof(last_error), "%s %s", why, detail);
 }
-static struct ke_io io = {0, 1ULL << 48, read_mem, write_mem, error, 0};
+static struct ke_io io = {0, 1ULL << 48, read_mem, write_mem, error, 0, 0};
 static int resolve(void *c, u32 index, u64 *out)
 {
     (void)c;
@@ -81,7 +83,66 @@ static void init_fixture(void)
     s[1] = (struct ke_sym){1, 0x12, 0, 1, 0x4000, 4};
     s[2] = (struct ke_sym){5, 0x11, 0, 1, 0x2100, 8};
     hash[0] = 1; hash[1] = 3; hash[2] = 1; hash[3] = 0; hash[4] = 2; hash[5] = 0;
-    file_mode = 0; errors = 0; resolutions = 0;
+    file_mode = 0; errors = 0; resolutions = 0; read_failure = 0;
+}
+static void long_symbol_tests(void)
+{
+    const unsigned lengths[] = {255, 256, 285, 4096, 65537};
+    for (unsigned k = 0; k < sizeof(lengths) / sizeof(lengths[0]); k++) {
+        struct ke_object o;
+        struct ke_sym s;
+        unsigned len = lengths[k];
+        char *wanted = malloc(len + 1), *copy = malloc(len + 2);
+        u64 size, value;
+        u32 gh = 5381;
+        assert(wanted && copy);
+        init_fixture(); assert(!ke_open(&io, BASE, &o, 1));
+        o.ph[o.phnum++] = (struct ke_phdr){1, 4, 0, 0x10000, 0, 0x20000, 0x20000, 1};
+        o.strtab = BASE + 0x10000; o.strsz = len + 2;
+        for (unsigned i = 0; i < len; i++) {
+            wanted[i] = (char)('a' + i % 26);
+            gh = gh * 33 + (u8)wanted[i];
+        }
+        wanted[len] = 0;
+        memcpy(memory + 0x10001, wanted, len + 1);
+        assert(!ke_string_size(&io, &o, 1, &size) && size == len + 1);
+        memset(copy, 0x5a, len + 2);
+        assert(!ke_string_copy(&io, &o, 1, copy, len + 1) && !strcmp(copy, wanted));
+        assert(copy[len + 1] == 0x5a);
+        assert(ke_string_equal(&io, &o, 1, wanted) == 1);
+        u64 budget = len + 1;
+        io.string_budget = &budget;
+        assert(!ke_string_size(&io, &o, 1, &size) && !budget);
+        assert(ke_string_equal(&io, &o, 1, wanted) == -E2BIG);
+        assert(strstr(last_error, "budget exhausted"));
+        budget = len;
+        assert(ke_string_copy(&io, &o, 1, copy, len + 1) == -E2BIG);
+        io.string_budget = NULL;
+        assert(!ke_string_equal(&io, &o, 1, "a"));
+        memset(copy, 0x5a, len + 2);
+        assert(ke_string_copy(&io, &o, 1, copy, len) == -E2BIG && copy[len] == 0x5a);
+        assert(ke_lookup(&io, &o, wanted, "", 0, &s, &value) == 1 && value == BASE + 0x4000);
+        wanted[len - 1] ^= 1;
+        assert(!ke_lookup(&io, &o, wanted, "", 0, &s, &value));
+        wanted[len - 1] ^= 1;
+        /* One GNU bucket and one matching terminating chain entry. */
+        o.gnu_hash = BASE + 0xc00;
+        u32 *gnu = (void *)(memory + 0xc00);
+        gnu[0] = 1; gnu[1] = 1; gnu[2] = 1; gnu[3] = 0;
+        gnu[6] = 1; gnu[7] = gh | 1;
+        assert(ke_lookup(&io, &o, wanted, "", 0, &s, &value) == 1 && value == BASE + 0x4000);
+        /* Even mismatches must not silently accept malformed provider names. */
+        memory[0x10001 + len] = 'x';
+        assert(ke_string_size(&io, &o, 1, &size) == -ENOEXEC && !size);
+        assert(ke_string_equal(&io, &o, 1, "different") == -ENOEXEC);
+        memory[0x10001 + len] = 0;
+        read_failure = BASE + 0x10001 + len / 2;
+        assert(ke_string_size(&io, &o, 1, &size) == -ENOEXEC);
+        read_failure = 0;
+        assert(ke_string_size(&io, &o, (u32)o.strsz, &size) == -ENOEXEC);
+        free(copy); free(wanted);
+    }
+    puts("full symbol names 255/256/285/4096/65537: SysV/GNU, exact comparison, bounds/read failures: PASS");
 }
 static void symbol_tests(void)
 {
@@ -366,6 +427,6 @@ int main(int argc, char **argv)
 {
     assert(argc == 2);
     symbol_tests(); relocation_tests(); ifunc_tests(); malformed_tests(); file_tests(argv[1]);
-    loaded_header_tests();
+    loaded_header_tests(); long_symbol_tests();
     return 0;
 }

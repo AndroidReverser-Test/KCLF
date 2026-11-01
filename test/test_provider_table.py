@@ -26,7 +26,7 @@ PRELUDE = r'''
 typedef uint64_t u64;
 typedef uint32_t u32;
 struct ke_object { u64 bias, low, high; unsigned soname; };
-struct ke_io { void *error; };
+struct ke_io { void *error; void *string_budget; };
 struct kclf_req {
     u64 mm;
     struct { u64 linker_base, linker_end; } ld;

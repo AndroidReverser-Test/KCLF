@@ -1,4 +1,4 @@
-# KCLF 1.4.3：手动加载后端
+# KCLF 手动加载后端（1.4.3 起，1.5.7 修订）
 
 ## 目标与结论
 
@@ -72,6 +72,9 @@ headers。目前支持：
 - `R_AARCH64_RELATIVE`、`ABS64`、`GLOB_DAT`、`JUMP_SLOT`，以及 `R_AARCH64_NONE`。
 - 常规 RELA、Android APS2 packed RELA、标准及 Android 标签的 RELR，允许常见混合配置。
 - SysV/GNU hash、函数/数据/绝对符号、弱导入、`DT_VERSYM`/`VERNEED`/`VERDEF` 版本匹配。
+- 符号名按 `DT_STRSZ` 和可读 `PT_LOAD` 分段读取并完整比较；payload 内定义、外部导入
+  和提供库中的长符号名不受 256 字节限制。SONAME、`DT_NEEDED` 和版本名仍使用
+  `KE_NAME=256` 的显式上限。
 - 本地定义优先；未定义符号只在稳定顺序的 `DT_NEEDED` 闭包中查找。
 - 同名 SONAME 的已加载提供库按映射路径的加载来源选择；Android 12 的四份
   `libc++.so`（vndk/conscrypt/art/system）可以区分，同一路径的重复映射只选一个。
@@ -90,8 +93,10 @@ headers。目前支持：
 
 以下情况明确拒绝或不提供完整语义：
 
-- **拒绝** payload `PT_TLS`、TLS 重定位、`__emutls_get_address`、线程析构注册入口；
-  调用系统库内部使用 TLS 的普通函数不受这一限制。
+- **拒绝** payload `PT_TLS`、TLS 重定位、线程析构注册入口；payload 自带的
+  compiler-rt emutls（定义 `__emutls_get_address`）例外：允许运行，但镜像按
+  `nodelete=emutls` 驻留到目标 mm 退出。未定义/跨 DSO 的 emutls 运行时或控制对象
+  仍明确拒绝。
 - **拒绝**需要解析的 payload 自定义 IFUNC、IRELATIVE、GNU_UNIQUE；IFUNC 重定位若写入
   init/fini 数组也拒绝，因为调用表在进入 EL0 前已经验证和保存。
 - **拒绝** REL/textrel、PT_INTERP、可执行栈、PT_GNU_PROPERTY、共享/重叠 PT_LOAD 页、
@@ -109,7 +114,8 @@ headers。目前支持：
   不保证识别该镜像。框架不拦截 payload 对这些 API 的调用。
 
 资源上限是显式失败条件：64 MiB 文件快照，256 MiB 虚拟 ELF 跨度/最大对齐，
-64 个 program headers，每对象 64 个 NEEDED，已加载候选提供库表按需倍增
+256 MiB 符号名称读取预算（单名称 64 MiB，复用同一缓冲区），64 个 program headers，
+每对象 64 个 NEEDED，已加载候选提供库表按需倍增
 （初始 64，硬上限 4096；分配失败或超过上限时明确停止 prepare 并回滚，避免
 在不完整的同名库集合中选择错误来源），128 个闭包成员，
 50 万动态符号，100 万累计解码重定位，16 MiB APS2 数据，128 个初始化与128 个析构，
@@ -153,8 +159,8 @@ epoll_pwait/nanosleep/sched_yield` 的子集）；`hdr=scrubbed` 表示 ELF 头�
 - 非最后引用的 release 只减少 refs；最后引用运行析构并解除整段镜像映射。
 - 新镜像 `inject,...,unload` 在一次事务中构造、析构、回收；对已存在镜像执行此命令
   相当于临时借用并归还，不重跑初始化，也不消耗已有引用。
-- `DF_1_NODELETE` 镜像拒绝显式 release 和首次加载的 `unload`；需目标进程退出后 reap，
-  才能排空模块。
+- `DF_1_NODELETE` 或 `nodelete=emutls` 镜像拒绝显式 release 和首次加载的 `unload`；
+  需目标进程退出后 reap，才能排空模块。
 - 准备/重定位/安全点失败会回滚新映射；IFUNC/延迟 mprotect 返回可报告错误时，构造函数
   尚未执行，会安全回滚。resolver 异常、seccomp 杀进程等不会被当作普通返回值处理。
 - **ELF 头擦除**：manual 加载在映射后已经消费完头和程序头；本后端不会在运行期重新
@@ -196,6 +202,29 @@ stock KernelPatch 不尊重模块 exit 的 `-EBUSY`，所以不能强行卸载�
   见 [加固报告](OBSERVABILITY_HARDENING_20261030.md)。
 
 ## 验证与可复现性
+
+### 1.5.7：长符号名与 compiler-rt emutls
+
+2026-11-01，Pixel 6 / Android 16 / 6.1.134 / ARM64 / 4K、SELinux Enforcing，目标
+`cn.gov.tax.its`，payload `/data/local/tmp/libtest.so`（SHA-256
+`159c30c0c99d611fd85c13b42511fd8bf0f218b266b9bc5e7afd15255e92a865`）：
+
+- 1.5.6 在 prepare 阶段拒绝 payload 内定义的 285 字节符号；1.5.7 按完整名称读取，
+  并按 `bias + st_value` 完成该 `R_AARCH64_JUMP_SLOT`。
+- 修复长名称后，payload 自带的 `__emutls_get_address`（WEAK FUNC）曾被当作
+  loader 集成 TLS 拒绝；1.5.7 允许该定义，并把镜像标记为 `nodelete=emutls`。
+- 主线程和 Binder 线程各自在全新进程中完成注入，`state=done stage=restore
+  via=manual`；构造函数 `_Z10start_dumpv` 的 `started` 标志和 `game_path` 缓冲区
+  （`/data/user/0/cn.gov.tax.its`）通过 `/proc/<pid>/mem` 独立确认。
+- 同路径再次注入复用镜像、`refs=2`；`release` 按 NODELETE 语义返回
+  `manual: image 1 is NODELETE (emutls); resident until the process exits`。
+- 目标退出后 `reap`、`quiesce=idle`、`kpm unload` 成功；无新增
+  BUG/WARNING/Oops/panic，boot ID 和 SELinux 状态不变。
+
+App 自身把 `__android_log_print` 改写成 `ldr x16,#8; br x16; <shield-address>`，
+因此 payload 的 `Perfare` 日志被目标 hook 吞掉；这不是加载器失败，验证以镜像内
+构造函数副作用和 `status`/`images` 为准。完整产物、证据目录和边界见
+[1.5.7 兼容性报告](COMPATIBILITY_1.5.7.md)。
 
 ### 1.5.6：通用头覆写兼容
 

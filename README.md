@@ -1,4 +1,10 @@
-# KCLF 1.5.6
+# KCLF 1.5.7
+
+1.5.7 修复 manual 后端对合法长符号名和 payload 自带 compiler-rt emutls 的处理：
+符号名按 `DT_STRSZ`/可读 `PT_LOAD` 限界读取并完整比较，不再受 256 字节固定缓冲区
+限制；定义在 payload 内的 `__emutls_get_address` 按 NODELETE 驻留到目标 mm 退出，
+不再被误判为 loader 集成 TLS。提供库 SONAME、`DT_NEEDED` 和版本名仍保留 256 字节
+上限。实现、生命周期和设备验证见 [1.5.7 兼容性报告](COMPATIBILITY_1.5.7.md)。
 
 1.5.6 恢复已映射提供库的通用 ELF 结构解析：允许 `e_ident[8..15]`、
 `e_type/e_machine/e_version` 被任意改写，不依赖固定指令、包名或加固方案。
@@ -344,15 +350,18 @@ RELRO 或资源清理最多重试 8 次；耗尽或无法排队时报告 `state=
    `-EBUSY` 在 stock 宿主上不会被尊重。
 10. **手动加载不是完整动态链接器**：拒绝 payload TLS、payload IFUNC/IRELATIVE、
     textrel、GNU property 等未实现 ABI；不保证 C++ 异常展开、JNI 自动初始化和跨 DSO CFI。
+    payload 自带 compiler-rt emutls（定义 `__emutls_get_address`）是受支持的例外，
+    但镜像必须 NODELETE 驻留到目标 mm 退出，不能 release。
     依赖选择使用映射路径的来源启发式（同目录/APEX/分区/平台默认），不是对 bionic
     namespace 与全局符号插入顺序的完整重建；同名不同来源且无法区分时明确失败。
 11. **不绕过 non-dumpable/ptrace 策略**：App 被系统标记为 non-dumpable 时，
     `/proc/self/auxv`、`/proc/self/mem` 对 App 自身凭据也可能是 `EACCES`。框架用
     内核 accessor 解决自己的 `AT_HWCAP` 需求，但不会替 payload 打开这些文件。
-12. **没有覆盖所有内核**：1.5.4/1.5.5 的最新真机为 Android 13 / 5.15.74 / 4K；
-    其他 5.x、6.x、16K/64K 页仍需同一产物的真机回归。历史 5.10.66 / 6.1.134
-    结果不能当作 1.5.5 验收。厂商回移 TIF 位号、隐藏必需符号、宿主不支持该内核
-    时，仍可能需要适配；不推测未知函数 ABI 或结构偏移。
+12. **没有覆盖所有内核**：1.5.7 的最新真机为 Android 16 / 6.1.134 / 4K；
+    1.5.4–1.5.6 为 Android 13 / 5.15.74 / 4K。其他 5.x、6.x、16K/64K 页仍需同一
+    产物的真机回归。历史 5.10.66 结果不能当作 1.5.7 验收。厂商回移 TIF 位号、
+    隐藏必需符号、宿主不支持该内核时，仍可能需要适配；不推测未知函数 ABI 或
+    结构偏移。
 13. **借用栈有回退**：只有能找到 pt_regs、栈 VMA 足够大且距 guard 有余量时才借用
     线程栈；否则回退到临时栈块，`status` 会显示 `stack=transient`。深栈、altstack
     或找不到 syscall 帧的目标可能走回退路径。
@@ -368,6 +377,13 @@ RELRO 或资源清理最多重试 8 次；耗尽或无法排队时报告 `state=
     没有线程正在镜像代码中执行。payload 自己创建的后台线程未停止时释放，会出现
     执行已解除映射的 SIGSEGV；2026-11-01 的一次测试误用正是这种情形，不是注入
     失败。证据见 [受保护 App 注入失败分析与修复](REAL_APP_INJECTION_20261101.md)。
+17. **名称与 emutls 驻留的边界**：符号名支持任意合法长度；提供库 SONAME、
+    `DT_NEEDED` 和符号版本名仍有 256 字节上限。payload 自带 emutls 时镜像在目标
+    存活期间不能 `release`，必须先结束目标进程再 `reap`。emutls 判定依赖动态符号
+    表中的 `__emutls_get_address`/`__emutls_v.*`；若这些符号被 hidden/local
+    可见性完全移除，框架无法识别，使用方仍需自行保证释放安全。目标 App 可能 hook
+    `__android_log_print` 等函数，payload 没有日志不等于构造函数未执行；应以
+    `status`、`images`、构造函数写入的镜像内状态或直接内存读取为准。
 
 ## 测试
 
@@ -392,6 +408,13 @@ make -C kpms/kclf TARGET_COMPILE=aarch64-linux-gnu- -j4
 1.5.6 另加 256 种覆写与独立字段覆写的生产解析测试，以及真实 ARM64 库自行改写头后
 供 manual payload 导入函数/数据的设备用例。当前产物验证见
 [1.5.6 兼容性报告](COMPATIBILITY_1.5.6.md)。
+1.5.7 的主机入口为 **12 组**；新增 `test/test_manual_symbols.py`，用生产
+`resolve_import()` 覆盖真实 JUMP_SLOT、255–4096 字节名称、已定义/导入/弱符号、
+分配失败和 emutls 驻留/拒绝；`test_manual_elf.c` 增加 65537 字节名称、SysV/GNU
+hash、越界/无 NUL/读取失败和扫描预算用例。真机侧在同一台 Pixel 6 / Android 16 /
+6.1.134 / 4K 上对 `cn.gov.tax.its` 的主线程和 Binder 线程分别完成 manual 注入，
+构造证据直接读取 `/proc/<pid>/mem`。见
+[1.5.7 兼容性报告](COMPATIBILITY_1.5.7.md)。
 
 1.5.1 普通 App 自检（关键验收；full 45 个用例，期望 `detections=0`、
 `done=syscall`、构造函数/析构函数执行、`quiesce=idle`、`kpm num=0`）：
@@ -493,6 +516,7 @@ python3 kpms/kclf/test/test_compat.py
 python3 kpms/kclf/test/test_symbols.py
 python3 kpms/kclf/test/test_completion.py
 python3 kpms/kclf/test/test_manual_elf.py
+python3 kpms/kclf/test/test_manual_symbols.py
 python3 kpms/kclf/test/test_provider.py
 python3 kpms/kclf/test/test_provider_table.py
 # 可选：末尾传入保存的 vmlinux BTF 文件，验证其真实布局选择
@@ -503,7 +527,9 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 
 ## 文档
 
-- [COMPATIBILITY_1.5.6.md](COMPATIBILITY_1.5.6.md)：通用提供库头覆写兼容、当前产物和验证范围。
+- [COMPATIBILITY_1.5.7.md](COMPATIBILITY_1.5.7.md)：长符号名、emutls 驻留、当前产物和
+  Pixel 6 / cn.gov.tax.its 真机验证。
+- [COMPATIBILITY_1.5.6.md](COMPATIBILITY_1.5.6.md)：通用提供库头覆写兼容、产物和验证范围。
 - [COMPATIBILITY_1.5.5.md](COMPATIBILITY_1.5.5.md)：历史 1.5.5 审计与产物记录，头解析策略已在 1.5.6 修正。
 - [REAL_APP_INJECTION_20261101.md](REAL_APP_INJECTION_20261101.md)：受保护 App 的两类
   prepare 失败、原始字节对比及审计前 1.5.5 快照的历史真机结果。

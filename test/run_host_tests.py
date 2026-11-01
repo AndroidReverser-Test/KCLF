@@ -13,7 +13,7 @@ def main():
     # UBSan normally recovers after reporting UB; tests must fail instead.
     environment["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
     scripts = (
-        "test_helpers.py", "test_maps.py", "test_manual_elf.py", "test_provider.py",
+        "test_helpers.py", "test_maps.py", "test_manual_elf.py", "test_manual_symbols.py", "test_provider.py",
         "test_provider_table.py", "test_symbols.py", "test_compat.py", "test_completion.py",
         "test_runtime.py",
     )
@@ -34,7 +34,7 @@ def main():
             arguments = (["4096"], ["16384"], ["65536"]) if name == "test_codegen" else ([],)
             for args in arguments:
                 subprocess.run([str(exe), *args], cwd=directory, check=True, env=environment)
-    print("\nAll 11 host suites passed (not a kernel/device certification).", flush=True)
+    print("\nAll 12 host suites passed (not a kernel/device certification).", flush=True)
 
 
 if __name__ == "__main__":
