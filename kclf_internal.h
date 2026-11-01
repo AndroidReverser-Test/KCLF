@@ -33,7 +33,7 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.5.4"
+#define KCLF_VER "1.5.5"
 
 #define KCLF_MAX_REQ 4
 #define KCLF_MAX_IMAGES 32

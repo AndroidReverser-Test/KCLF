@@ -75,6 +75,14 @@ headers。目前支持：
 - 本地定义优先；未定义符号只在稳定顺序的 `DT_NEEDED` 闭包中查找。
 - 同名 SONAME 的已加载提供库按映射路径的加载来源选择；Android 12 的四份
   `libc++.so`（vndk/conscrypt/art/system）可以区分，同一路径的重复映射只选一个。
+- 已加载提供库的 ELF 头可能被加固/反调试引擎改写：实测某 App 的 libc.so 在偏移 8
+  处被写入 `ldr x16,#8; br x16; <addr>`，破坏
+  `e_ident[8..15]`/`e_type`/`e_machine`/`e_version`，但
+  `e_phoff`/`e_phentsize`/`e_phnum`、程序头、动态表和符号表仍然有效。1.5.5 仅在
+  已加载对象的 `e_ident[8..15]` 精确匹配 `ldr x16,#8; br x16` 指令字节时，允许
+  紧随其后的地址覆盖 `e_type/e_machine/e_version`。没有该签名时仍要求
+  ET_DYN/EM_AARCH64/version；魔数、结构字段和全部数据边界在两种情况下均校验。
+  payload 自身始终按严格校验，不因此放宽 TLS/REL 等拒绝条件。
 - 从已加载库导入 IFUNC：按 Android arm64 ABI 传入目标 `AT_HWCAP`/`AT_HWCAP2`；
   多个对应重定位可重复调用同一个 resolver，不保证任意带副作用的 resolver 安全。
   HWCAP 来自内核 accessor，不要求目标 App 可读自己的 auxv。
@@ -101,7 +109,9 @@ headers。目前支持：
   不保证识别该镜像。框架不拦截 payload 对这些 API 的调用。
 
 资源上限是显式失败条件：64 MiB 文件快照，256 MiB 虚拟 ELF 跨度/最大对齐，
-64 个 program headers，每对象 64 个 NEEDED，512 个已加载候选提供库，128 个闭包成员，
+64 个 program headers，每对象 64 个 NEEDED，已加载候选提供库表按需倍增
+（初始 64，硬上限 4096；分配失败或超过上限时明确停止 prepare 并回滚，避免
+在不完整的同名库集合中选择错误来源），128 个闭包成员，
 50 万动态符号，100 万累计解码重定位，16 MiB APS2 数据，128 个初始化与128 个析构，
 64 个 IFUNC fixup。调用/IFUNC/RELRO 表还必须共同装入一页参数区。
 镜像为对齐额外预留一段空间，因此 `resident` 大小可大于 ELF 跨度。
@@ -186,6 +196,29 @@ stock KernelPatch 不尊重模块 exit 的 `-EBUSY`，所以不能强行卸载�
   见 [加固报告](OBSERVABILITY_HARDENING_20261030.md)。
 
 ## 验证与可复现性
+
+### 1.5.5 审计前快照：受保护 App（2026-11-01）
+
+本节结果对应审计前快照，SHA-256 为
+`e9af06bad92c95cacdbd2dba103de334b5fe4116df7f7946077df08890463887`。
+最终代码随后收紧了表截断处理和头校验，最终发布产物及其验证范围见
+[1.5.5 兼容性报告](COMPATIBILITY_1.5.5.md)；下列第三方 App 结果不能代替最终产物实测。
+
+同一台小米 13 / Android 13 / 5.15.74 / ARM64 / 4K 设备，两个真实 App：
+
+- 抖音 `com.ss.android.ugc.aweme` 40.8.0 有 540–549 个带 `DT_SONAME` 的已加载
+  对象，超过 1.5.4 固定的 512 项表；旧产物报
+  `manual: provider scan limit exceeded`。提供库表改为按需倍增后主线程和
+  Binder 线程均注入成功。
+- 建行 `com.chinamworld.main` 7.6.0 的加固引擎把已加载 libc.so 的
+  `e_ident[8..15]/e_type/e_machine/e_version` 改写成跳板，旧产物报
+  `manual: DT_NEEDED is not already loaded: libc.so`。审计前的头校验修订后注入成功。
+
+两个 App 的构造函数实际执行（`Perfare : start dump.....`），release 后 App 存活、
+`images` 为空，无新增内核告警。完整字节对比、原因排除、主机测试和证据目录见
+[受保护 App 注入失败分析与修复](REAL_APP_INJECTION_20261101.md)。释放前必须确保
+payload 的后台线程已停止；本轮一次“观察 3 秒就 release”的测试误用导致执行已解除
+映射的 SIGSEGV，改回 12 秒观察后不再出现。
 
 ### 1.4.1：真实 App + 用户提供的 SO
 

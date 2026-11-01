@@ -270,9 +270,92 @@ static void file_tests(const char *path)
     assert(ke_file_layout(&io, &o, file_size, 4096) == -EOPNOTSUPP);
     puts("existing Android payload, truncation, mapping and W^X rejection: PASS");
 }
+static void set_soname(void)
+{
+    ((struct ke_dyn *)(memory + 0x200))[5] = (struct ke_dyn){14, 13}; /* "libdep.so" */
+}
+static void loaded_veneer_fixture(void)
+{
+    init_fixture(); set_soname();
+    memcpy(memory + 8, "\x50\x00\x00\x58\x00\x02\x1f\xd6\xfc\x8c\xce\x0c\x79\x00\x00\x00", 16);
+}
+static void loaded_header_tests(void)
+{
+    struct ke_object strict, loaded;
+    char name[KE_NAME];
+    /* An intact AArch64 provider has the same header contract as a payload. */
+    init_fixture(); set_soname();
+    assert(!ke_open(&io, BASE, &strict, 1));
+    assert(!ke_open(&io, BASE, &loaded, 0));
+    assert(loaded.symcount == strict.symcount && loaded.soname == 13);
+    assert(!ke_string(&io, &loaded, loaded.soname, name) && !strcmp(name, "libdep.so"));
+
+    /* A VMA can contain a mapped data file rather than a linker-loaded DSO.
+     * Intact foreign architectures and arbitrary damaged headers must not
+     * become providers just because the ELF magic and tables are plausible. */
+    init_fixture(); set_soname();
+    ((struct ke_ehdr *)memory)->machine = 62; /* EM_X86_64 */
+    assert(ke_open(&io, BASE, &loaded, 0) == -ENOEXEC);
+    assert(ke_open(&io, BASE, &strict, 1) == -ENOEXEC);
+    init_fixture(); set_soname();
+    ((struct ke_ehdr *)memory)->type = 2; /* ET_EXEC */
+    assert(ke_open(&io, BASE, &loaded, 0) == -ENOEXEC);
+    init_fixture(); set_soname();
+    ((struct ke_ehdr *)memory)->version = 2;
+    assert(ke_open(&io, BASE, &loaded, 0) == -ENOEXEC);
+    init_fixture(); set_soname();
+    memset(memory + 8, 0xa5, 16);
+    assert(ke_open(&io, BASE, &loaded, 0) == -ENOEXEC);
+
+    /* Anti-tamper veneer observed in the field: 16 bytes written at offset 8
+     * clobber e_ident[8..15], e_type, e_machine and e_version.  A payload must
+     * still be rejected; only the exact recognized veneer permits a provider. */
+    loaded_veneer_fixture();
+    assert(ke_open(&io, BASE, &loaded, 1));
+    assert(ke_headers(&io, BASE, &strict));
+    assert(!ke_open(&io, BASE, &loaded, 0));
+    assert(loaded.symcount == 3 && loaded.soname == 13);
+    assert(!ke_string(&io, &loaded, loaded.soname, name) && !strcmp(name, "libdep.so"));
+    for (unsigned i = 8; i < 16; i++) {
+        loaded_veneer_fixture();
+        memory[i] ^= 1; /* Every byte in both instructions is mandatory. */
+        assert(ke_open(&io, BASE, &loaded, 0) == -ENOEXEC);
+    }
+
+    /* The recognized overwrite never relaxes structural/table bounds. */
+    loaded_veneer_fixture();
+    ((struct ke_ehdr *)memory)->phnum = 0;
+    assert(ke_open(&io, BASE, &loaded, 0));
+    loaded_veneer_fixture();
+    ((struct ke_ehdr *)memory)->phnum = KE_PHNUM + 1;
+    assert(ke_open(&io, BASE, &loaded, 0));
+    loaded_veneer_fixture();
+    ((struct ke_ehdr *)memory)->ehsize = 8;
+    assert(ke_open(&io, BASE, &loaded, 0));
+    loaded_veneer_fixture();
+    ((struct ke_ehdr *)memory)->phentsize = 8;
+    assert(ke_open(&io, BASE, &loaded, 0));
+    loaded_veneer_fixture();
+    ((struct ke_ehdr *)memory)->phoff = 0xffffffffULL;
+    assert(ke_open(&io, BASE, &loaded, 0));
+    loaded_veneer_fixture();
+    ((struct ke_phdr *)(memory + 64))[0].memsz = ~0ULL;
+    assert(ke_open(&io, BASE, &loaded, 0));
+    loaded_veneer_fixture();
+    ((struct ke_dyn *)(memory + 0x200))[0].val = ~0ULL;
+    assert(ke_open(&io, BASE, &loaded, 0));
+    loaded_veneer_fixture();
+    ((u32 *)(memory + 0xa00))[1] = KE_SYMS + 1;
+    assert(ke_open(&io, BASE, &loaded, 0));
+    loaded_veneer_fixture();
+    memory[1] = 'X';
+    assert(ke_open(&io, BASE, &loaded, 0));
+    puts("loaded headers: strict architecture/type/version, recognized veneer only, bounded tables: PASS");
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
     symbol_tests(); relocation_tests(); ifunc_tests(); malformed_tests(); file_tests(argv[1]);
+    loaded_header_tests();
     return 0;
 }

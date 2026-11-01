@@ -40,16 +40,29 @@ static int objrd(struct ke_io *io, const struct ke_object *o, u64 at, void *p, u
     return rd(io, at, p, n);
 }
 
-int ke_headers(struct ke_io *io, u64 header, struct ke_object *o)
+/* loaded=0 is the strict file/payload contract: a payload has to be a complete
+ * ET_DYN/EM_AARCH64 image.  loaded=1 is used while scanning target VMAs, which
+ * does not prove that an object was accepted by the target's linker: a mapped
+ * data file can also start with an ELF header.  Keep the architecture/type/
+ * version checks unless e_ident[8..15] exactly matches the observed AArch64
+ * ldr x16,#8; br x16 veneer.  That veneer's following address overwrites
+ * e_type/e_machine/e_version.  All structural fields and later bounds remain
+ * mandatory even for this recognized overwrite. */
+static int ke_headers_impl(struct ke_io *io, u64 header, struct ke_object *o, int loaded)
 {
     struct ke_ehdr h;
     unsigned i;
     memset(o, 0, sizeof(*o));
     if (rd(io, header, &h, sizeof(h))) return -ENOEXEC;
-    if (memcmp(h.ident, "\177ELF\2\1\1", 7) || h.type != 3 || h.machine != 183 || h.version != 1 ||
-        h.ehsize != sizeof(h) || h.phentsize != sizeof(struct ke_phdr) || !h.phnum || h.phnum > KE_PHNUM ||
-        h.phoff < sizeof(h) || h.phoff > 1024 * 1024 || h.phoff > io->limit - header)
+    if (memcmp(h.ident, "\177ELF\2\1\1", 7))
+        return fail(io, -ENOEXEC, loaded ? "loaded image is not ELF64 little-endian"
+                                         : "expected bounded ELF64 little-endian AArch64 ET_DYN");
+    if ((h.type != 3 || h.machine != 183 || h.version != 1) &&
+        !(loaded && !memcmp(h.ident + 8, "\x50\x00\x00\x58\x00\x02\x1f\xd6", 8)))
         return fail(io, -ENOEXEC, "expected bounded ELF64 little-endian AArch64 ET_DYN");
+    if (h.ehsize != sizeof(h) || h.phentsize != sizeof(struct ke_phdr) || !h.phnum || h.phnum > KE_PHNUM ||
+        h.phoff < sizeof(h) || h.phoff > 1024 * 1024 || h.phoff > io->limit - header)
+        return fail(io, -ENOEXEC, loaded ? "loaded ELF header is structurally invalid" : "expected bounded ELF64 little-endian AArch64 ET_DYN");
     o->phnum = h.phnum;
     o->header = header;
     if (rd(io, header + h.phoff, o->ph, h.phnum * sizeof(o->ph[0]))) return -ENOEXEC;
@@ -70,6 +83,11 @@ int ke_headers(struct ke_io *io, u64 header, struct ke_object *o)
     if (o->low == ~0ULL || o->high <= o->low || o->high - o->low > KE_IMAGE_MAX || o->alignment > KE_IMAGE_MAX)
         return fail(io, -E2BIG, "ELF image/alignment limit exceeded");
     return 0;
+}
+
+int ke_headers(struct ke_io *io, u64 header, struct ke_object *o)
+{
+    return ke_headers_impl(io, header, o, 0);
 }
 
 int ke_file_layout(struct ke_io *io, struct ke_object *o, u64 size, u64 page)
@@ -167,7 +185,10 @@ int ke_open(struct ke_io *io, u64 header, struct ke_object *o, int payload)
     u64 dyn = 0, dynsz = 0, syment = 0, relaent = 24, relrent = 8, pltrel = 7;
     unsigned i, bases = 0;
     int ended = 0, rc;
-    if ((rc = ke_headers(io, header, o))) return rc;
+    /* VMA candidates keep the strict contract except for the recognized
+     * header veneer; the scan alone does not establish linker provenance.
+     * Payload images always keep the ET_DYN/EM_AARCH64/version contract. */
+    if ((rc = ke_headers_impl(io, header, o, !payload))) return rc;
     for (i = 0; i < o->phnum; i++) {
         const struct ke_phdr *p = &o->ph[i];
         if (p->type == 1 && !p->offset && p->filesz >= sizeof(struct ke_ehdr)) {

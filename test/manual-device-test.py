@@ -29,7 +29,7 @@ def main():
     ap.add_argument("--app", action="store_true", help="also exercise the installed, stopped com.kclf.apptest fixture")
     args = ap.parse_args()
     key = os.environ.get("KCLF_SUPERKEY", "")
-    if not re.fullmatch(r"[A-Za-z0-9_.+-]+", key):
+    if not re.fullmatch(r"[A-Za-z0-9_@.+-]+", key):
         raise SystemExit("Set a shell-safe KCLF_SUPERKEY")
     module = Path(__file__).resolve().parents[1]
     kpm_file = (args.kpm or module / "kclf.kpm").resolve()

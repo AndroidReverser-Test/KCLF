@@ -13,7 +13,13 @@
 #include <uapi/asm-generic/errno.h>
 
 #define KM_IMAGES KCLF_MAX_IMAGES
-#define KM_PROVIDERS 512
+/* Loaded-provider table. Modern protected apps map far more shared objects than
+ * the historical fixed 512 (Douyin/aweme: 543 objects with a DT_SONAME), so the
+ * table grows on demand. An incomplete table cannot safely distinguish
+ * same-SONAME providers from different namespaces, so allocation failure or
+ * KM_PROVIDERS_MAX exhaustion aborts preparation before dependency selection. */
+#define KM_PROVIDERS_INIT 64
+#define KM_PROVIDERS_MAX 4096
 #define KM_SCOPE 128
 #define KM_CALLS 128
 #define KM_IFUNCS 64
@@ -49,8 +55,9 @@ struct km_context {
     struct kclf_req *r;
     struct ke_io io;
     struct ke_object object, candidate;
-    struct km_provider providers[KM_PROVIDERS];
-    unsigned nproviders, nscope, scope[KM_SCOPE];
+    struct km_provider *providers; /* vmalloc'ed, grown on demand */
+    unsigned nproviders, provider_cap;
+    unsigned nscope, scope[KM_SCOPE];
     void *snapshot;
     unsigned long file_size;
     u64 *values;
@@ -112,6 +119,32 @@ static int own_mapping(u64 mm, u64 address)
     return found;
 }
 
+/* Grow the loaded-provider table geometrically. A target with 543 loaded
+ * SONAMEs uses 1024 slots; old and new buffers coexist briefly during growth.
+ * Preallocating the maximum would be wasteful for ordinary apps. On failure
+ * preserve the existing table and report failure to the mapping walker. */
+static int provider_reserve(struct km_context *c, unsigned need)
+{
+    struct km_provider *grown;
+    unsigned cap;
+
+    if (need > KM_PROVIDERS_MAX) return -ENOSPC;
+    if (need <= c->provider_cap) return 0;
+    if (c->provider_cap >= KM_PROVIDERS_MAX) return -ENOSPC;
+    cap = c->provider_cap ? c->provider_cap : KM_PROVIDERS_INIT;
+    while (cap < need) cap *= 2;
+    if (cap > KM_PROVIDERS_MAX) cap = KM_PROVIDERS_MAX;
+    grown = kclf_ks.vmalloc((unsigned long)cap * sizeof(*grown));
+    if (!grown) return -ENOMEM;
+    if (c->providers) {
+        memcpy(grown, c->providers, (size_t)c->nproviders * sizeof(*grown));
+        kclf_ks.vfree(c->providers);
+    }
+    c->providers = grown;
+    c->provider_cap = cap;
+    return 0;
+}
+
 static int collect(u64 address, const char *path, void *context)
 {
     struct km_context *c = context;
@@ -121,7 +154,7 @@ static int collect(u64 address, const char *path, void *context)
     u32 magic;
     unsigned i;
     char name[KE_NAME];
-    int own;
+    int own, rc;
     quiet.error = 0;
     if (kclf_urds(address, &magic, 4) || magic != 0x464c457fU) return 0;
     own = own_mapping(c->r->mm, address);
@@ -129,7 +162,13 @@ static int collect(u64 address, const char *path, void *context)
     if (own) return 0; /* manual modules are not implicitly dependency providers */
     if (ke_open(&quiet, address, o, 0) || !o->soname || ke_string(&quiet, o, o->soname, name)) return 0;
     for (i = 0; i < c->nproviders; i++) if (c->providers[i].object.bias == o->bias) return 0;
-    if (c->nproviders == KM_PROVIDERS) { report(c, "provider scan limit exceeded", ""); return -E2BIG; }
+    if (c->nproviders == c->provider_cap) {
+        if ((rc = provider_reserve(c, c->nproviders + 1))) {
+            report(c, rc == -ENOMEM ? "provider table allocation failed"
+                                    : "provider table limit exceeded", "");
+            return rc;
+        }
+    }
     provider = &c->providers[c->nproviders];
     memset(provider, 0, sizeof(*provider));
     memcpy(&provider->object, o, sizeof(*o));
@@ -720,6 +759,7 @@ long kclf_manual_prepare(struct kclf_req *r)
     }
 out:
     if (rc && !r->err[0]) kclf_set_err(r, "manual: %s failed rc=%d", step, rc);
+    if (c->providers) kclf_ks.vfree(c->providers);
     if (c->resolved) kclf_ks.vfree(c->resolved);
     if (c->values) kclf_ks.vfree(c->values);
     if (c->snapshot) kclf_ks.vfree(c->snapshot);
