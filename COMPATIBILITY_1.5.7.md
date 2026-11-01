@@ -1,5 +1,8 @@
 # KCLF 1.5.7：manual 长符号名与 emutls 驻留修复（2026-11-01）
 
+> 前文保留开发阶段的实现分析和设备记录。本文末尾“发布前独立复核”是本次
+> 提交、合并和发布前重新执行的审计/回归；不把既有第三方 App 记录当成本轮重测。
+
 ## 修改原因
 
 对 `/data/local/tmp/libtest.so` 注入 `cn.gov.tax.its` 的 manual 后端在 prepare 阶段
@@ -161,3 +164,84 @@ err="manual: image 1 is NODELETE (emutls); resident until the process exits"
   内存解析已加载提供库，不恢复、不绕过这些 hook。
 - 未验证目标的反注入检测、non-dumpable、ptrace 或 SELinux 策略变化；框架仍不
   承诺“不可检测”。
+
+## 发布前独立复核（2026-11-01，Asia/Shanghai）
+
+### 源码范围与实现链
+
+审计基线为 main `1e12047` / dev `2f9ce68`（1.5.6），本次实现提交为 dev
+`ade4c68`。框架源码仅修改 `kclf_elf.c`、`kclf_elf.h`、`kclf_manual.c` 和
+`kclf_internal.h`（版本号）。控制面、task_work、内核兼容层、用户内存访问、
+EL0 生成器、共享参数 ABI 的源码与 main 基线一致。
+
+执行链仍为：superkey 控制命令 → 目标线程 prepare task_work → 文件快照和
+ELF 映射 → emutls 策略预扫描 → 已驻留依赖闭包/重定位 → 权限和调用表 →
+hijack task_work 修改 pt_regs → EL0 初始化/恢复/token → 完成观察和 cleanup。
+名称分配、GUP 字符串读取、预扫描和回滚都在原有可睡眠 prepare 路径，不进入
+普通 syscall hook 的不可睡眠完成观察路径。
+
+### 跨内核兼容性结论
+
+**未发现本次修改破坏既有跨内核适配路径的阻断问题，可以同步 main。**
+这是相对 1.5.6 的差分审计结论，不是全版本、全厂商配置认证。
+
+| 检查项 | 结果 |
+| --- | --- |
+| 内核符号/模块导入 | 与 1.5.6 的 `nm -u` 结果完全一致；无新直接导入。动态解析代码未改，复用既有 vmalloc/vfree 和 access_process_vm |
+| 内核结构/ABI | 未增加结构偏移、内核版本分支或依赖新内核类型；`ke_io` 是模块内部接口，不是内核或持久化 ABI |
+| task_work / BTF / nofault | 通知和取消 ABI、BTF 验证、procfs/accessor/GUP 回退代码未改；对应主机测试和设备回退回归通过 |
+| 页大小/内核栈 | 字符串使用 64 字节对齐小块，长名称位于 vmalloc 堆；没有新增 4K 假设。原有 2048 字节栈帧告警作为错误执行 |
+| 边界/预算 | DT_STRSZ、可读 PT_LOAD、地址溢出、完整 NUL、分配失败、名称缓冲扩容和扫描预算用例通过 |
+| 生命周期 | 本地 emutls 在初始化前标记 NODELETE；首次 unload 和显式 release 被拒绝，失败准备可回滚，目标 mm 退出后沿原有 reap 路径释放登记 |
+
+ELF 字符串规范没有 255 字节通用上限，完整名称读取有其依据；compiler-rt
+使用 pthread key 注册 emutls 析构函数，因此保留 payload 代码到 mm 退出是必要
+的生命周期约束。参考 [ELF 字符串表规范](https://gabi.xinuos.com/elf/04-strtab.html)
+和 [LLVM compiler-rt emutls 实现](https://github.com/llvm/llvm-project/blob/main/compiler-rt/lib/builtins/emutls.c)。
+
+### 本轮重新执行的验证
+
+- `make test`：12 组全部通过；C 测试使用 ASan/UBSan，UBSan 遇错即停止。
+  包含 5.0–6.18 **模拟**版本/BTF ABI 选择、255/256/285/4096/65537 字节名称、
+  emutls 策略和失败路径，以及 4K/16K/64K 生成器用例；这些不是相应内核的真机实测。
+- 从当前设备读取真实 `/sys/kernel/btf/vmlinux`，重新运行 `test/test_compat.py`：
+  布局选择、缺失符号回退、mm 引用平衡通过；BTF SHA-256 为
+  `ef6ffa2e5d2f10ad1438a89a77d42747e80c7b78367c1d191140c5e623ff4970`。
+- 正式 KPM：Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4096，
+  `manual-device-test.py --app` **186 项断言通过**。包含原生进程和自有普通 App、
+  manual/linker、引用与释放、ELF 重定位、错误回滚、FPSIMD、seccomp、目标退出、
+  分页、取消和 quiesce。`probe`：`btf=1`、`pt_regs=336`、`vma_backend=locked`、
+  `nofault=1`。
+- 独立测试构建（不用于发布）：
+  `CFLAGS='-DKCLF_TEST_NO_BTF -DKCLF_TEST_NO_NOFAULT'`，
+  SHA-256 `94fb41cb75d6d375ffd5a656d7adda5fe3b7ebc4c56d4c949ed271ef5c6d7f36`。
+  同设备 `manual-device-test.py --app --expect-poll` **243 项断言通过**；
+  `probe` 确认为 `btf=0`、`vma_backend=proc_maps`、`mm_access=get_task_mm`、
+  `nofault=0`，成功请求均检查 `done=poll`。
+- 两轮最终结果均为 PASS；没有新增 retained dmesg BUG/WARNING/Oops/panic，
+  boot ID 和 SELinux Enforcing 不变。只启动/结束本轮自有夹具；测试 App 已停止，
+  KCLF 在 `quiesce=idle` 后卸载，最终模块列表为空。
+
+本地证据（不包含 superkey）：
+
+| 运行 | 证据目录（相对 KernelPatch 根目录） | results.json SHA-256 |
+| --- | --- | --- |
+| 正式产物 | `build/kclf-manual-582fd3865f73/` | `306498e6050bf9847be422b5447faf0a3102979139c2738cb1fa3264a5aeaf16` |
+| 无 BTF/nofault | `build/kclf-manual-bb39f93c4c1d/` | `6ae561653eee08fc85ccdc83cbf82189692d91a6706f067db2d611e92ccb165e` |
+
+### 可重复构建与发布边界
+
+使用 KernelPatch `406c85ce79a5e1c19b53be34c04baadc1ec68bc5` 的未修改头文件、
+WSL Ubuntu 24.04 / AArch64 GCC 13.3.0 / GNU binutils 2.42，执行
+`make -B TARGET_COMPILE=aarch64-linux-gnu- -j4`。产物为 142168 字节的 ELF64
+little-endian AArch64 ET_REL；SHA-256 与前文正式 1.5.7 完全一致：
+`8398bd98e72b5395e1ad4430fe474a5fb3e1008967bbacf0c2560a47f93593bf`。
+
+发布不包含关闭 BTF/nofault 的测试构建。main 保留精简源码、测试 App 和双语文档；
+完整主机/原生设备夹具及开发分析保留在 dev。
+
+尚存限制：本轮没有其他 5.x/6.x 或 16K/64K 真机；回退测试仍是在 6.1 上。
+新增预扫描会遍历动态符号表，完整名称最多 64 MiB（含 NUL），累计字符串读预算
+256 MiB；预算耗尽或额外内存不足会明确失败，不能宣称任意大小合法 ELF 均可加载。
+SONAME/NEEDED/版本名仍限制为 255 字节。隐藏且不在 dynsym 中的 emutls 无法自动
+识别；驻留依赖必须由调用者保证；x16、异步锁重入、强制卸载等原有风险没有消失。
