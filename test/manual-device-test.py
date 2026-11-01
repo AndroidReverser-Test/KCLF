@@ -183,6 +183,10 @@ def main():
             build("libmanual_unresolved.so", "manual_unresolved.c")
             build("libkclf_manual_absent.so", "manual_missing.c", "-Wl,-soname,libkclf_manual_absent.so")
             build("libmanual_missing.so", "manual_payload.c", "-L" + str(output), "-Wl,--no-as-needed", "-lkclf_manual_absent")
+            build("libkclf_rewritten.so", "manual_rewritten_provider.c", "-ldl",
+                  "-Wl,-soname,libkclf_rewritten.so")
+            build("libmanual_rewritten.so", "manual_rewritten_provider.c", "-DKCLF_REWRITTEN_PAYLOAD",
+                  "-L" + str(output), "-Wl,--no-as-needed", "-lkclf_rewritten")
         kpm("load", remote + "/kclf.kpm")
         loaded = True
         check("pt_regs=ok" in ctl("probe"), "runtime register frame available")
@@ -216,6 +220,21 @@ def main():
         check("via=__loader_dlopen" in inject(pid, flags=",linker,unload"), "explicit legacy linker backend still works")
         reap()
         if not args.smoke:
+            for mode in ("zero", "fill", "machine", "mixed"):
+                rewritten = start("rewrite-" + mode)
+                log = root(f"cat {remote}/rewrite-{mode}.log")
+                check(f"provider-header-ready mode={mode} value=13579bdf" in log,
+                      mode + ": owned AArch64 provider rewrote its header and remains callable")
+                st = inject(rewritten, "libmanual_rewritten.so")
+                identity = re.search(r"image=(\d+)", st).group(1)
+                check("via=manual" in st and "err=" not in st,
+                      mode + ": manual dependency preparation accepts rewritten metadata")
+                check(root(f"cat {remote}/provider_{rewritten}.log") == "function=13579bdf data=13579bdf",
+                      mode + ": constructor calls provider code and reads provider data")
+                reap()
+                release(rewritten, identity)
+                reap()
+                check("no manual images" in ctl("images"), mode + ": manual payload safely released")
             for name in ("libmanual.so", "libmanual_aps2.so", "libmanual_relr.so", "libmanual_both.so", "libmanual_sysv.so"):
                 case = start()
                 st = inject(case, name)

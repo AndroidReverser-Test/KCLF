@@ -78,11 +78,11 @@ headers。目前支持：
 - 已加载提供库的 ELF 头可能被加固/反调试引擎改写：实测某 App 的 libc.so 在偏移 8
   处被写入 `ldr x16,#8; br x16; <addr>`，破坏
   `e_ident[8..15]`/`e_type`/`e_machine`/`e_version`，但
-  `e_phoff`/`e_phentsize`/`e_phnum`、程序头、动态表和符号表仍然有效。1.5.5 仅在
-  已加载对象的 `e_ident[8..15]` 精确匹配 `ldr x16,#8; br x16` 指令字节时，允许
-  紧随其后的地址覆盖 `e_type/e_machine/e_version`。没有该签名时仍要求
-  ET_DYN/EM_AARCH64/version；魔数、结构字段和全部数据边界在两种情况下均校验。
-  payload 自身始终按严格校验，不因此放宽 TLS/REL 等拒绝条件。
+  `e_phoff`/`e_phentsize`/`e_phnum`、程序头、动态表和符号表仍然有效。1.5.6 按原版
+  契约通用处理这类情况：提供库的这些非结构性身份字段可以是任意内容，不匹配任何
+  指令签名；ELF64/小端标识、结构字段和全部数据边界仍校验。1.5.5 的特定指令例外已移除。
+  payload 自身始终严格校验 ET_DYN/EM_AARCH64/version，不因此放宽 TLS/REL 等拒绝条件。
+  VMA 扫描与结构解析不能证明 linker 来源或恢复被覆写的原始架构，框架仍只支持 ARM64 目标。
 - 从已加载库导入 IFUNC：按 Android arm64 ABI 传入目标 `AT_HWCAP`/`AT_HWCAP2`；
   多个对应重定位可重复调用同一个 resolver，不保证任意带副作用的 resolver 安全。
   HWCAP 来自内核 accessor，不要求目标 App 可读自己的 auxv。
@@ -196,6 +196,15 @@ stock KernelPatch 不尊重模块 exit 的 `-EBUSY`，所以不能强行卸载�
   见 [加固报告](OBSERVABILITY_HARDENING_20261030.md)。
 
 ## 验证与可复现性
+
+### 1.5.6：通用头覆写兼容
+
+生产解析器已验证 256 种重复字节内容、各身份字段单独改写及任意混合内容；
+payload 严格拒绝不合法身份，provider 结构解析仍拒绝坏结构/越界。
+设备夹具 `manual_rewritten_provider.c` 是实际编译的 ARM64 库：它自行用全零、
+重复字节、单独改写 machine、混合字节四种方式修改头部，随后验证 manual payload
+能导入并调用其函数、读取其数据及安全释放。当前产物和设备结果见
+[1.5.6 兼容性报告](COMPATIBILITY_1.5.6.md)。
 
 ### 1.5.5 审计前快照：受保护 App（2026-11-01）
 

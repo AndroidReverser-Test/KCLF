@@ -1,11 +1,11 @@
-# KCLF 1.5.5
+# KCLF 1.5.6
 
-1.5.5 将已加载提供库表改为按需倍增（初始 64、上限 4096）；分配失败或超过
-上限时明确停止 prepare 并回滚，避免用不完整的表误选同名库。已加载对象仅在
-`e_ident[8..15]` 精确匹配 `ldr x16,#8; br x16` 时，允许该跳板覆盖
-`e_type/e_machine/e_version`；其他头字段和数据边界仍校验，payload 保持严格
-ELF64/AArch64/ET_DYN 校验。最终代码审计、产物及验证范围见
-[1.5.5 兼容性报告](COMPATIBILITY_1.5.5.md)。
+1.5.6 恢复已映射提供库的通用 ELF 结构解析：允许 `e_ident[8..15]`、
+`e_type/e_machine/e_version` 被任意改写，不依赖固定指令、包名或加固方案。
+ELF64/小端标识、程序头和动态/符号表的结构与读取边界仍严格检查；待加载的
+payload 保持严格 ELF64/AArch64/ET_DYN 校验。1.5.5 的固定指令例外已移除。
+提供库表仍按需增长（64–4096），分配失败或超限仍停止并回滚。
+实现、测试与验证范围见 [1.5.6 兼容性报告](COMPATIBILITY_1.5.6.md)。
 
 [受保护 App 注入失败分析与修复](REAL_APP_INJECTION_20261101.md) 保留了两类失败
 的根因和审计前 1.5.5 快照的第三方 App 实测；该快照与最终发布产物不同，历史结果
@@ -361,10 +361,9 @@ RELRO 或资源清理最多重试 8 次；耗尽或无法排队时报告 `state=
     GCS 的线程不在支持范围，RET 不能被解释为完整的异步上下文恢复协议。
 15. **提供库发现是启发式**：manual 以 VMA 起点的 ELF 魔数枚举已加载对象，
     提供库表初始 64、按需倍增、硬上限 4096；分配失败或超过上限时停止准备并回滚，
-    不在不完整的候选表中选择依赖。已加载对象仅在 `e_ident[8..15]` 精确匹配
-    `ldr x16,#8; br x16` 时允许该跳板覆盖 `e_type/e_machine/e_version`；
-    无此签名的非 ARM64/非法类型和版本头仍拒绝。魔数或 `phnum/phoff/phentsize`
-    等结构字段被破坏时仍无法识别。
+    不在不完整的候选表中选择依赖。已映射提供库的非结构性身份字段不再用作
+    原始架构/类型认证，允许任意覆写；魔数、ELF64/小端编码及 `phnum/phoff/phentsize`
+    等结构字段被破坏时仍拒绝。VMA 扫描本身不证明 linker 来源，使用范围仍为 ARM64 目标。
 16. **释放前必须停止 payload 线程**：`release`/`unload` 只处理框架的引用，不证明
     没有线程正在镜像代码中执行。payload 自己创建的后台线程未停止时释放，会出现
     执行已解除映射的 SIGSEGV；2026-11-01 的一次测试误用正是这种情形，不是注入
@@ -390,7 +389,9 @@ make -C kpms/kclf TARGET_COMPILE=aarch64-linux-gnu- -j4
 可读 SO，轮询 `status`、保存 logcat/crash buffer，并在默认观察 12 秒后 `release`
 检查 App 存活。2026-11-01 的两个受保护 App 历史结果见
 [受保护 App 注入失败分析与修复](REAL_APP_INJECTION_20261101.md)，对应审计前快照；
-最终发布产物的验证见 [1.5.5 兼容性报告](COMPATIBILITY_1.5.5.md)。
+1.5.6 另加 256 种覆写与独立字段覆写的生产解析测试，以及真实 ARM64 库自行改写头后
+供 manual payload 导入函数/数据的设备用例。当前产物验证见
+[1.5.6 兼容性报告](COMPATIBILITY_1.5.6.md)。
 
 1.5.1 普通 App 自检（关键验收；full 45 个用例，期望 `detections=0`、
 `done=syscall`、构造函数/析构函数执行、`quiesce=idle`、`kpm num=0`）：
@@ -502,7 +503,8 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 
 ## 文档
 
-- [COMPATIBILITY_1.5.5.md](COMPATIBILITY_1.5.5.md)：最终 1.5.5 代码审计、发布产物与验证范围。
+- [COMPATIBILITY_1.5.6.md](COMPATIBILITY_1.5.6.md)：通用提供库头覆写兼容、当前产物和验证范围。
+- [COMPATIBILITY_1.5.5.md](COMPATIBILITY_1.5.5.md)：历史 1.5.5 审计与产物记录，头解析策略已在 1.5.6 修正。
 - [REAL_APP_INJECTION_20261101.md](REAL_APP_INJECTION_20261101.md)：受保护 App 的两类
   prepare 失败、原始字节对比及审计前 1.5.5 快照的历史真机结果。
 - [COMPATIBILITY_1.5.4.md](COMPATIBILITY_1.5.4.md)：1.5.4 实现、5.15 BTI 返回故障修复及普通 App 实测。

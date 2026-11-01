@@ -274,10 +274,11 @@ static void set_soname(void)
 {
     ((struct ke_dyn *)(memory + 0x200))[5] = (struct ke_dyn){14, 13}; /* "libdep.so" */
 }
-static void loaded_veneer_fixture(void)
+static void loaded_rewritten_fixture(void)
 {
     init_fixture(); set_soname();
-    memcpy(memory + 8, "\x50\x00\x00\x58\x00\x02\x1f\xd6\xfc\x8c\xce\x0c\x79\x00\x00\x00", 16);
+    /* Deliberately contains no recognizable instruction sequence. */
+    memset(memory + 8, 0xa5, 16);
 }
 static void loaded_header_tests(void)
 {
@@ -290,67 +291,76 @@ static void loaded_header_tests(void)
     assert(loaded.symcount == strict.symcount && loaded.soname == 13);
     assert(!ke_string(&io, &loaded, loaded.soname, name) && !strcmp(name, "libdep.so"));
 
-    /* A VMA can contain a mapped data file rather than a linker-loaded DSO.
-     * Intact foreign architectures and arbitrary damaged headers must not
-     * become providers just because the ELF magic and tables are plausible. */
-    init_fixture(); set_soname();
-    ((struct ke_ehdr *)memory)->machine = 62; /* EM_X86_64 */
-    assert(ke_open(&io, BASE, &loaded, 0) == -ENOEXEC);
-    assert(ke_open(&io, BASE, &strict, 1) == -ENOEXEC);
-    init_fixture(); set_soname();
-    ((struct ke_ehdr *)memory)->type = 2; /* ET_EXEC */
-    assert(ke_open(&io, BASE, &loaded, 0) == -ENOEXEC);
-    init_fixture(); set_soname();
-    ((struct ke_ehdr *)memory)->version = 2;
-    assert(ke_open(&io, BASE, &loaded, 0) == -ENOEXEC);
-    init_fixture(); set_soname();
-    memset(memory + 8, 0xa5, 16);
-    assert(ke_open(&io, BASE, &loaded, 0) == -ENOEXEC);
-
-    /* Anti-tamper veneer observed in the field: 16 bytes written at offset 8
-     * clobber e_ident[8..15], e_type, e_machine and e_version.  A payload must
-     * still be rejected; only the exact recognized veneer permits a provider. */
-    loaded_veneer_fixture();
-    assert(ke_open(&io, BASE, &loaded, 1));
-    assert(ke_headers(&io, BASE, &strict));
-    assert(!ke_open(&io, BASE, &loaded, 0));
-    assert(loaded.symcount == 3 && loaded.soname == 13);
-    assert(!ke_string(&io, &loaded, loaded.soname, name) && !strcmp(name, "libdep.so"));
-    for (unsigned i = 8; i < 16; i++) {
-        loaded_veneer_fixture();
-        memory[i] ^= 1; /* Every byte in both instructions is mandatory. */
-        assert(ke_open(&io, BASE, &loaded, 0) == -ENOEXEC);
+    /* Each identity field can be rewritten on its own. Even a value that
+     * names another architecture is not trustworthy after loading. The strict
+     * payload contract must reject it; the provider parser only checks structure. */
+    for (unsigned field = 0; field < 3; field++) {
+        init_fixture(); set_soname();
+        if (field == 0) ((struct ke_ehdr *)memory)->type = 2;
+        if (field == 1) ((struct ke_ehdr *)memory)->machine = 62;
+        if (field == 2) ((struct ke_ehdr *)memory)->version = 2;
+        assert(ke_open(&io, BASE, &strict, 1) == -ENOEXEC);
+        assert(ke_headers(&io, BASE, &strict) == -ENOEXEC);
+        assert(!ke_open(&io, BASE, &loaded, 0));
     }
 
-    /* The recognized overwrite never relaxes structural/table bounds. */
-    loaded_veneer_fixture();
+    /* Arbitrary metadata, including zero-fill and every possible repeated byte,
+     * has the same provider contract. Verify symbol lookup remains functional. */
+    for (unsigned byte = 0; byte < 256; byte++) {
+        struct ke_sym symbol;
+        u64 address;
+        init_fixture(); set_soname();
+        memset(memory + 8, (int)byte, 16);
+        assert(ke_open(&io, BASE, &strict, 1) == -ENOEXEC);
+        assert(ke_headers(&io, BASE, &strict) == -ENOEXEC);
+        assert(!ke_open(&io, BASE, &loaded, 0));
+        assert(loaded.symcount == 3 && loaded.soname == 13);
+        assert(!ke_string(&io, &loaded, loaded.soname, name) && !strcmp(name, "libdep.so"));
+        assert(ke_lookup(&io, &loaded, "fun", "", 0, &symbol, &address) == 1);
+        assert(address == BASE + 0x4000);
+    }
+    /* Different replacement content must not acquire a hidden signature rule. */
+    for (unsigned byte = 8; byte < 24; byte++) {
+        loaded_rewritten_fixture();
+        memory[byte] ^= 1;
+        assert(!ke_open(&io, BASE, &loaded, 0));
+    }
+
+    /* Metadata tolerance never relaxes structural/table bounds. */
+    loaded_rewritten_fixture();
     ((struct ke_ehdr *)memory)->phnum = 0;
     assert(ke_open(&io, BASE, &loaded, 0));
-    loaded_veneer_fixture();
+    loaded_rewritten_fixture();
     ((struct ke_ehdr *)memory)->phnum = KE_PHNUM + 1;
     assert(ke_open(&io, BASE, &loaded, 0));
-    loaded_veneer_fixture();
+    loaded_rewritten_fixture();
     ((struct ke_ehdr *)memory)->ehsize = 8;
     assert(ke_open(&io, BASE, &loaded, 0));
-    loaded_veneer_fixture();
+    loaded_rewritten_fixture();
     ((struct ke_ehdr *)memory)->phentsize = 8;
     assert(ke_open(&io, BASE, &loaded, 0));
-    loaded_veneer_fixture();
+    loaded_rewritten_fixture();
     ((struct ke_ehdr *)memory)->phoff = 0xffffffffULL;
     assert(ke_open(&io, BASE, &loaded, 0));
-    loaded_veneer_fixture();
+    loaded_rewritten_fixture();
     ((struct ke_phdr *)(memory + 64))[0].memsz = ~0ULL;
     assert(ke_open(&io, BASE, &loaded, 0));
-    loaded_veneer_fixture();
+    loaded_rewritten_fixture();
     ((struct ke_dyn *)(memory + 0x200))[0].val = ~0ULL;
     assert(ke_open(&io, BASE, &loaded, 0));
-    loaded_veneer_fixture();
+    loaded_rewritten_fixture();
     ((u32 *)(memory + 0xa00))[1] = KE_SYMS + 1;
     assert(ke_open(&io, BASE, &loaded, 0));
-    loaded_veneer_fixture();
+    loaded_rewritten_fixture();
     memory[1] = 'X';
     assert(ke_open(&io, BASE, &loaded, 0));
-    puts("loaded headers: strict architecture/type/version, recognized veneer only, bounded tables: PASS");
+    loaded_rewritten_fixture();
+    memory[4] = 1; /* ELF32 cannot be parsed with the ELF64 structures. */
+    assert(ke_open(&io, BASE, &loaded, 0));
+    loaded_rewritten_fixture();
+    memory[5] = 2; /* Big-endian needs a different decoder. */
+    assert(ke_open(&io, BASE, &loaded, 0));
+    puts("loaded headers: arbitrary metadata rewrite, strict payload, bounded tables: PASS");
 }
 int main(int argc, char **argv)
 {

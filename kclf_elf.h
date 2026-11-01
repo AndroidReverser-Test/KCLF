@@ -64,11 +64,11 @@ int ke_contains(const struct ke_object *, u64 address, u64 size, unsigned flags)
 int ke_headers(struct ke_io *, u64 header, struct ke_object *);
 int ke_file_layout(struct ke_io *, struct ke_object *, u64 file_size, u64 page_size);
 /* payload=1: strict ET_DYN/EM_AARCH64/version validation (file or new image).
- * payload=0: a target VMA candidate, not proof of linker provenance.  The same
- * checks apply unless e_ident[8..15] exactly matches the known AArch64
- * ldr x16,#8; br x16 header veneer, whose address overwrites type/machine/
- * version.  Structural fields and every data bound remain mandatory.
- * Symbol/relocation checks are identical in both modes. */
+ * payload=0: structural parsing of a provider candidate in an AArch64 target.
+ * e_ident[8..15], e_type, e_machine and e_version may have been rewritten;
+ * their content is not an identity check or an instruction signature. ELF64/LE
+ * encoding, structural fields and every table/range bound remain mandatory.
+ * This mode does not prove linker provenance or original code architecture. */
 int ke_open(struct ke_io *, u64 header, struct ke_object *, int payload);
 int ke_string(struct ke_io *, const struct ke_object *, u32 offset, char out[KE_NAME]);
 int ke_symbol(struct ke_io *, const struct ke_object *, u32 index, struct ke_sym *);
