@@ -1,4 +1,4 @@
-# KCLF 1.5.6
+# KCLF 1.5.7
 
 Kernel Controlled Loading Framework — Android ARM64 / KernelPatch KPM
 
@@ -11,19 +11,23 @@ KCLF 通过内核 `task_work` 借用目标线程，在 EL0 执行 SO 的构造/�
 `main` 维护框架、构建配置、测试 App 和当前版本兼容性报告；历史报告、检测实验及
 完整主机/设备回归夹具在 `dev`。
 
-### 1.5.6 更新与验证
+### 1.5.7 更新与验证
 
-- manual 提供库表从 64 项按需倍增，最多 4096 项；分配失败或超限明确停止并回滚。
-- 已映射提供库允许非结构性身份字段被任意改写，按 ELF 结构和表边界解析。
-  1.5.5 的固定指令匹配已删除，通用处理同类头覆写；payload 仍严格校验架构和类型。
-- 提供库表分配失败/超限仍回滚；VMA 扫描与结构解析不证明 linker 来源或原始代码架构。
-- 未新增内核 ABI/符号依赖。11 组主机测试通过；Android 13 / Linux 5.15.74 / ARM64 /
-  4K 页上原生 176 项、普通 App 236 项断言通过，包含四种真实 ARM64 提供库自行改写头的用例。
-  其他内核及 16K/64K 页设备未在本轮实测。
+- manual 按 DT_STRSZ 和可读 PT_LOAD 边界读取、完整比较符号名，解除原有 255 字节
+  符号名限制；SONAME、DT_NEEDED 和版本名仍保留该限制。
+- payload 内定义的 compiler-rt emutls 允许使用，但镜像标记 `nodelete=emutls`，
+  必须驻留到目标 mm 退出；首次 `unload` 和显式 `release` 拒绝执行。
+- 未新增内核 ABI/符号依赖，既有 BTF、task_work、procfs/accessor/GUP 回退路径未改。
+  12 组主机测试全部通过；真实设备 BTF 解析回归通过。
+- Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4K 页：正式产物通过 186 项
+  原生及自有普通 App 断言；关闭 BTF/nofault 的独立测试构建通过 243 项断言。
+  两轮均安全卸载且无新增内核告警；其他内核及 16K/64K 页设备未在本轮实测。
+- 1.5.6 的动态提供库表和已映射提供库结构解析保持不变。名称缓冲最多 64 MiB
+  （含 NUL），累计字符串读取预算 256 MiB；超限或分配失败会明确停止并回滚。
 
 实现、审计依据、产物 SHA-256 和证据范围见
-[1.5.6 兼容性报告](COMPATIBILITY_1.5.6.md)；产物见
-[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.5.6)。
+[1.5.7 兼容性报告](COMPATIBILITY_1.5.7.md)；产物见
+[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.5.7)。
 
 ### 编译
 
@@ -120,8 +124,12 @@ linker 在加载后调用 `dlclose` 释放本次引用，实际卸载取决于 l
 `keepelf` 只用于 manual，保留内存 ELF 头。
 `force` 仅跳过安全点启发式。**恢复路径会改写 x16/IP0，必须选择 x16 不再使用的协作边界**；
 系统调用白名单无法证明这一点，也无法证明目标未持有锁。
-manual 要求全部依赖已加载且在 payload 存活期间保持加载，不支持 payload TLS、
+manual 要求全部依赖已加载且在 payload 存活期间保持加载，不支持 ELF PT_TLS、
 完整 C++/JNI loader 集成。详见[实现与限制](IMPLEMENTATION.md)。
+
+`nodelete=emutls` / `nodelete=elf` 镜像在目标 mm 存活期间不能 release；必须先让
+目标进程退出，再 `reap` 并确认 `quiesce=idle`。完全不在 dynsym 中的隐藏 emutls
+无法自动识别，payload 使用方仍需自行保证生命周期安全。
 
 卸载前先 `quiesce`；驻留模式需要通过 `images` / `release` 排空所有引用，
 并先停止 payload 线程和异步回调。再执行：
@@ -148,23 +156,25 @@ the explicit `linker` backend calls the target bionic loader.
 `main` contains the framework, build configuration, test app and current compatibility report.
 Historical reports, detection experiments and full host/device regression fixtures remain on `dev`.
 
-### 1.5.6 changes and validation
+### 1.5.7 changes and validation
 
-- The manual provider table grows from 64 entries to at most 4096. Allocation failure or exhaustion
-  aborts preparation and rolls back instead of resolving against an incomplete candidate set.
-- Mapped providers allow arbitrary rewrites of nonstructural identity fields. The 1.5.5 instruction
-  signature check has been removed; ELF structure and table bounds determine parsing validity.
-  Payload architecture/type validation remains strict.
-- Incomplete provider tables still fail and roll back. VMA discovery and structural parsing do not
-  establish linker provenance or the original architecture of code with overwritten identity.
-- No new kernel ABI or symbol dependency was introduced. All 11 host suites passed. On Android 13 /
-  Linux 5.15.74 / ARM64 / 4K pages, 176 native and 236 ordinary-app assertions passed, including four
-  real AArch64 providers rewriting their own headers. Other kernels and 16K/64K page devices were
-  not tested in this round.
+- Manual loading reads and compares complete symbol names within DT_STRSZ/readable PT_LOAD
+  bounds, removing the 255-byte symbol-name limit. SONAME, DT_NEEDED and version names remain bounded.
+- Payload-defined compiler-rt emutls is supported with `nodelete=emutls`: its image stays mapped
+  until the target mm exits. First-load `unload` and explicit `release` are rejected.
+- No new kernel ABI or symbol dependency; BTF, task_work and procfs/accessor/GUP fallbacks are
+  unchanged. All 12 host suites and a real-device BTF parser regression passed.
+- Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4K: 186 native/self-owned app assertions passed
+  with the release artifact; 243 passed with a separate no-BTF/no-nofault test build. Both runs
+  drained and unloaded safely without new kernel diagnostics. Other kernels and 16K/64K devices
+  were not tested in this round.
+- The 1.5.6 provider table and mapped-provider structural parsing are unchanged. Name storage
+  is capped at 64 MiB including NUL, with a 256 MiB cumulative string-read budget; resource
+  exhaustion explicitly fails and rolls back.
 
-See the [1.5.6 compatibility report](COMPATIBILITY_1.5.6.md) for implementation, audit evidence,
+See the [1.5.7 compatibility report](COMPATIBILITY_1.5.7.md) for implementation, audit evidence,
 artifact SHA-256 and validation limits, and the
-[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.5.6) for downloads.
+[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.5.7) for downloads.
 
 ### Build
 
@@ -280,8 +290,13 @@ does not release those references.
 `force` only bypasses safe-point heuristics. **The restore tail overwrites x16/IP0:
 use a cooperative boundary where x16 is dead.** The syscall allowlist cannot prove
 this or the absence of held locks. Manual loading requires every dependency to
-already be loaded and remain resident; payload TLS and full C++/JNI loader
+already be loaded and remain resident; ELF PT_TLS and full C++/JNI loader
 integration are unsupported. See [implementation and limits](IMPLEMENTATION.md).
+
+Images marked `nodelete=emutls` or `nodelete=elf` cannot be released while their
+target mm is alive. Let the target process exit, then `reap` and confirm
+`quiesce=idle` before unloading the module. Hidden emutls absent from dynsym
+cannot be detected automatically; callers still own payload lifetime safety.
 
 Before unloading, issue `quiesce`. For resident manual images, drain every
 reference using `images` / `release`, after stopping payload threads and callbacks.

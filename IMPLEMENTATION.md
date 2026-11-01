@@ -1,4 +1,4 @@
-# KCLF 1.5.4 实现说明 / Implementation
+# KCLF 1.5.7 实现说明 / Implementation
 
 [中文](#中文) · [English](#english) · [编译与使用 / Build and use](README.md)
 
@@ -125,6 +125,7 @@ ABI 页与私有页没有固定相邻关系。
    预留 1–8 页随机前导 pad 及对齐余量。逐段复制文件内容，BSS 使用匿名页的零填充。
 3. 默认擦除内存 ELF 头；程序头在满足首个页及前缀范围限制时一并清除。
    解析元数据已在内核保存，后续不重新依赖这些头。`keepelf` 用于需自查 ELF 头的 payload。
+   初始化前扫描动态符号表，识别本地 emutls 并设定 NODELETE 生命周期策略。
 4. 扫描目标 VMA，解析有有效 ELF 和 SONAME 的已加载提供库。maps 路径优先可用，
    验证的直接 VMA 遍历为回退；不把框架自己的 manual 镜像隐式当作依赖库。
 5. 根据导入对象的路径，为每条 DT_NEEDED 选择同名 SONAME 的提供库，并按稳定顺序
@@ -150,6 +151,11 @@ ELF 核心通过 `ke_io` 读写回调工作，不依赖内核结构布局或 sec
 支持 SysV/GNU hash、版本符号 VERSYM/VERNEED/VERDEF、函数/数据/绝对符号；
 本地定义优先，未定义符号只在 DT_NEEDED 闭包中按序搜索。未定义弱符号可取零，
 强符号或所需版本未找到则失败。
+
+1.5.7 的符号名按 DT_STRSZ、可读 PT_LOAD 和用户地址上限分块读取，完整比较，
+不截断匹配；名称缓冲在 vmalloc 中按需扩容复用，最多 64 MiB（含 NUL），
+共享字符串读取预算 256 MiB。SONAME、DT_NEEDED 和版本名仍限制为 255 字节。
+所有操作在可睡眠 prepare 中执行；预算/分配失败返回错误并沿既有事务回滚。
 
 | 重定位 | 实际计算 |
 | --- | --- |
@@ -225,6 +231,12 @@ refs > 1 时只减一；最后引用执行析构并解除整段镜像映射。
 对已驻留镜像使用 unload 只是临时借还，不消耗已有引用。
 DF_1_NODELETE 镜像拒绝显式 release 和首次 unload，需目标退出才能排空。
 
+1.5.7 同样将可执行 PT_LOAD 内、由 payload 定义的普通 `__emutls_get_address`
+函数标记为 `nodelete=emutls`。compiler-rt 的 pthread-key 析构函数可能在线程退出时
+再次调用 payload 代码，故镜像一直保留到目标 mm 退出；不能仅凭 refs 释放。
+未定义/跨 DSO emutls、没有可见运行时的控制对象仍拒绝。完全移出 dynsym 的隐藏
+emutls 无法自动识别，调用者仍须保证释放前没有线程析构或其他异步使用。
+
 用户代码已进入但完成结果不可信时，镜像可能标记 abandoned，
 需要进程退出后 reap；不能假定没有后台线程或回调引用。
 借用线程退出而进程其余线程仍在时也可能需要让整个进程退出。
@@ -236,7 +248,7 @@ linker 后端的驻留 handle 由 bionic 管理，`images/release` 不管理它�
 
 ### 11. 能力边界与卸载协议
 
-manual 明确拒绝：PT_TLS/TLS 重定位、emutls、线程析构注册入口、
+manual 明确拒绝：PT_TLS/TLS 重定位、外部或无法验证的 emutls、线程析构注册入口、
 需要解析的 payload 自定义 IFUNC、IRELATIVE、GNU_UNIQUE、REL/textrel、
 PT_INTERP、PT_GNU_PROPERTY、可执行栈、非可读或 W+X 段、共享/重叠 PT_LOAD 页、
 不支持的动态 flags/filter/preinit，以及跨 DSO CFI 导入。
@@ -249,7 +261,7 @@ manual 不插入 soinfo、TLS、debugger 或异常展开登记，不自动调用
 payload 自己调用 API 的限制仍生效。
 
 主要上限：4 请求、32 镜像、64 MiB 文件、256 MiB ELF 跨度/最大对齐、
-64 program headers、每对象 64 NEEDED、512 提供库、128 依赖闭包成员、
+64 program headers、每对象 64 NEEDED、64–4096 按需增长提供库、128 依赖闭包成员、
 50 万动态符号、100 万累计重定位、16 MiB APS2、128 初始化和 128 析构、
 64 IFUNC fixup、8 RELRO 范围、16384 个 VMA 遍历步数。
 调用表和 IFUNC 表还必须共同装入一页 ABI，镜像额外 pad/对齐会增加实际预留长度。
@@ -425,6 +437,7 @@ For a new image:
 3. Scrub the in-memory ELF header by default. Program headers are also cleared
    when their extent fits the first-page/prefix bounds. Kernel metadata is already
    captured. keepelf supports payloads that inspect their own headers.
+   Scan dynsym before initialization to identify local emutls and set NODELETE policy.
 4. Scan VMAs for valid loaded ELF providers with SONAMEs. Prefer maps pathnames,
    with verified direct VMA traversal as fallback. Existing manual images are
    excluded as implicit dependency providers.
@@ -455,6 +468,12 @@ It supports SysV/GNU hash, VERSYM/VERNEED/VERDEF, function/data/absolute symbols
 local definitions before imports, and ordered lookup in the DT_NEEDED closure.
 Missing undefined weak symbols resolve to zero; missing strong symbols or required
 versions fail.
+
+Since 1.5.7, symbol names are read in bounded chunks and compared in full, without
+truncated matches. DT_STRSZ, readable PT_LOAD and user address limits constrain
+reads. A reusable vmalloc name buffer is capped at 64 MiB including NUL, with a
+shared 256 MiB string-read budget. SONAME, DT_NEEDED and versions retain their
+255-byte limit. Work stays in sleepable preparation; resource failures roll back.
 
 | Relocation | Computation |
 | --- | --- |
@@ -541,6 +560,13 @@ transaction. For an existing image, unload temporarily borrows/returns a referen
 without consuming prior refs. DF_1_NODELETE rejects explicit release and first-load
 unload; process exit is needed to drain it.
 
+Version 1.5.7 applies `nodelete=emutls` to a payload-defined ordinary
+`__emutls_get_address` function inside executable PT_LOAD. Its compiler-rt pthread
+key destructor can call payload code when threads exit, so the image stays mapped
+until the target mm exits. Undefined/cross-DSO emutls and controls without a visible
+runtime remain unsupported. Hidden emutls absent from dynsym cannot be identified;
+the caller must still exclude thread destructors and other asynchronous users before release.
+
 After entering user code, an untrusted completion may mark an image abandoned;
 reap can discard it after process exit. Background threads/callbacks may still use
 the code. An execution thread exiting while sibling threads live can require the
@@ -553,7 +579,7 @@ otherwise let the target manage the handle or wait for process exit.
 
 ### 11. Limits and module unload protocol
 
-Manual rejects payload PT_TLS/TLS relocations, emutls, thread-destructor registration,
+Manual rejects payload PT_TLS/TLS relocations, external/unverifiable emutls, thread-destructor registration,
 resolved payload-defined IFUNCs, IRELATIVE, GNU_UNIQUE, REL/textrel, PT_INTERP,
 PT_GNU_PROPERTY, executable stacks, non-readable/W+X segments, overlapping/shared
 PT_LOAD pages, unsupported dynamic flags/filter/preinit, and cross-DSO CFI imports.
@@ -567,7 +593,7 @@ Target credentials, SELinux, seccomp and non-dumpable policy are not automatical
 relaxed; payload API calls retain those restrictions.
 
 Main limits: four requests, 32 images, 64 MiB snapshot, 256 MiB ELF span/alignment,
-64 program headers, 64 NEEDED per object, 512 providers, 128 closure members,
+64 program headers, 64 NEEDED per object, 64–4096 dynamically grown providers, 128 closure members,
 500,000 dynamic symbols, 1,000,000 cumulative relocations, 16 MiB APS2,
 128 initializers and 128 finalizers, 64 IFUNC fixups, eight RELRO ranges and
 16,384 VMA traversal steps. Call vectors and IFUNC metadata must also fit one ABI

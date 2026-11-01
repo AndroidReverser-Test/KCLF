@@ -15,7 +15,7 @@ typedef int64_t s64;
 
 #define KE_PHNUM 64
 #define KE_NEEDED 64
-#define KE_NAME 256
+#define KE_NAME 256 /* bounded SONAME/version/diagnostic buffers, not symbol names */
 #define KE_SYMS 500000
 #define KE_RELOCS 1000000
 #define KE_IMAGE_MAX (256ULL * 1024 * 1024)
@@ -44,6 +44,7 @@ struct ke_io {
     int (*write)(void *, u64, const void *, unsigned long);
     void (*error)(void *, const char *, const char *);
     int (*defer_ifunc)(void *, u64 where, u32 symbol, s64 addend);
+    u64 *string_budget; /* optional shared byte budget for string-table reads */
 };
 
 struct ke_object {
@@ -71,6 +72,12 @@ int ke_file_layout(struct ke_io *, struct ke_object *, u64 file_size, u64 page_s
  * This mode does not prove linker provenance or original code architecture. */
 int ke_open(struct ke_io *, u64 header, struct ke_object *, int payload);
 int ke_string(struct ke_io *, const struct ke_object *, u32 offset, char out[KE_NAME]);
+/* Full symbol names: bounded by DT_STRSZ/readable PT_LOAD, never truncated.
+ * size includes NUL. copy requires capacity >= size; equal validates the entire
+ * table string and returns 1/0/-errno without allocating a candidate buffer. */
+int ke_string_size(struct ke_io *, const struct ke_object *, u32 offset, u64 *size);
+int ke_string_copy(struct ke_io *, const struct ke_object *, u32 offset, char *out, u64 capacity);
+int ke_string_equal(struct ke_io *, const struct ke_object *, u32 offset, const char *expected);
 int ke_symbol(struct ke_io *, const struct ke_object *, u32 index, struct ke_sym *);
 int ke_required_version(struct ke_io *, const struct ke_object *, u32 index, char out[KE_NAME], u32 *hash);
 /* 1 = found; 0 = not found; negative = malformed/unsupported, never silent fallback. */

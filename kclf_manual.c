@@ -24,6 +24,9 @@
 #define KM_CALLS 128
 #define KM_IFUNCS 64
 #define KM_FILE_MAX (64UL * 1024 * 1024)
+#define KM_STRING_BUDGET (256ULL * 1024 * 1024)
+#define KM_NODELETE_ELF 1
+#define KM_NODELETE_EMUTLS 2
 #define KM_FREE 0
 #define KM_BUSY 1
 #define KM_LIVE 2
@@ -62,6 +65,9 @@ struct km_context {
     unsigned long file_size;
     u64 *values;
     u8 *resolved;
+    char *symbol_name; /* full name scratch, reused; never on the kernel stack */
+    unsigned long symbol_name_cap;
+    u64 string_budget;
     u64 fixups[KM_IFUNCS][3];
 };
 
@@ -156,6 +162,11 @@ static int collect(u64 address, const char *path, void *context)
     char name[KE_NAME];
     int own, rc;
     quiet.error = 0;
+    /* Provider discovery keeps the bounded SONAME contract and must not
+     * consume the payload's shared symbol-name budget. A candidate that
+     * cannot yield a bounded SONAME is skipped, as before; this scan is not
+     * the dependency-selection result itself. */
+    quiet.string_budget = 0;
     if (kclf_urds(address, &magic, 4) || magic != 0x464c457fU) return 0;
     own = own_mapping(c->r->mm, address);
     if (own < 0) return own;
@@ -322,18 +333,107 @@ static int add_needed(struct km_context *c, const struct ke_object *o, const cha
     return 0;
 }
 
+static int read_symbol_name(struct km_context *c, u32 index, u32 offset)
+{
+    u64 size;
+    unsigned long capacity;
+    char *grown;
+    int rc = ke_string_size(&c->io, &c->object, offset, &size);
+    if (rc) return rc;
+    /* A payload snapshot is <=64 MiB. Keep auxiliary name storage within the
+     * same existing resource budget, including any malformed BSS string table. */
+    if (size > KM_FILE_MAX) {
+        kclf_set_err(c->r, "manual: symbol %u name size=%llu exceeds 64 MiB", index,
+                     (unsigned long long)size);
+        return -E2BIG;
+    }
+    if (size > c->symbol_name_cap) {
+        capacity = c->symbol_name_cap ? c->symbol_name_cap : KE_NAME;
+        while (capacity < size) capacity *= 2;
+        grown = allocate(capacity);
+        if (!grown) {
+            kclf_set_err(c->r, "manual: symbol %u name allocation failed size=%llu", index,
+                         (unsigned long long)size);
+            return -ENOMEM;
+        }
+        if (c->symbol_name) kclf_ks.vfree(c->symbol_name);
+        c->symbol_name = grown;
+        c->symbol_name_cap = capacity;
+    }
+    /* Copy only the measured size, so concurrent growth fails rather than
+     * silently substituting a name longer than the validated one. */
+    return ke_string_copy(&c->io, &c->object, offset, c->symbol_name, size);
+}
+
+/* compiler-rt emutls uses a pthread key, not an ELF TLS module. Its key's
+ * destructor lives in the payload and may run on any thread long after init.
+ * Keep code, control objects and templates mapped until the owning mm exits;
+ * do not depend on bionic's dlclose-only __emutls_unregister_key callback. */
+static int require_emutls_residency(struct km_context *c, const struct ke_sym *s)
+{
+    const struct ke_object *o = &c->object;
+    unsigned bind = s->info >> 4;
+    if (!s->shndx || s->shndx >= 0xff00 || (s->info & 15) != 2 ||
+        (bind != 0 && bind != 1 && bind != 2)) {
+        report(c, "emutls requires a payload-defined ordinary function", "__emutls_get_address");
+        return -EOPNOTSUPP;
+    }
+    if (o->bias >= c->io.limit || s->value >= c->io.limit - o->bias ||
+        !ke_contains(o, o->bias + s->value, s->size ? s->size : 1, 1)) {
+        report(c, "emutls implementation outside executable PT_LOAD", "");
+        return -ENOEXEC;
+    }
+    if (c->r->flags & KCLF_F_UNLOAD) {
+        report(c, "emutls requires residency until process exit; conflicts with unload", "");
+        return -EOPNOTSUPP;
+    }
+    c->r->image->nodelete |= KM_NODELETE_EMUTLS;
+    return 0;
+}
+
+static int prepare_tls_policy(struct km_context *c)
+{
+    u32 i;
+    int rc, controls = 0;
+    /* Inspect definitions too: a locally bound/direct emutls call need not
+     * have a dynamic relocation referring to __emutls_get_address. */
+    for (i = 1; i < c->object.symcount; i++) {
+        struct ke_sym s;
+        const char *name;
+        if ((rc = ke_symbol(&c->io, &c->object, i, &s))) return rc;
+        if ((rc = read_symbol_name(c, i, s.name))) return rc;
+        name = c->symbol_name;
+        if (!strcmp(name, "__emutls_get_address")) {
+            if ((rc = require_emutls_residency(c, &s))) return rc;
+        } else if (!strncmp(name, "__emutls_v.", 11) || !strncmp(name, "__emutls_t.", 11)) {
+            if (!s.shndx) {
+                report(c, "cross-DSO emutls control/template unsupported", name);
+                return -EOPNOTSUPP;
+            }
+            controls = 1;
+        }
+    }
+    if (controls && !(c->r->image->nodelete & KM_NODELETE_EMUTLS)) {
+        report(c, "emutls controls require a visible payload-defined runtime", "");
+        return -EOPNOTSUPP;
+    }
+    return 0;
+}
+
 static int resolve_import(void *context, u32 index, u64 *value)
 {
     struct km_context *c = context;
     struct ke_object *o = &c->object;
     struct ke_sym s;
-    char name[KE_NAME], version[KE_NAME];
+    char *name, version[KE_NAME];
     u32 hash;
     unsigned i, type;
     int rc;
     if (index >= o->symcount) return -ENOEXEC;
     if (c->resolved[index]) { *value = c->values[index]; return c->resolved[index] == 2 ? 1 : 0; }
-    if (ke_symbol(&c->io, o, index, &s) || ke_string(&c->io, o, s.name, name)) return -ENOEXEC;
+    if ((rc = ke_symbol(&c->io, o, index, &s))) return rc;
+    if ((rc = read_symbol_name(c, index, s.name))) return rc;
+    name = c->symbol_name;
     type = s.info & 15;
     if ((s.info >> 4) == 10 || (type != 0 && type != 1 && type != 2 && type != 10)) {
         report(c, "payload GNU_UNIQUE/TLS/IFUNC symbol unsupported", name);
@@ -342,11 +442,11 @@ static int resolve_import(void *context, u32 index, u64 *value)
     /* These registrations need loader-owned metadata for safe lifetime/CFI.
      * Ordinary malloc/pthread/libc calls are allowed and resolved normally. */
     if (!strcmp(name, "__cxa_thread_atexit_impl") || !strcmp(name, "__cxa_thread_atexit") ||
-        !strcmp(name, "__emutls_get_address") ||
         !strcmp(name, "__cfi_slowpath") || !strcmp(name, "__cfi_slowpath_diag")) {
         report(c, "loader-integrated TLS destructor/cross-DSO CFI unsupported", name);
         return -EOPNOTSUPP;
     }
+    if (!strcmp(name, "__emutls_get_address") && (rc = require_emutls_residency(c, &s))) return rc;
     if (s.shndx) {
         if (type == 10) { report(c, "payload-defined IFUNC/IRELATIVE unsupported", name); return -EOPNOTSUPP; }
         if (s.shndx == 0xfff1) *value = s.value;
@@ -659,7 +759,13 @@ static int reserve_image(struct kclf_req *r)
     if (m) {
         if (m->state != KM_LIVE) { rc = -EOWNERDEAD; goto out; }
         if (r->flags & KCLF_F_RELEASE) {
-            if (m->nodelete) { rc = -EOPNOTSUPP; goto out; }
+            if (m->nodelete) {
+                kclf_set_err(r, "manual: image %llu is NODELETE (%s); resident until the process exits",
+                             (unsigned long long)m->id,
+                             (m->nodelete & KM_NODELETE_EMUTLS) ? "emutls" : "DT_FLAGS_1");
+                rc = -EOPNOTSUPP;
+                goto out;
+            }
             r->image_action = m->refs > 1 ? KM_PUT : KM_DROP;
         } else {
             if (!(r->flags & KCLF_F_UNLOAD) && m->refs == 0xffffffffU) { rc = -EOVERFLOW; goto out; }
@@ -686,7 +792,8 @@ static int reserve_image(struct kclf_req *r)
 out:
     unlock_registry();
     if (owner) kclf_ks.put_pid(owner);
-    if (rc) kclf_set_err(r, "manual: image transaction rejected rc=%d (busy/unknown/abandoned/nodelete)", rc);
+    if (rc && !r->err[0])
+        kclf_set_err(r, "manual: image transaction rejected rc=%d (busy/unknown/abandoned/nodelete)", rc);
     return rc;
 }
 
@@ -718,16 +825,18 @@ long kclf_manual_prepare(struct kclf_req *r)
         return -ENOMEM;
     }
     c->r = r;
-    c->io = (struct ke_io){c, kclf_user_limit, user_read, user_write, report, defer_ifunc};
+    c->string_budget = KM_STRING_BUDGET;
+    c->io = (struct ke_io){c, kclf_user_limit, user_read, user_write, report, defer_ifunc, &c->string_budget};
     if ((rc = read_snapshot(c))) { step = "file snapshot"; goto out; }
     if ((rc = map_image(c))) { step = "ELF mapping"; goto out; }
     if (!(r->flags & KCLF_F_KEEPELF)) {
         if ((rc = scrub_headers(c))) { step = "ELF header scrub"; goto out; }
     }
-    r->image->nodelete = !!(c->object.flags1 & 8);
+    r->image->nodelete = (c->object.flags1 & 8) ? KM_NODELETE_ELF : 0;
     if (r->image->nodelete && (r->flags & KCLF_F_UNLOAD)) {
         report(c, "DT_FLAGS_1 NODELETE conflicts with unload", ""); rc = -EOPNOTSUPP; step = "NODELETE policy"; goto out;
     }
+    if ((rc = prepare_tls_policy(c))) { step = "emutls lifetime policy"; goto out; }
     if ((rc = kclf_walk_vmas(r->param_addr, collect, c))) { step = "target mapping scan"; goto out; }
     r->image->linker_base = r->ld.linker_base;
     r->image->linker_end = r->ld.linker_end;
@@ -760,6 +869,7 @@ long kclf_manual_prepare(struct kclf_req *r)
 out:
     if (rc && !r->err[0]) kclf_set_err(r, "manual: %s failed rc=%d", step, rc);
     if (c->providers) kclf_ks.vfree(c->providers);
+    if (c->symbol_name) kclf_ks.vfree(c->symbol_name);
     if (c->resolved) kclf_ks.vfree(c->resolved);
     if (c->values) kclf_ks.vfree(c->values);
     if (c->snapshot) kclf_ks.vfree(c->snapshot);
@@ -879,12 +989,20 @@ int kclf_manual_status(char *out, int length, unsigned start)
                                   (unsigned long long)m->id, m->original_tid, m->path);
             continue;
         }
-        off += kclf_scnprintf(out + off, length - off, "image=%llu state=%s refs=%u original_tid=%d base=%llx size=%llu hdr=%s path=%s%s\n",
-                             (unsigned long long)m->id, m->state == KM_LIVE ? "live" :
-                             (m->state == KM_BUSY ? "busy" : "abandoned"), m->refs, m->original_tid,
-                             (unsigned long long)m->map, (unsigned long long)m->length,
-                             m->hdr_kept ? "kept" : "scrubbed", m->path,
-                             m->nodelete ? " nodelete" : "");
+        {
+            const char *nodelete = "";
+            if ((m->nodelete & KM_NODELETE_ELF) && (m->nodelete & KM_NODELETE_EMUTLS))
+                nodelete = " nodelete=elf,emutls";
+            else if (m->nodelete & KM_NODELETE_EMUTLS)
+                nodelete = " nodelete=emutls";
+            else if (m->nodelete)
+                nodelete = " nodelete=elf";
+            off += kclf_scnprintf(out + off, length - off, "image=%llu state=%s refs=%u original_tid=%d base=%llx size=%llu hdr=%s path=%s%s\n",
+                                 (unsigned long long)m->id, m->state == KM_LIVE ? "live" :
+                                 (m->state == KM_BUSY ? "busy" : "abandoned"), m->refs, m->original_tid,
+                                 (unsigned long long)m->map, (unsigned long long)m->length,
+                                 m->hdr_kept ? "kept" : "scrubbed", m->path, nodelete);
+        }
     }
     if (!count) off += kclf_scnprintf(out + off, length - off, "no manual images\n");
     unlock_registry();
