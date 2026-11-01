@@ -1,4 +1,4 @@
-# KCLF 1.5.5
+# KCLF 1.5.6
 
 Kernel Controlled Loading Framework — Android ARM64 / KernelPatch KPM
 
@@ -11,18 +11,19 @@ KCLF 通过内核 `task_work` 借用目标线程，在 EL0 执行 SO 的构造/�
 `main` 维护框架、构建配置、测试 App 和当前版本兼容性报告；历史报告、检测实验及
 完整主机/设备回归夹具在 `dev`。
 
-### 1.5.5 更新与验证
+### 1.5.6 更新与验证
 
 - manual 提供库表从 64 项按需倍增，最多 4096 项；分配失败或超限明确停止并回滚。
-- VMA 候选头仅对已知 ARM64 覆写签名使用限定例外；payload 仍严格校验。
-- 审计修复了不完整表误选同名库、错误架构 ELF 被接受这两项回退风险。
+- 已映射提供库允许非结构性身份字段被任意改写，按 ELF 结构和表边界解析。
+  1.5.5 的固定指令匹配已删除，通用处理同类头覆写；payload 仍严格校验架构和类型。
+- 提供库表分配失败/超限仍回滚；VMA 扫描与结构解析不证明 linker 来源或原始代码架构。
 - 未新增内核 ABI/符号依赖。11 组主机测试通过；Android 13 / Linux 5.15.74 / ARM64 /
-  4K 页上原生 148 项、普通 App 236 项断言通过，同源 BTF/nofault 回退构建 34 项通过。
+  4K 页上原生 176 项、普通 App 236 项断言通过，包含四种真实 ARM64 提供库自行改写头的用例。
   其他内核及 16K/64K 页设备未在本轮实测。
 
 实现、审计依据、产物 SHA-256 和证据范围见
-[1.5.5 兼容性报告](COMPATIBILITY_1.5.5.md)；产物见
-[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.5.5)。
+[1.5.6 兼容性报告](COMPATIBILITY_1.5.6.md)；产物见
+[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.5.6)。
 
 ### 编译
 
@@ -147,21 +148,23 @@ the explicit `linker` backend calls the target bionic loader.
 `main` contains the framework, build configuration, test app and current compatibility report.
 Historical reports, detection experiments and full host/device regression fixtures remain on `dev`.
 
-### 1.5.5 changes and validation
+### 1.5.6 changes and validation
 
 - The manual provider table grows from 64 entries to at most 4096. Allocation failure or exhaustion
   aborts preparation and rolls back instead of resolving against an incomplete candidate set.
-- A narrowly recognized ARM64 header overwrite is accepted for VMA candidates. Payload validation
-  remains strict; unrelated corrupt or wrong-architecture headers are rejected.
-- The audit corrected incomplete-table origin selection and wrong-architecture provider acceptance.
+- Mapped providers allow arbitrary rewrites of nonstructural identity fields. The 1.5.5 instruction
+  signature check has been removed; ELF structure and table bounds determine parsing validity.
+  Payload architecture/type validation remains strict.
+- Incomplete provider tables still fail and roll back. VMA discovery and structural parsing do not
+  establish linker provenance or the original architecture of code with overwritten identity.
 - No new kernel ABI or symbol dependency was introduced. All 11 host suites passed. On Android 13 /
-  Linux 5.15.74 / ARM64 / 4K pages, 148 native and 236 ordinary-app assertions passed; a separate
-  same-source build without BTF/nofault passed 34 smoke assertions. Other kernels and 16K/64K page
-  devices were not tested in this round.
+  Linux 5.15.74 / ARM64 / 4K pages, 176 native and 236 ordinary-app assertions passed, including four
+  real AArch64 providers rewriting their own headers. Other kernels and 16K/64K page devices were
+  not tested in this round.
 
-See the [1.5.5 compatibility report](COMPATIBILITY_1.5.5.md) for implementation, audit evidence,
+See the [1.5.6 compatibility report](COMPATIBILITY_1.5.6.md) for implementation, audit evidence,
 artifact SHA-256 and validation limits, and the
-[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.5.5) for downloads.
+[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.5.6) for downloads.
 
 ### Build
 
