@@ -71,7 +71,13 @@ static int ke_headers_impl(struct ke_io *io, u64 header, struct ke_object *o, in
         struct ke_phdr *p = &o->ph[i];
         if (p->vaddr >= io->limit || p->memsz > io->limit - p->vaddr || p->filesz > p->memsz)
             return fail(io, -ENOEXEC, "invalid program-header size");
-        if (p->type == 7) o->tls = 1;
+        if (p->type == 7) {
+            if (!loaded && (o->tls || p->memsz > KE_IMAGE_MAX || p->align > KE_IMAGE_MAX ||
+                (p->align > 1 && (p->align & (p->align - 1)))))
+                return fail(io, -ENOEXEC, "invalid/duplicate PT_TLS segment");
+            o->tls = 1;
+            o->tls_index = (u16)i;
+        }
         if (p->type != 1 || !p->memsz) continue;
         if (p->align > 1 && ((p->align & (p->align - 1)) || (p->offset % p->align != p->vaddr % p->align)))
             return fail(io, -ENOEXEC, "invalid PT_LOAD alignment");
@@ -94,12 +100,29 @@ int ke_file_layout(struct ke_io *io, struct ke_object *o, u64 size, u64 page)
     unsigned i, j;
     int header = 0;
     if (!page || (page & (page - 1))) return -EINVAL;
-    if (o->tls) return fail(io, -EOPNOTSUPP, "payload PT_TLS is not supported");
     for (i = 0; i < o->phnum; i++) {
         const struct ke_phdr *p = &o->ph[i];
         u64 first, last;
         if (p->offset > size || p->filesz > size - p->offset)
             return fail(io, -ENOEXEC, "program header exceeds file snapshot");
+        if (p->type == 7) {
+            u64 align = p->align > 1 ? p->align : 1;
+            int mapped = !p->filesz;
+            if (p->memsz > KE_IMAGE_MAX - 16 || align > KE_IMAGE_MAX - 16 - p->memsz)
+                return fail(io, -E2BIG, "per-thread TLS allocation exceeds limit");
+            /* .tbss need not occupy PT_LOAD memory, but the initialized
+             * template must identify the same file bytes in a readable load.
+             * We copy it after relocation, just like a normal ELF loader. */
+            for (j = 0; j < o->phnum && !mapped; j++) {
+                const struct ke_phdr *q = &o->ph[j];
+                if (q->type == 1 && (q->flags & 4) && p->vaddr >= q->vaddr &&
+                    p->vaddr - q->vaddr <= q->filesz &&
+                    p->filesz <= q->filesz - (p->vaddr - q->vaddr) &&
+                    p->offset >= q->offset && p->offset - q->offset == p->vaddr - q->vaddr)
+                    mapped = 1;
+            }
+            if (!mapped) return fail(io, -ENOEXEC, "PT_TLS template outside matching readable PT_LOAD");
+        }
         if (p->type == 0x6474e553U) {
             /* GNU properties can require BTI, PAC or other ABI handling. Do
              * not silently execute an image with an unimplemented contract. */
@@ -257,7 +280,6 @@ int ke_open(struct ke_io *io, u64 header, struct ke_object *o, int payload)
     }
     if (!bases || o->high >= io->limit || o->bias >= io->limit - o->high || !dynsz ||
         dynsz / sizeof(struct ke_dyn) > 4096 || !ke_contains(o, o->bias + dyn, dynsz, 4)) return -ENOEXEC;
-    if (payload && o->tls) return fail(io, -EOPNOTSUPP, "payload PT_TLS is not supported");
     for (i = 0; i < dynsz / sizeof(struct ke_dyn); i++) {
         struct ke_dyn d;
         if (objrd(io, o, o->bias + dyn + i * sizeof(d), &d, sizeof(d))) return -ENOEXEC;
@@ -453,6 +475,34 @@ int ke_lookup(struct ke_io *io, const struct ke_object *o, const char *name, con
     return 0;
 }
 
+static int relocate_tlsdesc(struct ke_io *io, const struct ke_object *o, const struct ke_rela *r, u64 at)
+{
+    u32 index = r->info >> 32;
+    u64 offset = 0, size;
+    struct ke_sym symbol;
+    if (!ke_contains(o, at, 16, 2))
+        return fail(io, -ENOEXEC, "TLSDESC target outside writable PT_LOAD");
+    if (!o->tls || !io->tlsdesc)
+        return fail(io, -EOPNOTSUPP, "TLSDESC requires local PT_TLS runtime");
+    size = o->ph[o->tls_index].memsz;
+    if (index) {
+        if (ke_symbol(io, o, index, &symbol)) return -ENOEXEC;
+        if ((symbol.info & 15) != 6 || (symbol.info >> 4) > 2 ||
+            !symbol.shndx || symbol.shndx >= 0xff00)
+            return fail(io, -EOPNOTSUPP, "TLSDESC requires a payload-defined TLS symbol");
+        if (symbol.value >= size || symbol.size > size - symbol.value)
+            return fail(io, -ENOEXEC, "TLS symbol outside PT_TLS");
+        offset = symbol.value;
+    }
+    /* Validate the signed addend before the modular addition can wrap. */
+    if ((r->addend < 0 && 0ULL - (u64)r->addend > offset) ||
+        (r->addend >= 0 && (u64)r->addend > ~0ULL - offset))
+        return fail(io, -ENOEXEC, "TLSDESC addend out of bounds");
+    offset += (u64)r->addend;
+    if (offset >= size) return fail(io, -ENOEXEC, "TLSDESC offset outside PT_TLS");
+    return io->tlsdesc(io->ctx, at, offset);
+}
+
 static int relocate_one(struct ke_io *io, const struct ke_object *o, const struct ke_rela *r,
                         ke_resolve_fn resolve, void *ctx)
 {
@@ -464,6 +514,8 @@ static int relocate_one(struct ke_io *io, const struct ke_object *o, const struc
     at = o->bias + r->offset;
     if ((at & 7) || !ke_contains(o, at, 8, 2)) return fail(io, -ENOEXEC, "relocation target outside writable PT_LOAD");
     switch (type) {
+    case 1031: /* R_AARCH64_TLSDESC */
+        return relocate_tlsdesc(io, o, r, at);
     case 1027: /* R_AARCH64_RELATIVE */
         if (sym) return -ENOEXEC;
         value = o->bias;

@@ -43,6 +43,27 @@ static int kclf_maps_range(const char *line, uint64_t limit, uint64_t *start, ui
     return 0;
 }
 
+/* Decode the permission field of a maps line. Bits match mmap PROT_* flags:
+ * 1 = readable, 2 = writable, 4 = executable.  Returns -1 on a malformed
+ * prefix, otherwise 0. */
+static int kclf_maps_prot(const char *line, int *prot)
+{
+    int value = 0;
+
+    while (*line && *line != ' ') line++;
+    while (*line == ' ') line++;
+    if (line[0] != 'r' && line[0] != '-') return -1;
+    if (line[1] != 'w' && line[1] != '-') return -1;
+    if (line[2] != 'x' && line[2] != '-') return -1;
+    if (line[3] != 'p' && line[3] != 's') return -1;
+    if (line[4] != ' ') return -1;
+    if (line[0] == 'r') value |= 1;
+    if (line[1] == 'w') value |= 2;
+    if (line[2] == 'x') value |= 4;
+    *prot = value;
+    return 0;
+}
+
 /* Extract the optional pathname from a maps line:
  *   start-end perms offset dev inode [pathname]
  * Anonymous mappings have no pathname. The result is always NUL-terminated and

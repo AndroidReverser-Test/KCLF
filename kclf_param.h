@@ -37,6 +37,8 @@
 #define KCLF_P_IFUNCV 0x178 /* resolver, destination, addend triples */
 #define KCLF_P_IFUNCN 0x180
 #define KCLF_P_IFARG 0x188 /* AArch64 __ifunc_arg_t: size, hwcap, hwcap2 */
+#define KCLF_P_TLS_INIT 0x1a0 /* optional manual TLS initialization function */
+#define KCLF_P_TLS_ARG 0x1a8 /* persistent TLS runtime state */
 #define KCLF_P_SIZE 0x1c0
 
 #define KCLF_PATH_MAX 256

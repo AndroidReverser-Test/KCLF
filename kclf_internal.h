@@ -33,10 +33,11 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.5.7"
+#define KCLF_VER "1.6.0"
 
 #define KCLF_MAX_REQ 4
 #define KCLF_MAX_IMAGES 32
+#define KCLF_MAX_VMA 16384
 #define KCLF_CLEANUP_RETRIES 8
 /* GNU_RELRO ranges whose protection is applied from the kernel once the EL0
  * phase finished (IFUNC results must be written before they turn read-only). */
@@ -151,6 +152,7 @@ struct kclf_req
     u32 ifunc_count, protect_count;
     u32 image_hdr_kept; /* the resident manual image kept its ELF headers */
     u64 hwcap, hwcap2;
+    u64 tls_init, tls_arg;
 
     /* saved context */
     struct kclf_regs saved;
@@ -265,6 +267,8 @@ int kclf_urd(u64 addr, void *buf, int len);
 int kclf_urds(u64 addr, void *buf, int len);
 int kclf_uwr(u64 addr, const void *buf, int len);
 int kclf_walk_vmas(u64 scratch, int (*visit)(u64, const char *, void *), void *context);
+struct kclf_vm_range { u64 start, end; int prot; };
+int kclf_snapshot_vmas(u64 scratch, struct kclf_vm_range *ranges, unsigned capacity);
 /* 0 only when the process identity disappeared or demonstrably exec'd. */
 int kclf_process_mm_alive(struct pid *pid, u64 mm);
 

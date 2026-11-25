@@ -377,7 +377,7 @@ try {
         $DmesgAfter = Root 'dmesg'
         $DmesgAfter | Set-Content -LiteralPath (Join-Path $Results 'dmesg-after.txt') -Encoding utf8
         $NewFaults = @($DmesgAfter -split "`n" | Where-Object {
-            $_ -match 'BUG:|WARNING:|Oops:|Kernel panic' -and -not $DmesgBefore.Contains($_)
+            $_ -match '\b(?:BUG:|BUG at|WARNING:|Oops:|Kernel panic)' -and -not $DmesgBefore.Contains($_)
         })
         Check ($NewFaults.Count -eq 0) 'no new retained kernel BUG/WARNING/Oops/panic'
         $CrashAfter = (Invoke-Adb @('logcat', '-b', 'main', '-b', 'crash', '-d',

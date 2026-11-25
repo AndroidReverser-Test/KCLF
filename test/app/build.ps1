@@ -99,6 +99,9 @@ Run $Clang @('-Wall', '-Wextra', '-Werror', '-O2', '-shared', '-fPIC', '-DKCLF_A
     '-Wl,-z,max-page-size=16384', (Join-Path $PSScriptRoot 'jni\payload.c'), '-o', (Join-Path $Work 'obj\libkclfapp_hold.so')) 'hold payload clang'
 
 $KeyStore = Join-Path $OutDir 'debug.keystore'
+Run $Clang @('-Wall', '-Wextra', '-Werror', '-O2', '-shared', '-fPIC',
+    '-fno-emulated-tls', '-DKCLF_TLS_APP', '-Wl,-z,max-page-size=16384',
+    (Join-Path $PSScriptRoot '..\tls\payload.c'), '-o', (Join-Path $Work 'obj\libkclfapp_tls.so')) 'TLS payload clang'
 $LegacyKeyStore = Join-Path $OutDir 'work\debug.keystore'
 if (-not (Test-Path -LiteralPath $KeyStore)) {
     if (Test-Path -LiteralPath $LegacyKeyStore) {
@@ -125,6 +128,7 @@ try {
         @('lib/arm64-v8a/libkclfhost.so', (Join-Path $Work 'obj\libkclfhost.so')),
         @('lib/arm64-v8a/libkclfapp_fp.so', (Join-Path $Work 'obj\libkclfapp_fp.so')),
         @('lib/arm64-v8a/libkclfapp_hold.so', (Join-Path $Work 'obj\libkclfapp_hold.so')),
+        @('lib/arm64-v8a/libkclfapp_tls.so', (Join-Path $Work 'obj\libkclfapp_tls.so')),
         @('lib/arm64-v8a/libkclfapp_payload.so', (Join-Path $Work 'obj\libkclfapp_payload.so')))) {
         $Entry = $Zip.CreateEntry($Pair[0], [System.IO.Compression.CompressionLevel]::Optimal)
         $In = [System.IO.File]::OpenRead($Pair[1])

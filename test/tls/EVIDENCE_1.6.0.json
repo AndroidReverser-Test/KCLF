@@ -1,0 +1,19 @@
+{
+  "version": "1.6.0",
+  "date": "2026-11-24/25 Asia/Shanghai",
+  "device": "Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4096-byte pages",
+  "host_suites": 14,
+  "release_device_assertions": 548,
+  "fallback_device_assertions": 361,
+  "kpm_sha256": "b2b8e8e451425552ddf6e6c9fdc8a03222d466211ddeb3289ffbcd5d66e233b7",
+  "local_evidence_sha256": {
+    "build/kclf-tls-260eee679fc9/results.json": "b1beab6867e3dc6527f8ec5313f12e02dc9e2c6f99a407100ca0a493e7e4d911",
+    "build/kclf-app-1f9e92a77eb2/results.txt": "391f199e53ee9505993d04729d1eb7c809b5d5fc7d0ac7579eb96c4d77466c18",
+    "build/kclf-app-9295d4848c06/results.txt": "367331cd16cdaedcfc3e8cf461fcd07ca9d98f5c3d0cf2f231c692b3d4571e63",
+    "build/kclf-tls-1e2cbcaa2964/results.json": "57131b5de92a85f5c8c9652fe5a86e7561f270ddc9f00505e182bdb9f0c9a905",
+    "build/kclf-app-e8a192a241df/results.txt": "ae644d545939b0935c1ab13fe265c65c26b67dd8b46ef1359178516d3c644dc1",
+    "build/audit-1.6.0/host.log": "6e77bc2ff26cc99be1252d64fddd98f58393025e7935a90265494fced37db6d9",
+    "build/audit-1.6.0/real-btf.log": "86019f45c7c27586952c8440ab67158f2dd591a8bc6c90d102c6f05f592a8430",
+    "build/audit-1.6.0/runtime-final.log": "3674dc99e5368639e7df86f418bf2da4b76162b4a07bf8143c5cf7ba718ccf5b"
+  }
+}

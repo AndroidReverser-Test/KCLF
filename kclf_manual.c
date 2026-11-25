@@ -5,6 +5,7 @@
  * reconstruction of bionic namespace/global interposition state. */
 #include "kclf_internal.h"
 #include "kclf_elf.h"
+#include "kclf_tls.h"
 #include <kputils.h>
 #include <linux/string.h>
 #include <linux/kernel.h>
@@ -27,6 +28,7 @@
 #define KM_STRING_BUDGET (256ULL * 1024 * 1024)
 #define KM_NODELETE_ELF 1
 #define KM_NODELETE_EMUTLS 2
+#define KM_NODELETE_TLS 4
 #define KM_FREE 0
 #define KM_BUSY 1
 #define KM_LIVE 2
@@ -40,6 +42,7 @@ struct kclf_manual_image {
     int state;
     u32 refs, nfini;
     u64 id, mm, map, length, bias;
+    u64 tls_map, tls_length;
     struct pid *owner; /* process (TGID), not the borrowed execution thread */
     char path[KCLF_PATH_MAX];
     u64 fini[KM_CALLS];
@@ -54,6 +57,7 @@ struct km_provider {
     char name[KE_NAME]; /* DT_SONAME */
     char path[KCLF_PATH_MAX]; /* maps pathname: namespace/load-origin evidence */
 };
+struct km_tls_fixup { u64 where, offset; };
 struct km_context {
     struct kclf_req *r;
     struct ke_io io;
@@ -69,6 +73,10 @@ struct km_context {
     unsigned long symbol_name_cap;
     u64 string_budget;
     u64 fixups[KM_IFUNCS][3];
+    struct km_tls_fixup *tls_fixups;
+    unsigned ntls, tls_cap;
+    struct kclf_vm_range *ranges;
+    unsigned nranges;
 };
 
 static struct kclf_manual_image images[KM_IMAGES];
@@ -119,7 +127,9 @@ static int own_mapping(u64 mm, u64 address)
     if (!lock_registry()) return -EBUSY;
     for (i = 0; i < KM_IMAGES; i++) {
         const struct kclf_manual_image *m = &images[i];
-        if (m->state && m->mm == mm && address >= m->map && address - m->map < m->length) { found = 1; break; }
+        if (m->state && m->mm == mm &&
+            ((address >= m->map && address - m->map < m->length) ||
+             (address >= m->tls_map && address - m->tls_map < m->tls_length))) { found = 1; break; }
     }
     unlock_registry();
     return found;
@@ -151,6 +161,39 @@ static int provider_reserve(struct km_context *c, unsigned need)
     return 0;
 }
 
+/* A protected app can keep an extra read-only mmap of the same ELF file (for
+ * integrity scanning) in addition to the loader's real mapping.  Both parse as
+ * the same SONAME/path, but the private copy has no executable segment and
+ * resolving a provider function through it would branch into non-executable
+ * memory. Check complete executable PT_LOAD ranges with a binary search in
+ * the cached maps snapshot. With the direct fallback, permissions are unknown
+ * and the previous acceptance is retained; this is not a loader lock. */
+static int provider_exec_mapped(struct km_context *c, const struct ke_object *o)
+{
+    unsigned i;
+    for (i = 0; i < o->phnum; i++) {
+        const struct ke_phdr *p = &o->ph[i];
+        u64 address, end;
+        unsigned lo = 0, hi = c->nranges;
+        if (p->type != 1 || !(p->flags & 1) || !p->memsz) continue;
+        address = o->bias + p->vaddr;
+        end = address + p->memsz;
+        while (lo < hi) {
+            unsigned mid = lo + (hi - lo) / 2;
+            if (c->ranges[mid].end <= address) lo = mid + 1;
+            else hi = mid;
+        }
+        while (address < end) {
+            const struct kclf_vm_range *v;
+            if (lo == c->nranges) return 0;
+            v = &c->ranges[lo++];
+            if (v->start > address || (v->prot >= 0 && !(v->prot & 4))) return 0;
+            address = v->end;
+        }
+    }
+    return 1;
+}
+
 static int collect(u64 address, const char *path, void *context)
 {
     struct km_context *c = context;
@@ -171,7 +214,8 @@ static int collect(u64 address, const char *path, void *context)
     own = own_mapping(c->r->mm, address);
     if (own < 0) return own;
     if (own) return 0; /* manual modules are not implicitly dependency providers */
-    if (ke_open(&quiet, address, o, 0) || !o->soname || ke_string(&quiet, o, o->soname, name)) return 0;
+    if (ke_open(&quiet, address, o, 0) || !o->soname || ke_string(&quiet, o, o->soname, name) ||
+        !provider_exec_mapped(c, o)) return 0;
     for (i = 0; i < c->nproviders; i++) if (c->providers[i].object.bias == o->bias) return 0;
     if (c->nproviders == c->provider_cap) {
         if ((rc = provider_reserve(c, c->nproviders + 1))) {
@@ -395,6 +439,13 @@ static int prepare_tls_policy(struct km_context *c)
 {
     u32 i;
     int rc, controls = 0;
+    if (c->object.tls) {
+        if (c->r->flags & KCLF_F_UNLOAD) {
+            report(c, "ELF TLS requires residency until process exit; conflicts with unload", "");
+            return -EOPNOTSUPP;
+        }
+        c->r->image->nodelete |= KM_NODELETE_TLS;
+    }
     /* Inspect definitions too: a locally bound/direct emutls call need not
      * have a dynamic relocation referring to __emutls_get_address. */
     for (i = 1; i < c->object.symcount; i++) {
@@ -497,11 +548,116 @@ static int defer_ifunc(void *context, u64 where, u32 index, s64 addend)
         report(c, "IFUNC initializer/finalizer pointer unsupported", "");
         return -EOPNOTSUPP;
     }
+    if (o->tls) {
+        const struct ke_phdr *tls = &o->ph[o->tls_index];
+        u64 first = o->bias + tls->vaddr;
+        if (tls->filesz && where < first + tls->filesz && where + 8 > first) {
+            report(c, "deferred IFUNC in TLS template unsupported", "");
+            return -EOPNOTSUPP;
+        }
+    }
     if (n == KM_IFUNCS) { report(c, "too many IFUNC fixups", ""); return -E2BIG; }
     c->fixups[n][0] = c->values[index];
     c->fixups[n][1] = where;
     c->fixups[n][2] = (u64)addend;
     c->r->ifunc_count++;
+    return 0;
+}
+
+static int defer_tlsdesc(void *context, u64 where, u64 offset)
+{
+    struct km_context *c = context;
+    if (c->ntls == c->tls_cap) {
+        unsigned cap = c->tls_cap ? c->tls_cap * 2 : 16;
+        struct km_tls_fixup *grown;
+        if (c->ntls == KE_RELOCS) return -E2BIG;
+        if (cap > KE_RELOCS) cap = KE_RELOCS;
+        grown = allocate((unsigned long)cap * sizeof(*grown));
+        if (!grown) return -ENOMEM;
+        if (c->tls_fixups) {
+            memcpy(grown, c->tls_fixups, c->ntls * sizeof(*grown));
+            kclf_ks.vfree(c->tls_fixups);
+        }
+        c->tls_fixups = grown;
+        c->tls_cap = cap;
+    }
+    c->tls_fixups[c->ntls++] = (struct km_tls_fixup){where, offset};
+    return 0;
+}
+
+static int prepare_tls_runtime(struct km_context *c)
+{
+    static const char *const names[] = {
+        "pthread_key_create", "pthread_getspecific", "pthread_setspecific", "abort"
+    };
+    struct kclf_req *r = c->r;
+    struct kclf_manual_image *m = r->image;
+    const struct ke_phdr *tls;
+    const struct ke_object *libc;
+    u64 state[KT_SIZE / 8];
+    u64 page = kclf_page_size, length, base, args, template;
+    unsigned long code_size = (unsigned long)(kclf_tls_end - kclf_tls_start);
+    unsigned i;
+    int index, rc;
+    if (!c->object.tls) return 0;
+    memset(state, 0, sizeof(state));
+    tls = &c->object.ph[c->object.tls_index];
+    if (!code_size || code_size > page) return -E2BIG;
+    index = select_provider(c, r->path, "libc.so");
+    if (index < 0) return index;
+    libc = &c->providers[index].object;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        struct ke_sym s;
+        u64 value;
+        rc = ke_lookup(&c->io, libc, names[i], "", 0, &s, &value);
+        if (rc < 0) return rc;
+        if (!rc || (s.info & 15) != 2 || (value & 3)) {
+            report(c, "TLS runtime requires an ordinary libc function", names[i]);
+            return -EOPNOTSUPP;
+        }
+        state[KT_KEY_CREATE / 8 + i] = value;
+    }
+    /* One RX code page followed by state, descriptor arguments and a template.
+     * The metadata becomes read-only through the normal completion RELRO pass.
+     * Its mapping is owned by the image before any fallible copy/protection. */
+    length = (page + KT_SIZE + (u64)c->ntls * 16 + tls->filesz + page - 1) & ~(page - 1);
+    base = kclf_ks.vm_mmap(0, 0, length, 3, 0x22, 0);
+    if (!base || base >= (u64)-4095) return base ? (int)(long)base : -ENOMEM;
+    m->tls_map = base;
+    m->tls_length = length;
+    if (base >= c->io.limit || length > c->io.limit - base) return -EFAULT;
+    args = base + page + KT_SIZE;
+    template = args + (u64)c->ntls * 16;
+    state[KT_MEMSZ / 8] = tls->memsz;
+    state[KT_FILESZ / 8] = tls->filesz;
+    state[KT_ALIGN / 8] = tls->align > 1 ? tls->align : 1;
+    state[KT_FIRSTBYTE / 8] = tls->vaddr & (state[KT_ALIGN / 8] - 1);
+    state[KT_TEMPLATE / 8] = template;
+    if (kclf_uwr(base, kclf_tls_start, (int)code_size) ||
+        kclf_uwr(base + page, state, sizeof(state))) return -EFAULT;
+    for (i = 0; i < c->ntls; i++) {
+        u64 argument[2] = {base + page, c->tls_fixups[i].offset};
+        u64 descriptor[2] = {base + (u64)(kclf_tls_resolve - kclf_tls_start), args + (u64)i * 16};
+        if (kclf_uwr(descriptor[1], argument, sizeof(argument)) ||
+            kclf_uwr(c->tls_fixups[i].where, descriptor, sizeof(descriptor))) return -EFAULT;
+    }
+    /* Relocations in .tdata (e.g. a pointer to a global) must be reflected in
+     * every thread's initial value. The raw file snapshot contains stale
+     * addresses. Deferred IFUNC writes into this template are rejected. */
+    for (u64 off = 0; off < tls->filesz;) {
+        u8 chunk[256];
+        int n = tls->filesz - off > sizeof(chunk) ? (int)sizeof(chunk) : (int)(tls->filesz - off);
+        if (kclf_urds(c->object.bias + tls->vaddr + off, chunk, n) ||
+            kclf_uwr(template + off, chunk, n)) return -EFAULT;
+        off += (u64)n;
+    }
+    rc = (int)raw_syscall3(__NR_mprotect, base, page, 5);
+    if (rc) return rc;
+    if (r->relro_count == KCLF_MAX_RELRO) return -E2BIG;
+    r->relro[r->relro_count][0] = base + page;
+    r->relro[r->relro_count++][1] = length - page;
+    r->tls_init = base + (u64)(kclf_tls_init - kclf_tls_start);
+    r->tls_arg = base + page;
     return 0;
 }
 
@@ -672,12 +828,29 @@ static int protect_image(struct km_context *c)
      */
     for (i = 0; i < o->phnum; i++) {
         const struct ke_phdr *p = &o->ph[i];
-        u64 first, end;
+        u64 start, stop, first, end;
+        unsigned j;
+        int contained = 0;
         if (p->type != 0x6474e552U || !p->memsz) continue;
-        if (!ke_contains(o, o->bias + p->vaddr, p->memsz, 2)) return -ENOEXEC;
+        start = o->bias + p->vaddr;
+        stop = start + p->memsz;
+        /* Linkers round GNU_RELRO's in-memory size up to a page boundary, so
+         * its tail can extend past the last writable PT_LOAD's p_memsz into
+         * the same final page.  That page is already covered by the load's
+         * page-rounded mapping; accept the range only when both its start and
+         * page-rounded end stay inside one writable load's page extent. */
+        for (j = 0; j < o->phnum; j++) {
+            const struct ke_phdr *q = &o->ph[j];
+            u64 qfirst, qend;
+            if (q->type != 1 || !q->memsz || !(q->flags & 2)) continue;
+            qfirst = (o->bias + q->vaddr) & ~(page - 1);
+            qend = (o->bias + q->vaddr + q->memsz + page - 1) & ~(page - 1);
+            if (start >= qfirst && stop <= qend) { contained = 1; break; }
+        }
+        if (!contained) return -ENOEXEC;
         if (c->r->relro_count == KCLF_MAX_RELRO) return -E2BIG;
-        first = (o->bias + p->vaddr) & ~(page - 1);
-        end = (o->bias + p->vaddr + p->memsz + page - 1) & ~(page - 1);
+        first = start & ~(page - 1);
+        end = (stop + page - 1) & ~(page - 1);
         c->r->relro[c->r->relro_count][0] = first;
         c->r->relro[c->r->relro_count][1] = end - first;
         c->r->relro_count++;
@@ -711,8 +884,8 @@ static int protect_image(struct km_context *c)
 
 /*
  * The manual loader has already consumed the ELF and program headers, and this
- * backend rejects payload TLS/IFUNC/exceptions and never registers the image
- * with the linker, so nothing re-reads them at runtime.  A byte-identical ELF
+ * backend snapshots TLS metadata, rejects payload IFUNC/exceptions and never
+ * registers the image with the linker. A byte-identical ELF
  * header left in target memory is exactly what a known-payload detector anchors
  * on, so drop it.  "keepelf" keeps the legacy layout for payloads that inspect
  * their own __ehdr_start.
@@ -762,7 +935,8 @@ static int reserve_image(struct kclf_req *r)
             if (m->nodelete) {
                 kclf_set_err(r, "manual: image %llu is NODELETE (%s); resident until the process exits",
                              (unsigned long long)m->id,
-                             (m->nodelete & KM_NODELETE_EMUTLS) ? "emutls" : "DT_FLAGS_1");
+                             (m->nodelete & KM_NODELETE_TLS) ? "ELF TLS" :
+                             ((m->nodelete & KM_NODELETE_EMUTLS) ? "emutls" : "DT_FLAGS_1"));
                 rc = -EOPNOTSUPP;
                 goto out;
             }
@@ -826,7 +1000,8 @@ long kclf_manual_prepare(struct kclf_req *r)
     }
     c->r = r;
     c->string_budget = KM_STRING_BUDGET;
-    c->io = (struct ke_io){c, kclf_user_limit, user_read, user_write, report, defer_ifunc, &c->string_budget};
+    c->io = (struct ke_io){c, kclf_user_limit, user_read, user_write, report,
+                         defer_ifunc, &c->string_budget, defer_tlsdesc};
     if ((rc = read_snapshot(c))) { step = "file snapshot"; goto out; }
     if ((rc = map_image(c))) { step = "ELF mapping"; goto out; }
     if (!(r->flags & KCLF_F_KEEPELF)) {
@@ -836,7 +1011,12 @@ long kclf_manual_prepare(struct kclf_req *r)
     if (r->image->nodelete && (r->flags & KCLF_F_UNLOAD)) {
         report(c, "DT_FLAGS_1 NODELETE conflicts with unload", ""); rc = -EOPNOTSUPP; step = "NODELETE policy"; goto out;
     }
-    if ((rc = prepare_tls_policy(c))) { step = "emutls lifetime policy"; goto out; }
+    if ((rc = prepare_tls_policy(c))) { step = "TLS lifetime policy"; goto out; }
+    c->ranges = allocate(KCLF_MAX_VMA * sizeof(*c->ranges));
+    if (!c->ranges) { rc = -ENOMEM; step = "mapping permission allocation"; goto out; }
+    rc = kclf_snapshot_vmas(r->param_addr, c->ranges, KCLF_MAX_VMA);
+    if (rc < 0) { step = "mapping permission snapshot"; goto out; }
+    c->nranges = (unsigned)rc;
     if ((rc = kclf_walk_vmas(r->param_addr, collect, c))) { step = "target mapping scan"; goto out; }
     r->image->linker_base = r->ld.linker_base;
     r->image->linker_end = r->ld.linker_end;
@@ -851,6 +1031,7 @@ long kclf_manual_prepare(struct kclf_req *r)
     c->resolved = allocate(c->object.symcount);
     if (!c->values || !c->resolved) { rc = -ENOMEM; step = "relocation table allocation"; goto out; }
     if ((rc = ke_relocate(&c->io, &c->object, resolve_import, c))) { step = "symbol resolution/relocation"; goto out; }
+    if ((rc = prepare_tls_runtime(c))) { step = "TLS runtime preparation"; goto out; }
     if (r->ifunc_count && (rc = read_hwcap(c))) { step = "IFUNC HWCAP read"; goto out; }
     if ((rc = prepare_calls(c))) { step = "initializer/finalizer validation"; goto out; }
     if ((rc = protect_image(c))) { step = "segment protection/RELRO"; goto out; }
@@ -869,6 +1050,8 @@ long kclf_manual_prepare(struct kclf_req *r)
 out:
     if (rc && !r->err[0]) kclf_set_err(r, "manual: %s failed rc=%d", step, rc);
     if (c->providers) kclf_ks.vfree(c->providers);
+    if (c->ranges) kclf_ks.vfree(c->ranges);
+    if (c->tls_fixups) kclf_ks.vfree(c->tls_fixups);
     if (c->symbol_name) kclf_ks.vfree(c->symbol_name);
     if (c->resolved) kclf_ks.vfree(c->resolved);
     if (c->values) kclf_ks.vfree(c->values);
@@ -890,6 +1073,8 @@ void kclf_manual_params(struct kclf_req *r, u8 *p)
     *(u64 *)(p + KCLF_P_IFARG) = 24;
     *(u64 *)(p + KCLF_P_IFARG + 8) = r->hwcap;
     *(u64 *)(p + KCLF_P_IFARG + 16) = r->hwcap2;
+    *(u64 *)(p + KCLF_P_TLS_INIT) = r->tls_init;
+    *(u64 *)(p + KCLF_P_TLS_ARG) = r->tls_arg;
 }
 
 long kclf_manual_finish(struct kclf_req *r)
@@ -909,6 +1094,11 @@ long kclf_manual_finish(struct kclf_req *r)
     }
     drop = (r->image_action == KM_NEW && (!ok || (r->flags & KCLF_F_UNLOAD))) ||
            (ok && r->image_action == KM_DROP);
+    if (drop && m->tls_map) {
+        rc = kclf_ks.vm_munmap(m->tls_map, m->tls_length);
+        if (rc) return rc;
+        m->tls_map = m->tls_length = 0;
+    }
     if (drop && m->map) {
         rc = kclf_ks.vm_munmap(m->map, m->length);
         if (rc) return rc; /* retain ownership; the common cleanup retries */
@@ -929,7 +1119,7 @@ long kclf_manual_finish(struct kclf_req *r)
     unlock_registry();
     if (owner) kclf_ks.put_pid(owner);
     if (!ok && r->unload_rc)
-        kclf_fail(r, KCLF_FAILED, KCLF_ST_LOADER, r->unload_rc, "manual: IFUNC/RELRO failed before constructors rc=%d", r->unload_rc);
+        kclf_fail(r, KCLF_FAILED, KCLF_ST_LOADER, r->unload_rc, "manual: TLS/IFUNC initialization failed before constructors rc=%d", r->unload_rc);
     return 0;
 }
 
@@ -991,7 +1181,9 @@ int kclf_manual_status(char *out, int length, unsigned start)
         }
         {
             const char *nodelete = "";
-            if ((m->nodelete & KM_NODELETE_ELF) && (m->nodelete & KM_NODELETE_EMUTLS))
+            if (m->nodelete & KM_NODELETE_TLS)
+                nodelete = " nodelete=tls";
+            else if ((m->nodelete & KM_NODELETE_ELF) && (m->nodelete & KM_NODELETE_EMUTLS))
                 nodelete = " nodelete=elf,emutls";
             else if (m->nodelete & KM_NODELETE_EMUTLS)
                 nodelete = " nodelete=emutls";

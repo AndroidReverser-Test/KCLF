@@ -1,4 +1,4 @@
-# KCLF 1.5.7
+# KCLF 1.6.0
 
 Kernel Controlled Loading Framework — Android ARM64 / KernelPatch KPM
 
@@ -8,26 +8,29 @@ Kernel Controlled Loading Framework — Android ARM64 / KernelPatch KPM
 
 KCLF 通过内核 `task_work` 借用目标线程，在 EL0 执行 SO 的构造/析构函数。
 默认 `manual` 后端自行映射和重定位 ELF；显式 `linker` 后端调用目标 bionic loader。
-`main` 维护框架、构建配置、测试 App 和当前版本兼容性报告；历史报告、检测实验及
-完整主机/设备回归夹具在 `dev`。
+`main` 维护框架、构建配置、14 组主机回归、测试 App、TLS 设备夹具及兼容性报告；
+历史检测实验和其他设备夹具保留在 `dev`。
 
-### 1.5.7 更新与验证
+### 1.6.0 更新与验证
 
-- manual 按 DT_STRSZ 和可读 PT_LOAD 边界读取、完整比较符号名，解除原有 255 字节
-  符号名限制；SONAME、DT_NEEDED 和版本名仍保留该限制。
-- payload 内定义的 compiler-rt emutls 允许使用，但镜像标记 `nodelete=emutls`，
-  必须驻留到目标 mm 退出；首次 `unload` 和显式 `release` 拒绝执行。
-- 未新增内核 ABI/符号依赖，既有 BTF、task_work、procfs/accessor/GUP 回退路径未改。
-  12 组主机测试全部通过；真实设备 BTF 解析回归通过。
-- Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4K 页：正式产物通过 186 项
-  原生及自有普通 App 断言；关闭 BTF/nofault 的独立测试构建通过 243 项断言。
-  两轮均安全卸载且无新增内核告警；其他内核及 16K/64K 页设备未在本轮实测。
-- 1.5.6 的动态提供库表和已映射提供库结构解析保持不变。名称缓冲最多 64 MiB
-  （含 NUL），累计字符串读取预算 256 MiB；超限或分配失败会明确停止并回滚。
+- payload 本地 ELF TLS（PT_TLS + `R_AARCH64_TLSDESC`）由框架 EL0 运行时按线程分配，
+  镜像标记 `nodelete=tls`，驻留到目标 mm 退出；首次 `unload` 和显式 `release` 拒绝。
+  外部 TLS、TPREL/DTPREL、initial-exec/local-exec 和线程析构注册仍不支持。
+- TLS 模板取自已重定位镜像，支持指针初值；校验模板与 PT_LOAD 的文件/地址对应关系，
+  限制线程分配总量，并明确拒绝模板中的延迟 IFUNC。失败回滚保留可重试的映射所有权。
+- 提供库权限只读取一次 maps 快照，用二分查找检查完整可执行段；direct walker 回退
+  仍可能没有权限信息。RELRO 支持合法的页对齐尾部。
+- 14 组主机测试（含 ASan/UBSan、模拟内核 ABI、4K/16K/64K）和真实设备 BTF 回归通过；
+  未新增内核符号导入或结构偏移依赖。
+- Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4K：正式产物通过 93 项 TLS、
+  236 项普通 App manual、219 项 linker 断言；关闭 BTF/nofault 的独立构建通过
+  106 项 TLS、255 项普通 App manual 断言。完整结果见报告。
+- 1.5.7 的长符号名与 `nodelete=emutls` 策略保留；其他内核及 16K/64K 真机没有在本轮
+  实测，模拟用例不能代替真机认证。
 
 实现、审计依据、产物 SHA-256 和证据范围见
-[1.5.7 兼容性报告](COMPATIBILITY_1.5.7.md)；产物见
-[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.5.7)。
+[1.6.0 兼容性报告](COMPATIBILITY_1.6.0.md)；产物见
+[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.6.0)。
 
 ### 编译
 
@@ -40,6 +43,8 @@ make KP_DIR=/path/to/KernelPatch TARGET_COMPILE=/path/to/bin/aarch64-none-elf-
 
 产物为 `kclf.kpm`；`make clean` 清理模块产物。位于 KernelPatch 的
 `kpms/kclf` 时可省略 `KP_DIR`（默认 `../..`）。本仓库不内置 KernelPatch 头文件。
+`make test` 在 Linux/WSL 运行主机测试，需要 Python 3、主机 GCC 和
+`aarch64-linux-gnu-gcc`（自动生成 ELF 夹具，无需预编译测试二进制）。
 
 测试 App 需要 Windows PowerShell、JDK（`java/javac/keytool` 在 PATH 中）、
 Android SDK platform 35 或更新、build-tools 和 NDK：
@@ -49,7 +54,11 @@ Android SDK platform 35 或更新、build-tools 和 NDK：
 ```
 
 生成 `build/kclf-apptest/app.apk`，包名 `com.kclf.apptest`，包含普通、FP 状态破坏、
-延时构造三种 payload。可用 `-OutDir` 指定输出目录；调试签名密钥会在输出目录复用。
+延时构造和 ELF TLS 四种 payload。可用 `-OutDir` 指定输出目录；调试签名密钥会在输出目录复用。
+
+ELF TLS / TLSDESC 回归的构建和设备步骤见
+[test/tls/README.md](test/tls/README.md)；端到端 payload 必须用
+`-fno-emulated-tls` 编译，否则 Android clang 会使用 compiler-rt emutls。
 
 ### 使用
 
@@ -124,10 +133,11 @@ linker 在加载后调用 `dlclose` 释放本次引用，实际卸载取决于 l
 `keepelf` 只用于 manual，保留内存 ELF 头。
 `force` 仅跳过安全点启发式。**恢复路径会改写 x16/IP0，必须选择 x16 不再使用的协作边界**；
 系统调用白名单无法证明这一点，也无法证明目标未持有锁。
-manual 要求全部依赖已加载且在 payload 存活期间保持加载，不支持 ELF PT_TLS、
-完整 C++/JNI loader 集成。详见[实现与限制](IMPLEMENTATION.md)。
+manual 要求全部依赖已加载且在 payload 存活期间保持加载。payload 本地 ELF TLS 以
+每线程匿名块和私有 pthread key 实现，首次加载后镜像为 `nodelete=tls`；不注册
+bionic soinfo/TLS，也不支持完整 C++/JNI loader 集成。详见[实现与限制](IMPLEMENTATION.md)。
 
-`nodelete=emutls` / `nodelete=elf` 镜像在目标 mm 存活期间不能 release；必须先让
+`nodelete=emutls` / `nodelete=tls` / `nodelete=elf` 镜像在目标 mm 存活期间不能 release；必须先让
 目标进程退出，再 `reap` 并确认 `quiesce=idle`。完全不在 dynsym 中的隐藏 emutls
 无法自动识别，payload 使用方仍需自行保证生命周期安全。
 
@@ -153,28 +163,33 @@ adb shell /data/local/tmp/kpatch "$KEY" kpm unload kclf
 KCLF borrows a target thread through kernel `task_work` to run SO constructors and
 finalizers in EL0. The default `manual` backend maps and relocates ELF itself;
 the explicit `linker` backend calls the target bionic loader.
-`main` contains the framework, build configuration, test app and current compatibility report.
-Historical reports, detection experiments and full host/device regression fixtures remain on `dev`.
+`main` contains the framework, build configuration, 14 host suites, test app,
+TLS device fixtures and compatibility reports. Historical detection experiments
+and other device fixtures remain on `dev`.
 
-### 1.5.7 changes and validation
+### 1.6.0 changes and validation
 
-- Manual loading reads and compares complete symbol names within DT_STRSZ/readable PT_LOAD
-  bounds, removing the 255-byte symbol-name limit. SONAME, DT_NEEDED and version names remain bounded.
-- Payload-defined compiler-rt emutls is supported with `nodelete=emutls`: its image stays mapped
-  until the target mm exits. First-load `unload` and explicit `release` are rejected.
-- No new kernel ABI or symbol dependency; BTF, task_work and procfs/accessor/GUP fallbacks are
-  unchanged. All 12 host suites and a real-device BTF parser regression passed.
-- Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4K: 186 native/self-owned app assertions passed
-  with the release artifact; 243 passed with a separate no-BTF/no-nofault test build. Both runs
-  drained and unloaded safely without new kernel diagnostics. Other kernels and 16K/64K devices
-  were not tested in this round.
-- The 1.5.6 provider table and mapped-provider structural parsing are unchanged. Name storage
-  is capped at 64 MiB including NUL, with a 256 MiB cumulative string-read budget; resource
-  exhaustion explicitly fails and rolls back.
+- Payload-local ELF TLS (`PT_TLS` + `R_AARCH64_TLSDESC`) uses a framework EL0 runtime
+  with per-thread allocations and `nodelete=tls`. Images stay mapped until mm exit;
+  first-load `unload` and explicit `release` are rejected. External TLS, TPREL/DTPREL,
+  initial-exec/local-exec and thread-destructor registration remain unsupported.
+- Templates come from the relocated image, including pointer initializers. Template
+  file/virtual ranges and total per-thread allocation are bounded; deferred IFUNC
+  writes into the template are rejected. Rollback retains retryable mapping ownership.
+- Provider permissions use one maps snapshot and binary searches over complete
+  executable segments. The direct-walker fallback may lack permission information.
+  GNU_RELRO accepts valid page-rounded tails.
+- All 14 host suites and the real-device BTF regression passed, including sanitizer
+  checks, simulated kernel ABIs and 4K/16K/64K layouts. No new kernel imports or offsets.
+- Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4K: the release artifact passed 93 TLS,
+  236 ordinary-app manual and 219 linker assertions. A no-BTF/no-nofault build passed
+  106 TLS and 255 ordinary-app manual assertions. See the report for complete results.
+- 1.5.7 long-symbol and `nodelete=emutls` support is retained. Other kernels and 16K/64K
+  devices were not tested; simulated cases do not certify those devices.
 
-See the [1.5.7 compatibility report](COMPATIBILITY_1.5.7.md) for implementation, audit evidence,
-artifact SHA-256 and validation limits, and the
-[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.5.7) for downloads.
+See the [1.6.0 compatibility report](COMPATIBILITY_1.6.0.md) for implementation,
+audit evidence, artifact SHA-256 and validation limits, and the
+[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.6.0) for downloads.
 
 ### Build
 
@@ -188,6 +203,8 @@ make KP_DIR=/path/to/KernelPatch TARGET_COMPILE=/path/to/bin/aarch64-none-elf-
 Output: `kclf.kpm`. Run `make clean` to remove module outputs.
 `KP_DIR` defaults to `../..`, suitable for a checkout at KernelPatch's
 `kpms/kclf`. KernelPatch headers are external dependencies.
+`make test` runs the host suites on Linux/WSL with Python 3, host GCC and
+`aarch64-linux-gnu-gcc`; it builds its ELF fixture from source.
 
 The test app requires Windows PowerShell, a JDK with `java/javac/keytool` on PATH,
 Android SDK platform 35 or newer, build-tools and an NDK:
@@ -197,8 +214,12 @@ Android SDK platform 35 or newer, build-tools and an NDK:
 ```
 
 Output: `build/kclf-apptest/app.apk`, package `com.kclf.apptest`.
-It includes normal, FP-clobbering and delayed-constructor payloads.
+It includes normal, FP-clobbering, delayed-constructor and ELF TLS payloads.
 `-OutDir` changes the output location; the debug signing key is reused there.
+
+The ELF TLS / TLSDESC regression build and device steps are in
+[test/tls/README.md](test/tls/README.md). Build the end-to-end payload with
+`-fno-emulated-tls`; otherwise Android clang emits compiler-rt emutls.
 
 ### Use
 
@@ -290,10 +311,12 @@ does not release those references.
 `force` only bypasses safe-point heuristics. **The restore tail overwrites x16/IP0:
 use a cooperative boundary where x16 is dead.** The syscall allowlist cannot prove
 this or the absence of held locks. Manual loading requires every dependency to
-already be loaded and remain resident; ELF PT_TLS and full C++/JNI loader
-integration are unsupported. See [implementation and limits](IMPLEMENTATION.md).
+already be loaded and remain resident. Payload-local ELF TLS uses per-thread anonymous
+blocks behind a private pthread key and marks the image `nodelete=tls`; the image is not
+registered with bionic soinfo/TLS. Full C++/JNI loader integration is unsupported.
+See [implementation and limits](IMPLEMENTATION.md).
 
-Images marked `nodelete=emutls` or `nodelete=elf` cannot be released while their
+Images marked `nodelete=emutls`, `nodelete=tls` or `nodelete=elf` cannot be released while their
 target mm is alive. Let the target process exit, then `reap` and confirm
 `quiesce=idle` before unloading the module. Hidden emutls absent from dynsym
 cannot be detected automatically; callers still own payload lifetime safety.

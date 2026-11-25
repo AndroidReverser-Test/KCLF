@@ -1,4 +1,4 @@
-# KCLF 1.5.7 实现说明 / Implementation
+# KCLF 1.6.0 实现说明 / Implementation
 
 [中文](#中文) · [English](#english) · [编译与使用 / Build and use](README.md)
 
@@ -24,6 +24,7 @@ KCLF 是 KernelPatch 加载的可重定位 KPM（`ld -r`），不是常规 Linux
 | [kclf_manual.c](kclf_manual.c) | manual 文件快照、依赖闭包、权限、初始化表及镜像引用登记 |
 | [kclf_codegen.c](kclf_codegen.c)、[kclf_codegen.h](kclf_codegen.h)、[kclf_param.h](kclf_param.h) | 每请求 AArch64 机器码生成、随机私有布局和 EL0 ABI |
 | [test/app](test/app) | 普通 Android 测试目标、payload、构建和设备回归 |
+| [kclf_tls.S](kclf_tls.S)、[kclf_tls.h](kclf_tls.h)、[test/tls](test/tls) | 驻留的 EL0 TLS 运行时、共享状态布局和 TLS 回归 |
 
 ### 2. 初始化与运行时兼容
 
@@ -128,6 +129,9 @@ ABI 页与私有页没有固定相邻关系。
    初始化前扫描动态符号表，识别本地 emutls 并设定 NODELETE 生命周期策略。
 4. 扫描目标 VMA，解析有有效 ELF 和 SONAME 的已加载提供库。maps 路径优先可用，
    验证的直接 VMA 遍历为回退；不把框架自己的 manual 镜像隐式当作依赖库。
+   被保护应用可能额外保留同一 ELF 文件的只读私有映射（完整性扫描用），它与 loader
+   的真实映射同 SONAME/路径但可执行段为 `r--`；必须要求每个可执行 PT_LOAD 落在
+   可执行 VMA 内，否则跳过该候选，避免把函数地址解析到不可执行副本。
 5. 根据导入对象的路径，为每条 DT_NEEDED 选择同名 SONAME 的提供库，并按稳定顺序
    广度优先展开传递依赖，去重且处理环。
 6. 解析符号、执行可在内核完成的重定位，保存 IFUNC fixup 和初始化/析构表；
@@ -164,6 +168,10 @@ ELF 核心通过 `ke_io` 读写回调工作，不依赖内核结构布局或 sec
 | ABS64 / GLOB_DAT / JUMP_SLOT | `*(B + offset) = S + A` |
 | RELR | 位图/地址表指定位置的原值加 B |
 | Android APS2 packed RELA | 有界 SLEB128 解码后复用 RELA 逻辑 |
+| `R_AARCH64_TLSDESC` | prepare 记录 `(descriptor 地址, TLS offset)`，映射 TLS 运行时后写入 descriptor |
+
+TLSDESC 不在通用重定位阶段直接写 GOT：它需要先完成 TLS 运行时映射和 libc 入口
+校验，再由 kernel 侧写入 16 字节 descriptor；写入目标仍限制在可写 PT_LOAD 内。
 
 B 是 load bias，S 是符号地址，A 是 addend；地址加法按 ELF 的模 2^64 语义。
 执行顺序为 RELR、APS2、普通 RELA 和 PLT RELA，共享累计重定位上限。
@@ -175,6 +183,8 @@ B 是 load bias，S 是符号地址，A 是 addend；地址加法按 ELF 的模 
 **GNU_RELRO 在所有 EL0 初始化/析构工作完成后的 cleanup 中由 EL1 应用**；
 构造期间相关页仍可写，即使没有 IFUNC 也一样。失败逐范围重试，
 没有成功应用全部保护就不提交驻留镜像。这比常规 linker 更晚施加 RELRO。
+linker 常把 GNU_RELRO 的 memsz 向上取整到页边界，因此其尾部可以超出最后一个
+可写 PT_LOAD 的 p_memsz、但必须仍落在该段页对齐后的范围内；否则拒绝。
 
 ### 8. 每请求生成的 EL0 程序
 
@@ -237,6 +247,24 @@ DF_1_NODELETE 镜像拒绝显式 release 和首次 unload，需目标退出才�
 未定义/跨 DSO emutls、没有可见运行时的控制对象仍拒绝。完全移出 dynsym 的隐藏
 emutls 无法自动识别，调用者仍须保证释放前没有线程析构或其他异步使用。
 
+payload 本地 ELF TLS 由框架自带的 EL0 运行时实现（`kclf_tls.S` / `kclf_tls.h`）：
+
+- prepare 读取 PT_TLS 的 memsz/filesz/align/vaddr，验证 TLSDESC 目标位于可写段、
+  offset 落在 PT_TLS 内，且只接受 payload 自身定义的 `STT_TLS` 符号；外部 TLS 拒绝。
+- 在目标 mm 内建立一段独立映射：RX 代码页，以及经 RELRO 变为只读的状态、descriptor
+  参数和已重定位模板页。首次加载时，EL0 在调用任何构造函数前执行 `pthread_key_create`，
+  失败则返回错误、不进入 payload 构造函数。
+- 每线程首次访问 TLSDESC 时，resolver 用 `pthread_getspecific` 查块；慢路径先屏蔽
+  信号再复查，避免信号重入看到半初始化块。线程块用匿名 mmap 提供零填充 .tbss，
+  按 PT_TLS 的 align 和首字节偏置定位，并复制已重定位模板。
+- PT_TLS 文件模板必须与可读 PT_LOAD 的文件/虚拟范围一致；模板从重定位后的映射复制，
+  因而指针初值正确。模板中的延迟 IFUNC 在 prepare 阶段拒绝。
+- pthread key 析构函数在该线程退出时 munmap 线程块；代码页、状态和 key 本身保留到
+  目标 mm 退出，因此镜像标记 `nodelete=tls`，首次 unload 和显式 release 拒绝。
+- 只支持 TLSDESC。TLS_DTPMOD/DTPREL/TPREL 等重定位、initial-exec/local-exec、
+  外部 TLS 和 `__cxa_thread_atexit*` 仍拒绝；不向 bionic 注册 TLS/soinfo，
+  dlsym/dladdr 看不到这些 TLS 变量。
+
 用户代码已进入但完成结果不可信时，镜像可能标记 abandoned，
 需要进程退出后 reap；不能假定没有后台线程或回调引用。
 借用线程退出而进程其余线程仍在时也可能需要让整个进程退出。
@@ -248,13 +276,15 @@ linker 后端的驻留 handle 由 bionic 管理，`images/release` 不管理它�
 
 ### 11. 能力边界与卸载协议
 
-manual 明确拒绝：PT_TLS/TLS 重定位、外部或无法验证的 emutls、线程析构注册入口、
+manual 明确拒绝：外部/跨 DSO TLS、TLS_DTPMOD/DTPREL/TPREL 等非 TLSDESC 重定位、
+重复或非法对齐/超限的 PT_TLS、外部或无法验证的 emutls、线程析构注册入口、
 需要解析的 payload 自定义 IFUNC、IRELATIVE、GNU_UNIQUE、REL/textrel、
 PT_INTERP、PT_GNU_PROPERTY、可执行栈、非可读或 W+X 段、共享/重叠 PT_LOAD 页、
 不支持的动态 flags/filter/preinit，以及跨 DSO CFI 导入。
 初始化/析构入口必须在 payload 自身可执行段。
 
-manual 不插入 soinfo、TLS、debugger 或异常展开登记，不自动调用 JNI_OnLoad。
+manual 不把 payload TLS 注册到 bionic TLS，也不插入 soinfo、debugger 或异常展开登记，
+不自动调用 JNI_OnLoad。TLS 变量只对 payload 自身的 TLSDESC 访问可见；
 不保证 C++ 异常、栈展开、ART/JNI、dlsym/dladdr/dl_iterate_phdr 识别，
 也不复刻全局符号抢占和 namespace。需要这些集成时评估显式 linker 后端。
 目标凭据、SELinux、seccomp 和 non-dumpable 状态未被自动放宽；
@@ -265,6 +295,8 @@ payload 自己调用 API 的限制仍生效。
 50 万动态符号、100 万累计重定位、16 MiB APS2、128 初始化和 128 析构、
 64 IFUNC fixup、8 RELRO 范围、16384 个 VMA 遍历步数。
 调用表和 IFUNC 表还必须共同装入一页 ABI，镜像额外 pad/对齐会增加实际预留长度。
+TLS 运行时元数据占用一个 RELRO 范围；PT_TLS 的 memsz/align 和每线程 TLS 块
+同样受 256 MiB 镜像上限约束。
 
 卸载顺序：
 
@@ -281,7 +313,7 @@ payload 自己调用 API 的限制仍生效。
 ### 12. 编译与测试 App 如何衔接
 
 Makefile 使用 KernelPatch 头文件，以 freestanding、无 libc、无栈保护/展开表、
-严格警告及 `-mno-outline-atomics` 编译六个 C 对象，避免旧 KPM ABI 缺失原子 libcall，
+严格警告及 `-mno-outline-atomics` 编译六个 C 对象和一个位置无关的 TLS 汇编对象，避免旧 KPM ABI 缺失原子 libcall，
 最后 `ld -r` 生成 kclf.kpm。它不会构建 Android payload，也不是 NDK 内核模块构建。
 
 App 的 build.ps1 依次调用 javac、d8、NDK clang、aapt2、zipalign 和 apksigner，
@@ -298,7 +330,8 @@ payload 构造函数写 files/hit_<pid>，记录 PID/TID 和构造地址；
 device-test.ps1 支持 manual/linker、重复次数、指定 APK/KPM 和 poll 预期，
 检查 marker、映射回收、引用、取消、多槽、退出/restart、FPSIMD 和排空卸载，
 同时保存日志并检查新增内核告警/App 崩溃。它会安装和停止自建测试 App，
-不会把编译成功当作设备回归通过。历史实验和其他测试保留在 dev；
+不会把编译成功当作设备回归通过。`make test` 提供 14 组主机测试；
+`test/tls/device-test.py` 验证 TLS 和失败回滚。历史实验保留在 dev；
 构建复现和控制命令见 README。
 
 ## English
@@ -322,6 +355,7 @@ User functions, including constructors, execute in EL0.
 | [kclf_manual.c](kclf_manual.c) | File snapshots, dependencies, protection, call vectors and image references |
 | [kclf_codegen.c](kclf_codegen.c), [kclf_codegen.h](kclf_codegen.h), [kclf_param.h](kclf_param.h) | Per-request AArch64 machine code, private layouts and EL0 ABI |
 | [test/app](test/app) | Android target, payloads, build and device regression |
+| [kclf_tls.S](kclf_tls.S), [kclf_tls.h](kclf_tls.h), [test/tls](test/tls) | Resident EL0 TLS runtime, shared state layout and regression |
 
 ### 2. Initialization and runtime compatibility
 
@@ -440,7 +474,11 @@ For a new image:
    Scan dynsym before initialization to identify local emutls and set NODELETE policy.
 4. Scan VMAs for valid loaded ELF providers with SONAMEs. Prefer maps pathnames,
    with verified direct VMA traversal as fallback. Existing manual images are
-   excluded as implicit dependency providers.
+   excluded as implicit dependency providers. A protected app can keep an extra
+   read-only private mapping of the same ELF file for integrity scanning; it has
+   the same SONAME/path but no executable segment. Every executable PT_LOAD must
+   be covered completely by executable VMAs or the candidate is skipped, so function addresses
+   cannot resolve into a non-executable copy.
 5. Resolve each DT_NEEDED using the importing object's origin and expand a stable
    breadth-first transitive dependency closure with deduplication/cycle handling.
 6. Resolve symbols and kernel-side relocations, retain IFUNC fixups and call
@@ -482,6 +520,11 @@ shared 256 MiB string-read budget. SONAME, DT_NEEDED and versions retain their
 | ABS64 / GLOB_DAT / JUMP_SLOT | `*(B + offset) = S + A` |
 | RELR | Add B to original words selected by address/bitmap entries |
 | Android APS2 packed RELA | Bounded SLEB128 decoding, then the RELA operation |
+| `R_AARCH64_TLSDESC` | prepare records `(descriptor address, TLS offset)`; the descriptor is written after the TLS runtime is mapped |
+
+TLSDESC is not written during the generic relocation pass: the TLS runtime and libc
+entry points must be validated first. The 16-byte descriptor is then written by the
+kernel side, still bounded to a writable PT_LOAD.
 
 B is load bias, S the symbol address, and A the addend, with ELF modulo-2^64
 arithmetic. Processing order is RELR, APS2, regular RELA and PLT RELA, sharing a
@@ -495,6 +538,9 @@ first segment's permissions to allow VMA merging.
 Those pages remain writable during constructors, even without IFUNCs.
 Protection is retried per range; no resident image is committed before all ranges
 succeed. This applies RELRO later than a conventional linker.
+Linkers commonly round GNU_RELRO's memsz up to a page boundary, so its tail may
+extend past the last writable PT_LOAD's p_memsz as long as it stays inside that
+segment's page-rounded extent; otherwise the image is rejected.
 
 ### 8. Per-request EL0 code generation
 
@@ -567,6 +613,30 @@ until the target mm exits. Undefined/cross-DSO emutls and controls without a vis
 runtime remain unsupported. Hidden emutls absent from dynsym cannot be identified;
 the caller must still exclude thread destructors and other asynchronous users before release.
 
+Payload-local ELF TLS is implemented by a framework-owned EL0 runtime
+(`kclf_tls.S` / `kclf_tls.h`):
+
+- prepare reads PT_TLS memsz/filesz/align/vaddr, validates that every TLSDESC target
+  is writable and every offset lies inside PT_TLS, and accepts only payload-defined
+  `STT_TLS` symbols; external TLS is rejected.
+- A separate target mapping holds an RX code page plus read-only (after RELRO) state,
+  descriptor arguments and the relocated template. On first load, EL0 calls
+  `pthread_key_create` before any payload constructor; failure aborts the load.
+- On a thread's first TLSDESC access the resolver looks the block up with
+  `pthread_getspecific`. The slow path blocks signals and rechecks, so a nested
+  signal handler cannot observe a half-initialized block. Per-thread blocks are
+  anonymous mmaps supplying zero-filled .tbss, positioned by PT_TLS align and
+  first-byte bias, with the relocated template copied in (16-byte chunks plus a byte tail).
+- Initialized PT_TLS bytes must match a readable PT_LOAD file/virtual range.
+  Preparation snapshots the relocated bytes, including pointer initializers, and
+  rejects deferred IFUNC writes into the template.
+- The pthread key destructor munmaps that thread's block when it exits; the code page,
+  state and key stay live until the target mm exits. The image is therefore marked
+  `nodelete=tls`, and first-load unload plus explicit release are rejected.
+- Only TLSDESC is supported. TLS_DTPMOD/DTPREL/TPREL relocations,
+  initial-exec/local-exec, external TLS and `__cxa_thread_atexit*` remain unsupported.
+  TLS is not registered with bionic TLS/soinfo; dlsym/dladdr cannot see these variables.
+
 After entering user code, an untrusted completion may mark an image abandoned;
 reap can discard it after process exit. Background threads/callbacks may still use
 the code. An execution thread exiting while sibling threads live can require the
@@ -579,16 +649,19 @@ otherwise let the target manage the handle or wait for process exit.
 
 ### 11. Limits and module unload protocol
 
-Manual rejects payload PT_TLS/TLS relocations, external/unverifiable emutls, thread-destructor registration,
-resolved payload-defined IFUNCs, IRELATIVE, GNU_UNIQUE, REL/textrel, PT_INTERP,
-PT_GNU_PROPERTY, executable stacks, non-readable/W+X segments, overlapping/shared
-PT_LOAD pages, unsupported dynamic flags/filter/preinit, and cross-DSO CFI imports.
-Initializer/finalizer addresses must lie in the payload's own executable segments.
+Manual rejects external/cross-DSO TLS, TLS_DTPMOD/DTPREL/TPREL and other non-TLSDESC
+relocations, duplicate or invalid/oversized PT_TLS, external/unverifiable emutls,
+thread-destructor registration, resolved payload-defined IFUNCs, IRELATIVE, GNU_UNIQUE,
+REL/textrel, PT_INTERP, PT_GNU_PROPERTY, executable stacks, non-readable/W+X segments,
+overlapping/shared PT_LOAD pages, unsupported dynamic flags/filter/preinit, and
+cross-DSO CFI imports. Initializer/finalizer addresses must lie in the payload's own
+executable segments.
 
-It does not register soinfo, TLS, debugger or unwind metadata, or automatically call
-JNI_OnLoad. C++ exceptions, unwinding, ART/JNI, dlsym/dladdr/dl_iterate_phdr recognition,
-global interposition and namespace semantics are not guaranteed. Evaluate the
-explicit linker backend when such integration is needed.
+It does not register payload TLS with bionic, and does not register soinfo, debugger
+or unwind metadata, or automatically call JNI_OnLoad. TLS variables are visible only
+to the payload's own TLSDESC accesses. C++ exceptions, unwinding, ART/JNI,
+dlsym/dladdr/dl_iterate_phdr recognition, global interposition and namespace semantics
+are not guaranteed. Evaluate the explicit linker backend when such integration is needed.
 Target credentials, SELinux, seccomp and non-dumpable policy are not automatically
 relaxed; payload API calls retain those restrictions.
 
@@ -597,7 +670,9 @@ Main limits: four requests, 32 images, 64 MiB snapshot, 256 MiB ELF span/alignme
 500,000 dynamic symbols, 1,000,000 cumulative relocations, 16 MiB APS2,
 128 initializers and 128 finalizers, 64 IFUNC fixups, eight RELRO ranges and
 16,384 VMA traversal steps. Call vectors and IFUNC metadata must also fit one ABI
-page. Padding/alignment increases the actual reserved mapping length.
+page. Padding/alignment increases the actual reserved mapping length. The TLS runtime
+metadata consumes one RELRO range; PT_TLS memsz/align and each per-thread TLS block
+are bounded by the 256 MiB image limit.
 
 Unload sequence:
 
@@ -616,7 +691,8 @@ shutdown drops kernel bookkeeping only; orphan mappings remain until target exit
 
 ### 12. Build and test app integration
 
-The Makefile compiles six C objects against external KernelPatch headers with
+The Makefile compiles six C objects and one position-independent TLS assembly
+object against external KernelPatch headers with
 freestanding/no-libc settings, strict warnings, no stack protector/unwind tables,
 and -mno-outline-atomics to avoid missing atomic libcalls on older KPM hosts.
 ld -r produces kclf.kpm. This does not build Android payloads or use the NDK for
@@ -638,5 +714,37 @@ device-test.ps1 selects manual/linker, repetitions, APK/KPM and expected poll mo
 It checks markers, mapping reclamation, references, cancellation, slots, exit/restart,
 FPSIMD and draining, retaining logs and checking new kernel warnings/app crashes.
 It installs/stops the test app. Compilation success does not establish device
-regression success. Other tests and historical experiments remain on dev;
+regression success. `make test` runs 14 host suites; `test/tls/device-test.py` covers TLS and rollback.
+Historical experiments remain on dev;
 README supplies reproducible build and control commands.
+
+
+### 1.6.0 TLS compatibility and cost / TLS 兼容性与开销
+
+权限缓存最多 16,384 个区间（ARM64 约 384 KiB），准备阶段扫描 maps 一次，
+每段二分定位后检查相邻 VMA；不会为每个提供库重读 maps。maps 读取失败会终止准备，
+直接遍历回退仍以 `prot=-1` 标明未知权限，不能据此保证提供库可执行。
+快照与映射解析之间没有 linker 锁；调用方必须保证依赖不被并发卸载。
+
+TLS 热路径一次 pthread_getspecific，无系统调用、分配或全局锁；为保持 TLSDESC ABI，
+保存 GPR、完整 FPSIMD、FPCR/FPSR/NZCV，使用 800 字节栈帧。首次访问需要屏蔽信号、
+匿名 mmap、复制模板和设置 key。每线程映射长度为 `memsz + max(align,1) + 16`，
+上限 256 MiB，内核按本机页大小取整。key 创建失败可回滚；首次地址解析失败无法向
+调用方返回 errno，按运行时约定 abort。调用方须允许 rt_sigprocmask/mmap/munmap。
+
+The permission cache holds up to 16,384 ranges (about 384 KiB on ARM64), with one
+maps pass followed by binary searches and adjacent-range checks. Read errors abort
+preparation. Direct-walker fallback retains unknown permissions (`prot=-1`), and
+there is no linker lock against concurrent dependency removal.
+
+A warm TLS access calls pthread_getspecific without syscalls, allocation or a
+global lock, but preserves GPRs, full FPSIMD and FP control/status in an 800-byte
+frame. First access blocks signals, mmaps a block, copies the template and sets
+the key. Each allocation is `memsz + max(align,1) + 16`, capped at 256 MiB and rounded
+by the kernel to the device page size. Key-creation failure rolls back; address
+resolution failure aborts because TLSDESC cannot return an allocation errno.
+The target must permit rt_sigprocmask/mmap/munmap. SVE/SME callers, non-bionic/raw
+clone threads, and payload TLS access from other pthread-key destructors during
+thread teardown are outside this contract. In particular, destructor ordering can
+reinitialize TLS after its block was freed, and pthread destructor iteration limits
+can leave such reinitialized blocks until process exit.

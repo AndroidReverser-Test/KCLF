@@ -37,7 +37,6 @@
 /* Ordinary Android app processes routinely have well over two thousand VMAs
  * (graphics, JIT, profile buffers, binder). The walk stops as soon as the
  * linker, libdl and libc are known, so this is a safety bound, not a cost. */
-#define KCLF_MAX_VMA 16384
 #define KCLF_MAX_DYN 512
 #define KCLF_MAX_SYM 200000
 
@@ -409,6 +408,7 @@ struct kclf_vma
 {
     u64 start;
     u64 end;
+    int prot; /* VM_READ/WRITE/EXEC bits from procfs, -1 when unavailable */
     char path[KCLF_MAPS_PATH];
 };
 
@@ -470,6 +470,7 @@ static long kclf_vma_next(struct kclf_vma_iter *it, struct kclf_vma *out)
         out->end = *(u64 *)((char *)vma + kclf_vma_end_off);
         kclf_mmap_read_unlock(it->mm);
         if (out->end <= out->start || out->end <= it->addr || out->end > KCLF_USER_MAX) return -EFAULT;
+        out->prot = -1;
         out->path[0] = 0;
         it->addr = out->end;
         return 1;
@@ -502,6 +503,7 @@ static long kclf_vma_next(struct kclf_vma_iter *it, struct kclf_vma *out)
         }
         line[n] = 0;
         if (kclf_maps_range(line, KCLF_USER_MAX, &out->start, &out->end)) return -EINVAL;
+        if (kclf_maps_prot(line, &out->prot)) return -EINVAL;
         if (kclf_maps_path(line, out->path, sizeof(out->path))) return -EINVAL;
         if (out->end <= it->addr) continue;
         it->addr = out->end;
@@ -524,6 +526,32 @@ static long kclf_vma_at(struct mm_struct *mm, u64 addr, struct kclf_vma *out, u6
     kclf_vma_iter_close(&it);
     if (i == KCLF_MAX_VMA) return -E2BIG;
     return rc > 0 ? 0 : (rc ? rc : -ENOENT);
+}
+
+/* Capture permission ranges once per preparation, avoiding a full procfs read
+ * for each provider. Unknown direct-walker permissions remain explicit (-1).
+ * The caller owns the bounded buffer; read errors must abort preparation. */
+int kclf_snapshot_vmas(u64 scratch, struct kclf_vm_range *ranges, unsigned capacity)
+{
+    struct mm_struct *mm = kclf_task_mm(current);
+    struct kclf_vma_iter it;
+    struct kclf_vma vma;
+    long rc;
+    unsigned n = 0;
+
+    if (!mm) return -ESRCH;
+    rc = kclf_vma_iter_open(&it, mm, scratch, 1);
+    if (rc && kclf_vma_direct) rc = kclf_vma_iter_open(&it, mm, scratch, 0);
+    if (rc) return (int)rc;
+    for (;;) {
+        rc = kclf_vma_next(&it, &vma);
+        if (rc <= 0) break;
+        if (n == capacity) { rc = -E2BIG; break; }
+        if (n && vma.start < ranges[n - 1].end) { rc = -EINVAL; break; }
+        ranges[n++] = (struct kclf_vm_range){vma.start, vma.end, vma.prot};
+    }
+    kclf_vma_iter_close(&it);
+    return rc < 0 ? (int)rc : (int)n;
 }
 
 int kclf_walk_vmas(u64 scratch, int (*visit)(u64, const char *, void *), void *context)

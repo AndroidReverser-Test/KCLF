@@ -1,4 +1,4 @@
-ifneq ($(filter-out clean,$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
+ifneq ($(filter-out clean test,$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
 ifndef TARGET_COMPILE
     $(error TARGET_COMPILE not set)
 endif
@@ -25,7 +25,7 @@ KPM_CFLAGS := -std=gnu11 -Wall -Wextra -Werror -Wno-unused-parameter \
 	-ffreestanding -fno-builtin -nostdinc -fno-pic -fno-pie \
 	-fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -MMD -MP
 
-objs := kclf.o kclf_exec.o kclf_compat.o kclf_elf.o kclf_manual.o kclf_codegen.o
+objs := kclf.o kclf_exec.o kclf_compat.o kclf_elf.o kclf_manual.o kclf_codegen.o kclf_tls.o
 
 all: kclf.kpm
 
@@ -42,6 +42,9 @@ kclf.kpm: ${objs}
 
 -include $(objs:.o=.d)
 
-.PHONY: all clean
+.PHONY: all clean test
+test:
+	python3 test/run_host_tests.py
+
 clean:
 	rm -f kclf.kpm $(objs) $(objs:.o=.d)

@@ -45,6 +45,7 @@ struct ke_io {
     void (*error)(void *, const char *, const char *);
     int (*defer_ifunc)(void *, u64 where, u32 symbol, s64 addend);
     u64 *string_budget; /* optional shared byte budget for string-table reads */
+    int (*tlsdesc)(void *, u64 where, u64 offset); /* local ELF TLS descriptor */
 };
 
 struct ke_object {
@@ -57,6 +58,7 @@ struct ke_object {
     u64 flags, flags1;
     u32 needed[KE_NEEDED], nneeded, soname, symcount;
     u16 phnum;
+    u16 tls_index; /* PT_TLS program-header index, valid when tls is set */
     u8 symbolic, tls;
 };
 

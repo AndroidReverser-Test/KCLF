@@ -387,7 +387,7 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
     int qreg[32], qslot[16], order[31];
     int entry_off, i;
     int l_entry, l_manual, l_lok, l_lzero, l_ifunc, l_ifunc_err;
-    int l_init, l_init_loop, l_fini, l_fini_loop, l_man_done, l_man_err, l_tail, l_wipe;
+    int l_init, l_init_vectors, l_init_loop, l_fini, l_fini_loop, l_man_done, l_man_err, l_tail, l_wipe;
 
     if (!page || !out || !pl) return -1;
     if (page_size < 2048 || (page_size & (page_size - 1))) return -1;
@@ -424,6 +424,7 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
     l_ifunc = kce_label(&c);
     l_ifunc_err = kce_label(&c);
     l_init = kce_label(&c);
+    l_init_vectors = kce_label(&c);
     l_init_loop = kce_label(&c);
     l_fini = kce_label(&c);
     l_fini_loop = kce_label(&c);
@@ -535,6 +536,14 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
     kce_b(&c, l_tail);
 
     kce_bind(&c, l_init);
+    /* Allocate the TLS key only after fallible IFUNC fixups have finished.
+     * A failed key allocation returns before any payload constructor runs. */
+    kce_emit(&c, kce_ldr_x(r.t0, r.p, KCLF_P_TLS_INIT));
+    kce_cbz(&c, r.t0, 1, l_init_vectors);
+    kce_emit(&c, kce_ldr_x(0, r.p, KCLF_P_TLS_ARG));
+    kce_emit(&c, kce_blr(r.t0));
+    kce_cbnz(&c, 0, 1, l_man_err);
+    kce_bind(&c, l_init_vectors);
     kce_junk(&c, &r, kce_below(&c, 2));
     kce_emit(&c, kce_ldr_x(r.v, r.p, KCLF_P_INITV));
     kce_emit(&c, kce_ldr_x(r.c, r.p, KCLF_P_INITN));
