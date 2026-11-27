@@ -18,6 +18,7 @@ int kclf_vma_flags_off = -1;
 int kclf_file_path_off = -1;
 int kclf_vma_direct;
 int kclf_wake_supported;
+int kclf_tmp_backing;
 u64 kclf_trace_mask, kclf_vector_mask;
 const char *kclf_wake_abi = "version";
 
@@ -72,7 +73,7 @@ int kclf_compat_init(void)
     unsigned long end = kclf_lookup("__stop_BTF");
     struct kclf_btf b;
     struct mm_struct *mm;
-    int valid, cancel_abi = 0;
+    int valid, cancel_abi = 0, file_abi = 0;
 
 #ifdef KCLF_TEST_NO_BTF
     start = end = 0; /* exercise accessor/procfs/wrapper fallback on a BTF kernel */
@@ -103,6 +104,7 @@ int kclf_compat_init(void)
             kclf_wake_abi = "btf";
         }
         cancel_abi = kclf_btf_cancel_abi(&b);
+        file_abi = kclf_btf_file_abi(&b);
         kclf_mm_off = kclf_btf_member_range(&b, "task_struct", "mm", 8, 8);
         kclf_vma_start_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_start", 8, 8);
         kclf_vma_end_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_end", 8, 8);
@@ -166,6 +168,11 @@ int kclf_compat_init(void)
                       (kclf_ks.find_vma || kclf_ks.find_vma_prev) &&
                       ((kclf_mmap_lock_off >= 0 && kclf_ks.down_read && kclf_ks.up_read) ||
                        (kclf_mmap_lock_off < 0 && kclf_ks.mmap_read_lock && kclf_ks.mmap_read_unlock));
+    /* These exported prototypes are stable in the inspected 5.x..6.16 family.
+     * Newer kernels need both BTF prototypes; a vendor ABI mismatch always
+     * disables this optional path without breaking ordinary file loading. */
+    kclf_tmp_backing = kclf_ks.shmem_file_setup && kclf_ks.kernel_write &&
+                       (file_abi == 1 || (!file_abi && kver < VERSION(6, 17, 0)));
     logki("kclf: kernel=%x btf=%d mm=%d mmap_lock=%d regs=%d vma=%s\n", kver, kclf_btf_ok, kclf_mm_off,
           kclf_mmap_lock_off, kclf_regs_size, kclf_vma_direct ? "locked" : "proc_maps");
     return 0;

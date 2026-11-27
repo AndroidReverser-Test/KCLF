@@ -5,6 +5,9 @@ Linux 5.15.74-android13-8，ARM64，4 KiB 页，SELinux Enforcing。
 源码基线为 KCLF 1.6.4（`5884a9f`），本修复尚未发布。
 后续在 Pixel 6 上对目标游戏的实际注入结果见文末。
 
+本文记录自动 tmpfs 加载实现之前的复现结果；当前版本对默认 manual 后端增加了
+`/data/local/tmp/` 自动后备文件机制，最新行为与验证见 [自动加载说明](TMP_SO_LOADING.md)。
+
 ## 实现与失败位置
 
 `kclf.c` 接收 superkey 保护的控制命令，持有目标 PID/mm/凭据引用后提交准备 worker。

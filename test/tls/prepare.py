@@ -30,9 +30,11 @@ prelude = r'''
 #define KCLF_ST_LOADER 3
 #define __NR_mprotect 226
 struct pid { int dummy; } owner;
-struct kclf_manual_image { u64 id, tls_map, tls_length, tls_code, tls_code_len, map, length; struct pid *owner; unsigned refs; int state; };
+struct file { int unused; } backing;
+struct kclf_manual_image { u64 id, tls_map, tls_length, tls_code, tls_code_len, map, length; struct pid *owner; unsigned refs; int state; struct file *backing; };
 struct kclf_req {
     struct kclf_manual_image *image;
+    struct file *code_file;
     char path[32], code_path[32];
     unsigned flags, relro_count, ifunc_count;
     u64 relro[8][2], tls_init, tls_arg, handle, image_addr, image_len;
@@ -56,7 +58,7 @@ static unsigned char code[64], memory[262144], payload[8192], codepage[65536];
 #define kclf_tls_init code
 #define kclf_tls_resolve (code + 16)
 static u64 kclf_page_size;
-static int lookup_error, map_error, code_error, copy_failure, copies, unmaps, unmap_error, locked, abandoned, puts_count, code_maps;
+static int lookup_error, map_error, code_error, copy_failure, copies, unmaps, unmap_error, locked, abandoned, puts_count, code_maps, file_puts;
 static u64 requested_length;
 static int select_provider(struct km_context *c, const char *path, const char *name) {
     (void)c; (void)path; assert(!strcmp(name, "libc.so")); return 0;
@@ -83,12 +85,14 @@ static long unmap(u64 at, u64 size) {
     return 0;
 }
 static void put(struct pid *p) { assert(p == &owner); puts_count++; }
-static struct { u64 (*vm_mmap)(int,u64,u64,int,int,int); long (*vm_munmap)(u64,u64); void (*put_pid)(struct pid *); } kclf_ks = {map, unmap, put};
+static void put_file(struct file *f) { assert(f == &backing && !locked); file_puts++; }
+static struct { u64 (*vm_mmap)(int,u64,u64,int,int,int); long (*vm_munmap)(u64,u64); void (*put_pid)(struct pid *); void (*fput)(struct file *); } kclf_ks = {map, unmap, put, put_file};
 /* The production helper maps one page of the payload file and copies the EL0
  * runtime into it; here it hands back a fixed page and counts the calls. */
-static long kclf_map_file_code(const char *path, const void *from, u64 page, u64 *addr) {
+static long kclf_map_file_code(struct file *file, const char *path, const void *from, u64 page, u64 *addr) {
     code_maps++;
     (void)path;
+    assert(file == &backing);
     assert(from == kclf_tls_start && page == kclf_page_size);
     if (code_error) return code_error;
     *addr = (uintptr_t)codepage;
@@ -113,6 +117,7 @@ static void reset(unsigned page) {
     memset(memory, 0, sizeof(memory)); memset(payload, 0, sizeof(payload));
     kclf_page_size = page; c.r = &request; request.image = &image; request.image_action = KM_NEW;
     image.id = 7; image.map = (uintptr_t)payload; image.length = sizeof(payload); image.owner = &owner;
+    image.backing = request.code_file = &backing; file_puts = 0;
     c.providers = &provider; c.io.limit = 1ULL << 48; provider.io = c.io;
     c.object.tls = 1; c.object.phnum = 1;
     c.object.bias = (uintptr_t)payload;
@@ -153,16 +158,19 @@ int main(void) {
     assert(!kclf_manual_finish(&request) && unmaps == 3);
     reset(4096); assert(!prepare_tls_runtime(&c)); unmap_error = 1;
     assert(kclf_manual_finish(&request) == -EAGAIN && request.image && image.tls_code && image.tls_map && image.map);
-    assert(!kclf_manual_finish(&request) && unmaps == 4 && puts_count == 1);
+    assert(!file_puts);
+    assert(!kclf_manual_finish(&request) && unmaps == 4 && puts_count == 1 && file_puts == 1 && !request.code_file);
     reset(4096); assert(!prepare_tls_runtime(&c)); locked = 1;
     assert(kclf_manual_finish(&request) == -EAGAIN && request.image && !image.tls_code && !image.tls_map && !image.map);
-    locked = 0; assert(!kclf_manual_finish(&request) && unmaps == 3 && puts_count == 1);
+    assert(!file_puts);
+    locked = 0; assert(!kclf_manual_finish(&request) && unmaps == 3 && puts_count == 1 && file_puts == 1);
     reset(4096); assert(!prepare_tls_runtime(&c)); request.saved_valid = 1; request.unload_rc = -EAGAIN;
     assert(!kclf_manual_finish(&request) && !request.image && unmaps == 3 && !abandoned);
     reset(4096); assert(!prepare_tls_runtime(&c)); request.saved_valid = 1;
     assert(!kclf_manual_finish(&request) && abandoned == 1 && !unmaps);
     reset(4096); assert(!prepare_tls_runtime(&c)); request.state = KCLF_DONE; request.handle = image.id;
     assert(!kclf_manual_finish(&request) && !unmaps && image.refs == 1 && image.state == KM_LIVE);
+    assert(!file_puts && image.backing == &backing && !request.code_file);
     reset(4096); assert(defer_ifunc(&c, (uintptr_t)payload + 128, 0, 0) == -EOPNOTSUPP);
     assert(defer_ifunc(&c, (uintptr_t)payload + 144, 0, 0) == -EOPNOTSUPP);
     assert(!defer_ifunc(&c, (uintptr_t)payload + 152, 0, 0));

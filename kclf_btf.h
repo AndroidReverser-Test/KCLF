@@ -205,6 +205,48 @@ static inline int kclf_btf_points_to(const struct kclf_btf *b, const struct kclf
     return t && ((t->info >> 24) & 31) == 4 && !strcmp(kclf_btf_name(b, t->name), name);
 }
 
+/* Optional tmpfs APIs. 1: both verified, 0: missing prototypes (use the known
+ * version baseline), -1: a present prototype is incompatible. In particular,
+ * a struct-valued flags argument must never be called as unsigned long. */
+static inline int kclf_btf_file_abi(const struct kclf_btf *b)
+{
+    const char *names[2] = { "shmem_file_setup", "kernel_write" };
+    unsigned i, found = 0;
+    for (i = 0; i < 2; i++) {
+        const struct kclf_btf_type *p = kclf_btf_func_proto(b, names[i]), *t;
+        const uint32_t *args;
+        if (!p) continue;
+        found++;
+        if ((p->info & 0xffff) != (i ? 4U : 3U)) return -1;
+        args = (const void *)(p + 1);
+        t = kclf_btf_resolve(b, p->size);
+        if (!i) {
+            if (!kclf_btf_points_to(b, t, "file")) return -1;
+        } else if (!t || ((t->info >> 24) & 31) != 1 || t->size != 8) return -1;
+        t = kclf_btf_resolve(b, args[1]);
+        if (i) {
+            if (!kclf_btf_points_to(b, t, "file")) return -1;
+        } else {
+            if (!t || ((t->info >> 24) & 31) != 2) return -1;
+            t = kclf_btf_resolve(b, t->size);
+            if (!t || ((t->info >> 24) & 31) != 1 || t->size != 1) return -1;
+        }
+        t = kclf_btf_resolve(b, args[3]);
+        if (i) {
+            if (!t || ((t->info >> 24) & 31) != 2) return -1;
+        } else if (!t || ((t->info >> 24) & 31) != 1 || t->size != 8) return -1;
+        t = kclf_btf_resolve(b, args[5]);
+        if (!t || ((t->info >> 24) & 31) != 1 || t->size != 8) return -1;
+        if (i) {
+            t = kclf_btf_resolve(b, args[7]);
+            if (!t || ((t->info >> 24) & 31) != 2) return -1;
+            t = kclf_btf_resolve(b, t->size);
+            if (!t || ((t->info >> 24) & 31) != 1 || t->size != 8) return -1;
+        }
+    }
+    return found == 2 ? 1 : 0;
+}
+
 /* task_work_cancel has two incompatible ABIs under the SAME symbol name.
  * 0: no prototype; -1: unknown prototype; 1: function -> pointer; 2: work -> bool. */
 static inline int kclf_btf_cancel_abi(const struct kclf_btf *b)

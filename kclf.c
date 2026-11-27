@@ -186,6 +186,9 @@ int kclf_sym_lookup_all(void)
     kclf_ks.find_vma_prev = (typeof(kclf_ks.find_vma_prev))kclf_lookup("find_vma_prev");
     KCLF_KS(filp_open, "filp_open");
     KCLF_KS(kernel_read, "kernel_read");
+    /* Optional tmp-path backing. Compatibility validation gates their use. */
+    kclf_ks.kernel_write = (typeof(kclf_ks.kernel_write))kclf_lookup("kernel_write");
+    kclf_ks.shmem_file_setup = (typeof(kclf_ks.shmem_file_setup))kclf_lookup("shmem_file_setup");
     kclf_ks.vfs_read = (typeof(kclf_ks.vfs_read))kclf_lookup("vfs_read");
     KCLF_KS(fput, "fput");
     /* Optional: lets the locked VMA walker name providers when procfs maps is
@@ -1593,6 +1596,8 @@ static long kclf_cmd_sym(char *out, int outlen, int *off)
         "vm_munmap",
         "find_vma",
         "find_vma_prev",
+        "shmem_file_setup",
+        "kernel_write",
         "filp_open",
         "kernel_read",
         "fput",

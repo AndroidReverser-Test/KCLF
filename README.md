@@ -4,9 +4,12 @@ Kernel Controlled Loading Framework — Android ARM64 / KernelPatch KPM
 
 KCLF 通过内核 `task_work` 借用目标线程，在 EL0 执行 SO 的构造与析构函数。
 默认 `manual` 后端映射并重定位 ELF；可显式选择 `linker` 后端调用目标 bionic loader。
+`manual` 可自动加载 `/data/local/tmp/` 下可读 SO，详见[后备文件与兼容性](docs/TMP_SO_LOADING.md)。
 
 KCLF runs SO constructors and finalizers in a target ARM64 thread through kernel
 `task_work`. It provides a manual ELF loader and an explicit bionic linker backend.
+Manual loading can stage readable `/data/local/tmp/` payloads automatically; see
+[backing files and compatibility](docs/TMP_SO_LOADING.md).
 
 [下载 / Releases](https://github.com/AndroidReverser-Test/KCLF/releases/latest) ·
 [文档 / Documentation](docs/README.md) · [使用 / Usage](docs/USAGE.md)

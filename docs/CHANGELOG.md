@@ -4,6 +4,11 @@
 
 ## 未发布 / Unreleased
 
+- `manual` 自动加载 `/data/local/tmp/` 下可读 SO：使用目标凭据创建 tmpfs 快照，
+  镜像、TLS 和跳板共享后备文件；覆盖源文件删除后的重入、release 与退出回收。
+  Automatically stage readable tmp-path payloads in a retained target-credential tmpfs file.
+- 可选接口采用精确符号与 BTF 原型校验，已知 5.x–6.16 ABI 可无 BTF 使用；
+  缺少接口或遇到未知 ABI 时保持普通路径可用。详见 [兼容性与验证](TMP_SO_LOADING.md)。
 - 修复部分 Android 5.15 内核缺少 `find_vma` 时 non-dumpable 目标无法准备的问题；
   通过明确的三参数 `find_vma_prev` ABI 保留 BTF 校验和加锁 VMA 回退。
   Retain the locked VMA fallback through `find_vma_prev` when `find_vma` is absent.

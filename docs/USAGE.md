@@ -80,10 +80,16 @@ adb shell run-as com.kclf.apptest cat /data/user/0/com.kclf.apptest/files/hit_$T
 - `manual` 不强制使用 App 的 native library 目录，也可使用目标有权读取的
   `/data/user/0/<包名>/files/<模块>.so`；依赖仍需预先加载，映射权限仍受设备策略限制。
   `linker` 还要求路径属于目标 linker namespace 允许的范围，并允许文件的可执行映射；
-  本示例使用安装后的 native library 目录。`/data/local/tmp` 不能视为普通 App 通用可用的路径。
+  本示例使用安装后的 native library 目录。
+- 默认 `manual` 会自动为 `/data/local/tmp/` 下可读的 SO 创建目标凭据下的 tmpfs 副本，
+  PT_LOAD、TLS 代码与跳板统一使用这个副本，无需手动复制到 App 目录或修改标签。
+  `probe` 显示 `tmp_load=shmem` 时可用，`images` 显示 `backing=shmem`。
+  源文件仍需可读，tmpfs 的执行映射仍经 SELinux 检查。缺少接口/兼容 ABI 时保持原文件
+  加载并显示 `tmp_load=unavailable`，原路径可能仍报 -13；显式 `linker` 不使用此机制。
+  [自动加载与兼容性验证](TMP_SO_LOADING.md) 说明了具体边界。
 
 `manual: PT_LOAD[...] mmap prot=5 rc=-13` 表示文件的 RX 映射被拒绝，应检查目标的
-文件访问权限和 SELinux execute 策略；单独 `chmod 777` 或控制端提权不能解决标签限制。
+文件访问权限、`tmp_load` 能力和 SELinux execute 策略；单独 `chmod 777` 或控制端提权不能解决标签限制。
 若文件路径已允许执行，但出现 `mapping permission snapshot rc=-2/-13`，检查
 `probe` 的 `vma_backend` / `vma_find`；non-dumpable 目标可能拒绝 worker 的 procfs 读取。
 具体复现和修复见 [HybridCLR 加载失败分析](HYBRIDCLR_LOADING_FIX.md)。
@@ -150,6 +156,9 @@ adb shell /data/local/tmp/kpatch "$KEY" kpm unload kclf
 ```powershell
 .\test\app\device-test.ps1 -SuperKey $env:KCLF_SUPERKEY -Serial '<SERIAL>' -Backend manual -Repeat 3 -NonDumpable -RootContext u:r:magisk:s0
 ```
+
+增加 `-TmpSource` 可将测试 SO 放在 `/data/local/tmp/`，覆盖自动后备文件、源文件删除后的
+重复加载和引用释放。该选项仅用于 `manual`，可与 `-NonDumpable` 组合。
 
 ## English
 
@@ -239,7 +248,15 @@ injecting another SO.
   and mapping permissions remain subject to device policy. `linker` additionally
   requires an allowed path in the target linker namespace and permission for
   executable file mappings. This example uses the installed native library
-  directory. Do not assume `/data/local/tmp` is usable by an ordinary app.
+  directory.
+- Default `manual` loading automatically copies readable `/data/local/tmp/`
+  payloads into a target-credential tmpfs file shared by PT_LOAD, TLS code and
+  trampolines. No disk copy or relabeling is needed. Check `tmp_load=shmem` in
+  `probe` and `backing=shmem` in `images`. Source read access and tmpfs executable
+  mappings still require target permissions. Missing APIs/incompatible ABI leave
+  ordinary file loading available (`tmp_load=unavailable`); that path may still
+  fail with -13. Explicit `linker` mode does not stage the file.
+  See [automatic tmp-path loading and compatibility](TMP_SO_LOADING.md).
 
 `PT_LOAD[...] mmap prot=5 rc=-13` means the RX file mapping was denied. Check
 target file access and SELinux execute policy; `chmod 777` or controller root

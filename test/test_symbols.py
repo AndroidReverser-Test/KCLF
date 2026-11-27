@@ -80,6 +80,9 @@ int main(void) {
     absent[1] = "find_vma_prev";
     assert(!kclf_sym_lookup_all() && !kclf_ks.find_vma && !kclf_ks.find_vma_prev);
     puts("exact-name find_vma_prev fallback resolved; both missing leaves procfs available: PASS");
+    memset(absent, 0, sizeof(absent)); absent[0] = "shmem_file_setup"; absent[1] = "kernel_write";
+    assert(!kclf_sym_lookup_all() && !kclf_ks.shmem_file_setup && !kclf_ks.kernel_write);
+    puts("optional tmpfs APIs absent: ordinary loading remains available: PASS");
     puts("vmalloc_noprof/probe_user_read aliases; required allocators; optional nofault; ambiguous cancel deferral: PASS");
     kclf_rcu_read_lock = mock_lock; kclf_rcu_read_unlock = mock_unlock;
     kclf_ks.pid_task = mock_pid_task; work.func = mock_work;

@@ -134,6 +134,7 @@ struct kclf_req
     char comm[16];
     char path[KCLF_PATH_MAX];
     char code_path[KCLF_PATH_MAX]; /* file whose first page backs code_addr */
+    struct file *code_file; /* borrowed from the BUSY manual image, never owns a reference */
 
     /* transient mapping inside the target */
     u64 map_addr;
@@ -261,6 +262,8 @@ struct kclf_syms
     int (*access_remote_vm)(struct mm_struct *mm, unsigned long addr, void *buf, int len, unsigned int gup_flags);
     struct file *(*filp_open)(const char *name, int flags, umode_t mode);
     long (*kernel_read)(struct file *file, void *buf, unsigned long count, loff_t *pos);
+    long (*kernel_write)(struct file *file, const void *buf, unsigned long count, loff_t *pos);
+    struct file *(*shmem_file_setup)(const char *name, loff_t size, unsigned long flags);
     long (*vfs_read)(struct file *file, char *buf, unsigned long count, loff_t *pos);
     void (*fput)(struct file *file);
     /* Resolve an open file's path from its struct path.  The manual backend
@@ -331,10 +334,11 @@ long kclf_apply_relro(struct kclf_req *r);
 long kclf_exec_finish(struct kclf_req *r, int capture_err);
 int kclf_exec_probe(char *out, int outlen);
 int kclf_exec_init(void);
-/* Map one page of @path read+execute and write @code through its private COW
- * page (GUP FOLL_FORCE). The VMA keeps vm_file, so the page appears in
- * /proc/<pid>/maps with the module path instead of as anonymous r-xp. */
-long kclf_map_file_code(const char *path, const void *code, u64 page, u64 *addr);
+/* Map one page of borrowed @backing (or reopen @path) read+execute and write
+ * @code through its private COW page. The VMA keeps its own file reference. */
+long kclf_map_file_code(struct file *backing, const char *path, const void *code, u64 page, u64 *addr);
+int kclf_tmp_path(const char *path);
+int kclf_stage_tmp_file(const char *path, const void *data, unsigned long size, struct file **out);
 int kclf_urd(u64 addr, void *buf, int len);
 int kclf_urds(u64 addr, void *buf, int len);
 int kclf_uwr(u64 addr, const void *buf, int len);
@@ -371,6 +375,7 @@ extern int kclf_vma_file_off, kclf_vma_pgoff_off, kclf_vma_flags_off, kclf_file_
 extern int kclf_btf_ok;
 extern int kclf_vma_direct;
 extern int kclf_wake_supported;
+extern int kclf_tmp_backing;
 extern u64 kclf_trace_mask, kclf_vector_mask;
 extern const char *kclf_wake_abi;
 unsigned long kclf_lookup(const char *name);

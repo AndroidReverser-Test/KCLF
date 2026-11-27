@@ -51,7 +51,7 @@ static struct {
     void (*mmput_async)(struct mm_struct *);
     void (*down_read)(void *), (*up_read)(void *);
     void (*mmap_read_lock)(struct mm_struct *), (*mmap_read_unlock)(struct mm_struct *);
-    void *find_vma, *find_vma_prev;
+    void *find_vma, *find_vma_prev, *shmem_file_setup, *kernel_write;
     struct callback_head *(*task_work_cancel_func)(struct task_struct *, void (*)(struct callback_head *));
     void *task_work_cancel_match;
     bool (*task_work_cancel_object)(struct task_struct *, struct callback_head *);
@@ -82,6 +82,31 @@ static size_t vma_fixture(struct btf_fixture *f) {
     memcpy(f->bytes + f->used, f->strings, f->string_used);
     return f->used + f->string_used;
 }
+/* bad: 1 struct flags, 2 by-value write offset, 3 wrong arity, 4 missing writer. */
+static size_t file_fixture(struct btf_fixture *f, int bad) {
+    struct kclf_btf_header h = { .magic=0xeb9f, .version=1, .hdr_len=24 };
+    unsigned int e[8] = {0}, file, pf, word, pw, byte, pc, pv, flags, proto;
+    memset(f, 0, sizeof(*f)); f->used = sizeof(h); f->string_used = 1;
+    file = bf_type(f, "file", 4, 32, 0, NULL, 0);
+    pf = bf_type(f, "", 2, file, 0, NULL, 0);
+    e[0] = 64; word = bf_type(f, "long", 1, 8, 0, e, 1);
+    pw = bf_type(f, "", 2, word, 0, NULL, 0);
+    e[0] = 8; byte = bf_type(f, "char", 1, 1, 0, e, 1);
+    byte = bf_type(f, "", 10, byte, 0, NULL, 0);
+    pc = bf_type(f, "", 2, byte, 0, NULL, 0);
+    pv = bf_type(f, "", 2, 0, 0, NULL, 0);
+    flags = bad == 1 ? bf_type(f, "vma_flags_t", 4, 16, 0, NULL, 0) : word;
+    memset(e, 0, sizeof(e)); e[1] = pc; e[3] = word; e[5] = flags;
+    proto = bf_type(f, "", 13, pf, bad == 3 ? 2 : 3, e, bad == 3 ? 4 : 6);
+    bf_type(f, "shmem_file_setup", 12, proto, 1, NULL, 0);
+    e[1] = pf; e[3] = pv; e[5] = word; e[7] = bad == 2 ? word : pw;
+    proto = bf_type(f, "", 13, word, 4, e, 8);
+    if (bad != 4) bf_type(f, "kernel_write", 12, proto, 1, NULL, 0);
+    h.type_len = f->used - sizeof(h); h.str_off = h.type_len; h.str_len = f->string_used;
+    memcpy(f->bytes, &h, sizeof(h));
+    memcpy(f->bytes + f->used, f->strings, f->string_used);
+    return f->used + f->string_used;
+}
 static void reset(unsigned int version) {
     kver = version;
     kclf_mm_off = kclf_vma_start_off = kclf_vma_end_off = kclf_mmap_lock_off = -1;
@@ -95,6 +120,7 @@ static void reset(unsigned int version) {
     kclf_ks.mmap_read_lock = kclf_ks.mmap_read_unlock = NULL;
     kclf_ks.find_vma = (void *)1;
     kclf_ks.find_vma_prev = NULL;
+    kclf_ks.shmem_file_setup = kclf_ks.kernel_write = (void *)1;
     gets = puts_count = 0;
 }
 int main(int argc, char **argv) {
@@ -104,6 +130,7 @@ int main(int argc, char **argv) {
     for (unsigned int i = 0; i < sizeof(versions) / sizeof(versions[0]); i++) {
         reset(versions[i]);
         assert(!kclf_compat_init());
+        assert(kclf_tmp_backing == (kver < VERSION(6,17,0)));
         assert(!kclf_btf_ok && !kclf_vma_direct && !kclf_regs_size && kclf_mm_off == -1);
         assert(kclf_wake_supported == (kver >= VERSION(5,8,0)));
         assert(kclf_trace_mask & (1ULL << (kver >= VERSION(6,16,0) ? 5 : 4)));
@@ -115,6 +142,20 @@ int main(int argc, char **argv) {
         assert(gets == puts_count && gets > 0);
     }
     puts("5.0-6.18 notify/TIF selection: PASS (mock versions, not devices)");
+    reset(VERSION(6,1,0)); kclf_ks.kernel_write = NULL;
+    assert(!kclf_compat_init() && !kclf_tmp_backing);
+    reset(VERSION(5,4,0)); kclf_ks.shmem_file_setup = NULL;
+    assert(!kclf_compat_init() && !kclf_tmp_backing);
+    struct btf_fixture files;
+    for (int bad = 0; bad <= 4; bad++) {
+        btf_len = file_fixture(&files, bad); btf = files.bytes;
+        reset(VERSION(6,18,0));
+        assert(!kclf_compat_init() && kclf_tmp_backing == (bad == 0));
+        reset(VERSION(5,4,0));
+        assert(!kclf_compat_init() && kclf_tmp_backing == (bad == 0 || bad == 4));
+    }
+    btf = NULL;
+    puts("tmpfs ABI: 5.x-6.16 baseline, missing APIs, newer BTF, incompatible vendor prototypes: PASS");
     reset(VERSION(4,19,0)); assert(kclf_compat_init() == -EOPNOTSUPP);
     reset(VERSION(7,0,0)); assert(kclf_compat_init() == -EOPNOTSUPP);
     reset(VERSION(5,4,0));
@@ -204,6 +245,8 @@ int main(int argc, char **argv) {
         memcpy(mock_current.bytes + offset, &mm, sizeof(mm));
         reset(VERSION(6,1,134));
         assert(!kclf_compat_init() && kclf_btf_ok && kclf_vma_direct && kclf_regs_size == 336);
+        assert(kclf_btf_file_abi(&b) == 1 && kclf_tmp_backing);
+        puts("saved device BTF: exact tmpfs/write prototypes verified: PASS");
         assert(kclf_mm_off == offset && gets == puts_count);
         kclf_mmap_read_lock(&target_mm); kclf_mmap_read_unlock(&target_mm);
         reset(VERSION(6,1,134));

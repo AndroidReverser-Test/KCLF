@@ -146,10 +146,13 @@ ABI 页与私有页没有固定相邻关系。
 
 1. 用目标凭据打开文件，以有界快照读取，限制 64 MiB。快照避免反复解析变化的文件，
    不是文件系统原子快照；加载期间不要修改文件。文件句柄保留到所有映射建立完成。
+   对 `/data/local/tmp/` 路径，在可选 ABI 可用时把快照完整写入普通 `shmem_file_setup`
+   文件。目标凭据与 SELinux 检查保持有效；镜像持有文件引用，供后续 TLS/跳板及 release
+   复用，最后释放或目标退出时回收。实现不使用 `shmem_kernel_file_setup`、fd 注入或 inode 偏移。
 2. 验证 ELF64、小端、AArch64、ET_DYN 和 program headers，预留 1–8 页随机前导 pad
    及对齐余量。每个 PT_LOAD 的页用 `MAP_PRIVATE` 从 payload 文件同偏移映射进预留区间，
    **一次就使用该段的最终权限**（R / RW / RX）；文件未覆盖的 .bss 尾部补匿名 RW 页。
-   镜像因此与 bionic 加载的库同形：每段在 `/proc/<pid>/maps` 中带模块路径，
+   每段在 `/proc/<pid>/maps` 中带原模块路径或 `/kclf:<文件名> (deleted)` tmpfs 名称，
    可执行段是文件后备的 `r-xp`，段间空洞保持 PROT_NONE。
 3. 默认擦除内存 ELF 头；程序头在满足首个页及前缀范围限制时一并清除。
    解析元数据已在内核保存，后续不重新依赖这些头。`keepelf` 用于需自查 ELF 头的 payload。
@@ -543,12 +546,17 @@ For a new image:
    This avoids reparsing changing file contents but is not an atomic filesystem
    snapshot; do not modify the file during loading. The file stays open until all
    mappings are installed.
+   When optional APIs/ABI are available, `/data/local/tmp/` payload snapshots are
+   copied into an ordinary `shmem_file_setup` file under target credentials.
+   The image retains its reference for TLS, trampolines and release, including
+   after source removal; final release or target exit drops it outside the
+   registry lock. No private-inode helper, fd installation or inode offsets are used.
 2. Validate little-endian ELF64/AArch64 ET_DYN and program headers. Reserve
    one-to-eight random leading pages plus alignment slack, then map every PT_LOAD
    page with MAP_PRIVATE from the payload file at the same offset, **directly with
    that segment's final protection** (R, RW or RX); anonymous RW pages supply the
-   BSS tail the file does not cover. The image therefore looks like a
-   bionic-loaded library: each segment carries the module pathname in
+   BSS tail the file does not cover. Each segment carries the original pathname
+   or `/kclf:<filename> (deleted)` tmpfs name in
    /proc/<pid>/maps, the executable segment is a file-backed r-xp, and the gaps
    between segments stay PROT_NONE.
 3. Scrub the in-memory ELF header by default. Program headers are also cleared

@@ -224,7 +224,8 @@ void kclf_prefault_user(u64 start, u64 len)
 }
 
 /* Every executable page the framework installs in a target is a private,
- * file-backed mapping of the payload.  A process-local /proc/<pid>/maps scan
+ * file-backed mapping of the payload (or its retained tmpfs snapshot).
+ * A process-local /proc/<pid>/maps scan
  * treats executable memory without a module pathname (anonymous r-xp, the
  * classic signature of a manual loader) as injected code, so the trampoline
  * and the TLS runtime never get an anonymous RX page of their own.
@@ -236,8 +237,9 @@ void kclf_prefault_user(u64 start, u64 len)
  * through GUP does not consult the mmap/mprotect hooks, leaves the payload file
  * unmodified and never creates a W+X VMA.  Offset zero is the ELF header page,
  * which every payload has, so the mapping can never fault beyond EOF.  The
- * caller flushes the instruction cache after its last call. */
-long kclf_map_file_code(const char *path, const void *code, u64 page, u64 *addr)
+ * caller flushes the instruction cache after its last call. A non-NULL backing
+ * is borrowed from the busy manual image; it is not reopened by pathname. */
+long kclf_map_file_code(struct file *backing, const char *path, const void *code, u64 page, u64 *addr)
 {
     struct file *f;
     u64 at;
@@ -246,11 +248,11 @@ long kclf_map_file_code(const char *path, const void *code, u64 page, u64 *addr)
     if (!path || !path[0] || !code || !addr) return -EINVAL;
     if (page < 2048 || (page & (page - 1))) return -EINVAL;
     if (!kclf_ks.filp_open || !kclf_ks.vm_mmap || !kclf_ks.fput || !kclf_ks.vm_munmap) return -EOPNOTSUPP;
-    f = kclf_ks.filp_open(path, KCLF_O_RDONLY, 0);
+    f = backing ? backing : kclf_ks.filp_open(path, KCLF_O_RDONLY, 0);
     if (!f) return -ENOENT;
     if (kclf_is_err(f)) return (long)(unsigned long)f;
     at = kclf_ks.vm_mmap(f, 0, page, KCLF_PROT_READ | KCLF_PROT_EXEC, KCLF_MAP_PRIVATE, 0);
-    kclf_ks.fput(f);
+    if (!backing) kclf_ks.fput(f);
     if (!at || kclf_is_err((void *)at)) return at ? (long)at : -ENOMEM;
     if (!kclf_user_range(at, page)) {
         rc = -EFAULT;
@@ -1305,7 +1307,7 @@ long kclf_exec_prepare(struct kclf_req *r)
         rc = -EFAULT;
         goto fail;
     }
-    rc = kclf_map_file_code(r->code_path, scratch, page, &r->code_addr);
+    rc = kclf_map_file_code(r->code_file, r->code_path, scratch, page, &r->code_addr);
     kclf_ks.vfree(scratch);
     if (rc) {
         kclf_set_err(r, "trampoline file mapping failed rc=%ld path=%s", rc, r->code_path);
@@ -1657,6 +1659,8 @@ int kclf_exec_probe(char *out, int outlen)
                           regs ? "ok" : "unavailable", kclf_regs_size, thread_size, kclf_page_size);
     off += kclf_scnprintf(out + off, outlen - off, "user_limit=%llx tbi=%d\n", (unsigned long long)kclf_user_limit,
                           kclf_user_tbi);
+    off += kclf_scnprintf(out + off, outlen - off, "tmp_load=%s (manual)\n",
+                          kclf_tmp_backing ? "shmem" : "unavailable");
     off += kclf_scnprintf(out + off, outlen - off, "vma_backend=%s mm_access=%s vma_meta=%d dpath=%d vma_find=%s\n",
                           kclf_vma_direct ? "locked" : "proc_maps", kclf_mm_off > 0 ? "offset" : "get_task_mm",
                           kclf_vma_file_off >= 0 && kclf_vma_pgoff_off >= 0 && kclf_vma_flags_off >= 0 &&

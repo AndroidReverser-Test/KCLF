@@ -25,7 +25,7 @@ KPM_CFLAGS := -std=gnu11 -Wall -Wextra -Werror -Wno-unused-parameter \
 	-ffreestanding -fno-builtin -nostdinc -fno-pic -fno-pie \
 	-fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -MMD -MP
 
-objs := kclf.o kclf_exec.o kclf_compat.o kclf_elf.o kclf_manual.o kclf_codegen.o kclf_tls.o
+objs := kclf.o kclf_exec.o kclf_compat.o kclf_elf.o kclf_manual.o kclf_file.o kclf_codegen.o kclf_tls.o
 
 all: kclf.kpm
 

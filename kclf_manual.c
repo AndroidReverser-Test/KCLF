@@ -54,6 +54,7 @@ struct kclf_manual_image {
     u64 tls_map, tls_length;
     u64 tls_code, tls_code_len; /* EL0 TLS runtime code page (file-backed) */
     struct pid *owner; /* process (TGID), not the borrowed execution thread */
+    struct file *backing; /* owned tmpfs reference; NULL for ordinary path-backed images */
     char path[KCLF_PATH_MAX];
     u64 fini[KM_CALLS];
     int nodelete;
@@ -99,7 +100,7 @@ struct km_context {
     unsigned nproviders, provider_cap;
     unsigned nfile_providers, nresident_providers; /* discovery source counters */
     unsigned nscope, scope[KM_SCOPE];
-    struct file *file; /* payload, opened with target credentials */
+    struct file *file; /* payload backing, opened/created with target credentials */
     void *snapshot;
     unsigned long file_size;
     u64 *values;
@@ -766,7 +767,7 @@ static int prepare_tls_runtime(struct km_context *c)
     m->tls_map = base;
     m->tls_length = length;
     if (base >= c->io.limit || length > c->io.limit - base) return -EFAULT;
-    rc = (int)kclf_map_file_code(r->code_path, kclf_tls_start, page, &m->tls_code);
+    rc = (int)kclf_map_file_code(r->code_file, r->code_path, kclf_tls_start, page, &m->tls_code);
     if (rc) return rc;
     m->tls_code_len = page;
     args = base + KT_SIZE;
@@ -861,15 +862,25 @@ static int read_snapshot(struct km_context *c)
         got = kclf_ks.kernel_read(f, (u8 *)c->snapshot + pos, n, &pos);
         if (got <= 0 || (unsigned long)got > n) { rc = got < 0 ? (int)got : -ENOEXEC; break; }
     }
-    /* The snapshot is only the parser's view.  The image itself is mapped from
-     * this file, so the payload's kernel copy can no longer diverge from what
-     * the target executes, and every executable image page keeps the module
-     * pathname in /proc/<pid>/maps.  Keep the file open until all mappings are
-     * installed; the VMAs then own their own references. */
+    if (!rc && kclf_tmp_path(c->r->path) && kclf_tmp_backing) {
+        struct file *backing = 0;
+        rc = kclf_stage_tmp_file(c->r->path, c->snapshot, c->file_size, &backing);
+        if (rc) kclf_set_err(c->r, "manual: tmpfs backing failed rc=%d", rc);
+        else {
+            /* The image owns this reference even if later preparation fails.
+             * Reuse it for TLS and all later trampoline/release transactions. */
+            c->r->image->backing = backing;
+            c->r->code_file = backing;
+            kclf_ks.fput(f);
+            f = backing;
+        }
+    }
+    /* Ordinary paths keep their original file. Tmp paths map the same snapshot
+     * that the ELF parser validates; source permissions and labels stay intact. */
     if (!rc) c->file = f;
 out:
     if (rc) kclf_ks.fput(f);
-    if (rc) kclf_set_err(c->r, "manual: file snapshot failed rc=%d (limit 64 MiB)", rc);
+    if (rc && !c->r->err[0]) kclf_set_err(c->r, "manual: file snapshot failed rc=%d (limit 64 MiB)", rc);
     return rc;
 }
 
@@ -1237,6 +1248,7 @@ long kclf_manual_prepare(struct kclf_req *r)
      * image (inject without unload, or release). */
     strncpy(r->code_path, r->image->path, sizeof(r->code_path) - 1);
     r->code_path[sizeof(r->code_path) - 1] = 0;
+    r->code_file = r->image->backing;
     if (r->image_action != KM_NEW) {
         r->ld.linker_base = r->image->linker_base;
         r->ld.linker_end = r->image->linker_end;
@@ -1304,8 +1316,8 @@ long kclf_manual_prepare(struct kclf_req *r)
           c->nresident_providers);
 out:
     if (rc && !r->err[0]) kclf_set_err(r, "manual: %s failed rc=%d", step, rc);
-    /* The image and TLS code mappings hold their own file references. */
-    if (c->file) kclf_ks.fput(c->file);
+    /* Tmpfs stays owned by the image; ordinary files are kept by their VMAs. */
+    if (c->file && c->file != r->image->backing) kclf_ks.fput(c->file);
     close_providers(c);
     if (c->providers) kclf_ks.vfree(c->providers);
     if (c->ranges) kclf_ks.vfree(c->ranges);
@@ -1529,6 +1541,7 @@ long kclf_manual_finish(struct kclf_req *r)
 {
     struct kclf_manual_image *m = r->image;
     struct pid *owner = 0;
+    struct file *backing = 0;
     int ok, drop;
     long rc;
     if (!m) return 0;
@@ -1566,11 +1579,14 @@ long kclf_manual_finish(struct kclf_req *r)
     r->image_addr = m->map; r->image_len = m->length; r->image_refs = drop ? 0 : m->refs;
     if (drop) {
         owner = m->owner;
+        backing = m->backing;
         memset(m, 0, sizeof(*m));
     } else m->state = KM_LIVE;
     r->image = 0;
+    r->code_file = 0;
     unlock_registry();
     if (owner) kclf_ks.put_pid(owner);
+    if (backing) kclf_ks.fput(backing);
     if (!ok && r->unload_rc)
         kclf_fail(r, KCLF_FAILED, KCLF_ST_LOADER, r->unload_rc, "manual: TLS/IFUNC initialization failed before constructors rc=%d", r->unload_rc);
     return 0;
@@ -1584,22 +1600,26 @@ void kclf_manual_abandon(struct kclf_req *r)
      * ABANDONED is the final operation; reap will only discard dead processes. */
     r->image_addr = m->map; r->image_len = m->length; r->image_refs = m->refs;
     r->image = 0;
+    r->code_file = 0;
     __atomic_store_n(&m->state, KM_ABANDONED, __ATOMIC_RELEASE);
 }
 
 void kclf_manual_reap(void)
 {
-    int i;
+    struct file *files[KM_IMAGES];
+    int i, nfiles = 0;
     if (!lock_registry()) return;
     for (i = 0; i < KM_IMAGES; i++) {
         struct kclf_manual_image *m = &images[i];
         if (!m->state || m->state == KM_BUSY) continue;
         if (!kclf_process_mm_alive(m->owner, m->mm)) {
             kclf_ks.put_pid(m->owner);
+            if (m->backing) files[nfiles++] = m->backing;
             memset(m, 0, sizeof(*m)); /* old mm, not the controller's mm, owns the mapping */
         }
     }
     unlock_registry();
+    for (i = 0; i < nfiles; i++) kclf_ks.fput(files[i]);
 }
 
 int kclf_manual_busy(void)
@@ -1622,7 +1642,7 @@ int kclf_manual_status(char *out, int length, unsigned start)
         if (!m->state) continue;
         /* Reserve enough space for a complete path/status and continuation;
          * never silently truncate an image that the controller must release. */
-        if (length - off < 416) {
+        if (length - off < KCLF_PATH_MAX + 256) {
             off += kclf_scnprintf(out + off, length - off, "next=%u (use images,%u)\n", i, i);
             break;
         }
@@ -1642,11 +1662,12 @@ int kclf_manual_status(char *out, int length, unsigned start)
                 nodelete = " nodelete=emutls";
             else if (m->nodelete)
                 nodelete = " nodelete=elf";
-            off += kclf_scnprintf(out + off, length - off, "image=%llu state=%s refs=%u original_tid=%d base=%llx size=%llu hdr=%s path=%s%s\n",
+            off += kclf_scnprintf(out + off, length - off, "image=%llu state=%s refs=%u original_tid=%d base=%llx size=%llu hdr=%s path=%s%s backing=%s\n",
                                  (unsigned long long)m->id, m->state == KM_LIVE ? "live" :
                                  (m->state == KM_BUSY ? "busy" : "abandoned"), m->refs, m->original_tid,
                                  (unsigned long long)m->map, (unsigned long long)m->length,
-                                 m->hdr_kept ? "kept" : "scrubbed", m->path, nodelete);
+                                 m->hdr_kept ? "kept" : "scrubbed", m->path, nodelete,
+                                 m->backing ? "shmem" : "file");
         }
     }
     if (!count) off += kclf_scnprintf(out + off, length - off, "no manual images\n");
@@ -1664,6 +1685,7 @@ int kclf_manual_shutdown(void)
         if (!images[i].state) continue;
         orphaned++;
         if (images[i].owner) kclf_ks.put_pid(images[i].owner);
+        if (images[i].backing) kclf_ks.fput(images[i].backing);
         memset(&images[i], 0, sizeof(images[i]));
     }
     return orphaned;

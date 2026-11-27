@@ -8,12 +8,14 @@ param(
     [switch]$ExpectPoll,
     [switch]$RootInstall,
     [switch]$NonDumpable,
+    [switch]$TmpSource,
     [string]$RootContext = '',
     [ValidateRange(1, 100)][int]$Repeat = 10
 )
 $ErrorActionPreference = 'Stop'
 if ($SuperKey -notmatch '^[A-Za-z0-9_@.+-]+$') { throw 'Use a shell-safe superkey with this test runner.' }
 if ($RootContext -and $RootContext -notmatch '^[A-Za-z0-9_:.,-]+$') { throw 'Invalid root context.' }
+if ($TmpSource -and $Backend -ne 'manual') { throw 'TmpSource requires the manual backend.' }
 $ModuleDir = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $RepoDir = $ModuleDir
 if (-not $Apk) { $Apk = Join-Path $RepoDir 'build/kclf-apptest/app.apk' }
@@ -199,6 +201,7 @@ try {
     Log ('serial=' + $Serial)
     Log ('backend=' + $Backend)
     Log ('non_dumpable=' + $NonDumpable)
+    Log ('tmp_source=' + $TmpSource)
     Log ('module SHA256=' + (Get-FileHash -Algorithm SHA256 $Kpm).Hash)
     Log ('APK SHA256=' + (Get-FileHash -Algorithm SHA256 $Apk).Hash)
     $BootBefore = Root 'cat /proc/sys/kernel/random/boot_id'
@@ -226,6 +229,17 @@ try {
     $Library = ($BaseApk -replace '/base.apk$', '/lib/arm64/libkclfapp_payload.so')
     $FpLibrary = $Library -replace 'libkclfapp_payload.so$', 'libkclfapp_fp.so'
     $HoldLibrary = $Library -replace 'libkclfapp_payload.so$', 'libkclfapp_hold.so'
+    $InstalledFpLibrary = $FpLibrary
+    if ($TmpSource) {
+        foreach ($Source in @($Library, $FpLibrary, $HoldLibrary)) {
+            $Name = ($Source -split '/')[-1]
+            Root "cp $Source $Remote/$Name && chmod 644 $Remote/$Name && restorecon $Remote/$Name" | Out-Null
+        }
+        $Library = "$Remote/libkclfapp_payload.so"
+        $FpLibrary = "$Remote/libkclfapp_fp.so"
+        $HoldLibrary = "$Remote/libkclfapp_hold.so"
+        Check ((Root "ls -lZ $Library") -match 'shell_data_file') 'tmp source retains shell_data_file label'
+    }
     Log ('payload=' + $Library)
     $AppStatus = Root "cat /proc/$TargetId/status"
     $AppStatus | Set-Content -LiteralPath (Join-Path $Results 'app-status.txt') -Encoding utf8
@@ -238,6 +252,7 @@ try {
     $Loaded = $true
     $Probe = (Ctl 'probe').Text
     Check ($Probe -match 'pt_regs=ok' -and $Probe -match 'completion=el0') 'register layout and EL0 completion available'
+    if ($TmpSource) { Check ($Probe -match 'tmp_load=shmem') 'tmpfs backing available on this kernel' }
 
     Log 'CASE: main thread, wake + unload'
     Inject-App $TargetId $TargetId ',wake,unload'
@@ -300,7 +315,7 @@ try {
         Check ($Text -match "pid=$($IdleIds[0])\([^\r\n]*state=ready") 'first payload waits at a blocked return boundary'
         Ctl "inject,$($IdleIds[1]),$Library,unload" | Out-Null
         $Watch.Restart()
-        Kpm @('ctl0', 'kclf', "inject,$($IdleIds[2]),$FpLibrary,wake,unload,linker") | Out-Null
+        Kpm @('ctl0', 'kclf', "inject,$($IdleIds[2]),$InstalledFpLibrary,wake,unload,linker") | Out-Null
         do {
             $Line = @((Ctl 'status').Text -split "`n" | Where-Object { $_ -match "pid=$($IdleIds[2])\(" }) -join ''
             if ($Line -match 'state=done' -and $Line -notmatch 'pending=| map=') { break }
@@ -335,12 +350,35 @@ try {
         Inject-App $TargetId $TargetId ',wake,unload'
     }
 
+    if ($TmpSource) {
+        Log 'CASE: retained tmp backing survives source removal and balances references'
+        $ReuseLibrary = "$Remote/reuse.so"
+        Root "cp $Library $ReuseLibrary && chmod 644 $ReuseLibrary && restorecon $ReuseLibrary" | Out-Null
+        Ctl "inject,$TargetId,$ReuseLibrary,wake" | Out-Null
+        $First = Await-State 'state=done'
+        Check ($First -match 'image=(\d+) refs=1') 'first tmp load owns one image reference'
+        $ReuseImage = $Matches[1]
+        Ctl 'reap' | Out-Null
+        Root "rm $ReuseLibrary" | Out-Null
+        Ctl "inject,$TargetId,$ReuseLibrary,wake" | Out-Null
+        Check ((Await-State 'state=done') -match "image=$ReuseImage refs=2") 'repeat load uses retained backing after original source removal'
+        Ctl 'reap' | Out-Null
+        Ctl "release,$TargetId,$ReuseImage,wake" | Out-Null
+        Check ((Await-State 'state=done') -match "image=$ReuseImage refs=1") 'first release retains the backing and image'
+        Ctl 'reap' | Out-Null
+        Ctl "release,$TargetId,$ReuseImage,wake" | Out-Null
+        Check ((Await-State 'state=done') -match "image=$ReuseImage refs=0 resident=0\+0") 'last release finalizes and removes the tmp image'
+        Ctl 'reap' | Out-Null
+        Check ((Ctl 'images').Text -match 'no manual images') 'source-removal case leaves no retained image'
+    }
+
     Log 'CASE: force-stop after completion WITHOUT reap; cold restart'
     Ctl "inject,$TargetId,$Library,wake" | Out-Null
     Await-State 'state=done' | Out-Null
     Verify-Marker $TargetId $TargetId
     if ($Backend -eq 'manual') {
         Check ((Ctl 'images').Text -match 'state=live refs=1') 'normal load registers a live manual image'
+        if ($TmpSource) { Check ((Ctl 'images').Text -match 'backing=shmem') 'tmp source owns a retained memory file' }
     } else { Check ((Root "cat /proc/$TargetId/maps") -match 'libkclfapp_payload.so') 'normal load keeps the SO in the app' }
     $OldTargetId = $TargetId
     $TargetId = Start-App
@@ -398,9 +436,10 @@ try {
     Check ($CodeStart -lt $MapStart -or $CodeStart -ge $MapEnd) 'trampoline page is a separate mapping outside the RW transient region'
     Check ($CodeSize -eq $PageSize) 'trampoline page is exactly one page'
     $HoldName = [regex]::Escape(($HoldLibrary -split '/')[-1])
-    $TrampolinePattern = '^{0}-{1} r-xp .*{2}$' -f $CodeHex, $CodeEndHex, $HoldName
+    $BackingName = if ($TmpSource) { '/kclf:' + $HoldName + ' \(deleted\)' } else { $HoldName }
+    $TrampolinePattern = '^{0}-{1} r-xp \S+ \S+ [1-9]\d*\s+.*{2}$' -f $CodeHex, $CodeEndHex, $BackingName
     Check (@($Maps -split "`n" | Where-Object { $_ -match $TrampolinePattern }).Count -eq 1) `
-        'trampoline page is file-backed and carries the module pathname'
+        'trampoline page is RX, file-backed and carries the expected backing name'
     Check ($Maps -notmatch '(?m)^\S+ r.xp 00000000 00:00 0\s*$') 'no anonymous executable mapping while the trampoline runs'
     if ($Running -match 'stack=task/') {
         Check ($MapSize -ge 2 * $PageSize -and $MapSize -le 8 * $PageSize -and $GuardStart -eq 0) 'borrowed stack uses 2..8 transient pages without an extra guard'
