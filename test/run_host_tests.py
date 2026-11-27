@@ -14,8 +14,8 @@ def main():
     environment["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
     scripts = (
         "test_helpers.py", "test_maps.py", "test_manual_elf.py", "test_manual_symbols.py", "test_provider.py",
-        "test_provider_table.py", "test_symbols.py", "test_compat.py", "test_completion.py",
-        "test_runtime.py", "tls/prepare.py",
+        "test_provider_file.py", "test_provider_table.py", "test_symbols.py", "test_compat.py",
+        "test_completion.py", "test_runtime.py", "test_worker.py", "tls/prepare.py",
     )
     for name in scripts:
         print(f"\n=== {name} ===", flush=True)
@@ -35,7 +35,7 @@ def main():
             arguments = (["4096"], ["16384"], ["65536"]) if name == "test_codegen" else ([],)
             for args in arguments:
                 subprocess.run([str(exe), *args], cwd=directory, check=True, env=environment)
-    print("\nAll 14 host suites passed (not a kernel/device certification).", flush=True)
+    print("\nAll 16 host suites passed (not a kernel/device certification).", flush=True)
 
 
 if __name__ == "__main__":

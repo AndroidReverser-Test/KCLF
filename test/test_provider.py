@@ -18,6 +18,7 @@ PRELUDE = r'''
 #include <string.h>
 
 #define KCLF_PATH_MAX 256
+#define logki(...) ((void)0)
 
 struct km_provider {
     char name[256];

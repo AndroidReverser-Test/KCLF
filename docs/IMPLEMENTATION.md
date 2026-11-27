@@ -1,8 +1,9 @@
-# KCLF 1.6.0 实现说明 / Implementation
+# KCLF 1.6.4 实现说明 / Implementation
 
-[中文](#中文) · [English](#english) · [编译与使用 / Build and use](README.md)
+[中文](#中文) · [English](#english) · [编译与使用 / Build and use](USAGE.md)
 
-本文以本分支源码为准。/ This document describes the source on this branch.
+本文描述当前源码。版本变更见 [更新记录](CHANGELOG.md)，测试依据见 [1.6.4 审计报告](AUDIT_1.6.4.md)。
+This document describes the current implementation; see the [changelog](CHANGELOG.md) and [audit](AUDIT_1.6.4.md) for release history and evidence.
 
 ## 中文
 
@@ -10,21 +11,23 @@
 
 KCLF 是 KernelPatch 加载的可重定位 KPM（`ld -r`），不是常规 Linux LKM。
 控制器通过 superkey 保护的 `kpatch ... kpm ctl0 kclf <命令>` 提交请求。
-内核安排目标线程自己的 `task_work`，在该线程的 mm、凭据及命名空间下准备映射，
-修改返回用户态的 `pt_regs`，让 EL0 跳板执行加载工作，随后恢复目标继续运行。
+准备阶段优先由 `kclf-prep` 内核线程借用目标 mm、使用目标凭据完成；能力不足时
+回退到目标线程的 `task_work`。worker 不会自动切换到目标的 mount/PID 命名空间。
+准备完成后排队目标线程的 `task_work`，修改返回用户态的 `pt_regs`，
+让 EL0 跳板执行加载工作，随后恢复目标继续运行。
 用户态函数始终在 EL0 执行，内核不直接调用 SO 构造函数。
 
 | 文件 | 职责与主要入口 |
 | --- | --- |
-| [kclf.c](kclf.c) | KPM 生命周期、命令解析、请求槽、task_work、完成观察；`kclf_ctl0`、`kclf_work_*` |
-| [kclf_internal.h](kclf_internal.h) | 状态机、请求、运行时内核接口和限制 |
-| [kclf_compat.c](kclf_compat.c)、[kclf_btf.h](kclf_btf.h) | 内核布局和 ABI 验证、BTF 解析、访问器回退 |
-| [kclf_exec.c](kclf_exec.c)、[kclf_maps.h](kclf_maps.h) | 用户内存访问、VMA/loader 解析、临时映射、现场重定向和清理 |
-| [kclf_elf.c](kclf_elf.c)、[kclf_elf.h](kclf_elf.h) | 有界 ELF64 解析、哈希/版本符号查询、重定位解码 |
-| [kclf_manual.c](kclf_manual.c) | manual 文件快照、依赖闭包、权限、初始化表及镜像引用登记 |
-| [kclf_codegen.c](kclf_codegen.c)、[kclf_codegen.h](kclf_codegen.h)、[kclf_param.h](kclf_param.h) | 每请求 AArch64 机器码生成、随机私有布局和 EL0 ABI |
-| [test/app](test/app) | 普通 Android 测试目标、payload、构建和设备回归 |
-| [kclf_tls.S](kclf_tls.S)、[kclf_tls.h](kclf_tls.h)、[test/tls](test/tls) | 驻留的 EL0 TLS 运行时、共享状态布局和 TLS 回归 |
+| [kclf.c](../kclf.c) | KPM 生命周期、命令解析、请求槽、task_work、完成观察；`kclf_ctl0`、`kclf_work_*` |
+| [kclf_internal.h](../kclf_internal.h) | 状态机、请求、运行时内核接口和限制 |
+| [kclf_compat.c](../kclf_compat.c)、[kclf_btf.h](../kclf_btf.h) | 内核布局和 ABI 验证、BTF 解析、访问器回退 |
+| [kclf_exec.c](../kclf_exec.c)、[kclf_maps.h](../kclf_maps.h) | 用户内存访问、VMA/loader 解析、临时映射、现场重定向和清理 |
+| [kclf_elf.c](../kclf_elf.c)、[kclf_elf.h](../kclf_elf.h) | 有界 ELF64 解析、哈希/版本符号查询、重定位解码 |
+| [kclf_manual.c](../kclf_manual.c) | manual 文件快照、依赖闭包、权限、初始化表及镜像引用登记 |
+| [kclf_codegen.c](../kclf_codegen.c)、[kclf_codegen.h](../kclf_codegen.h)、[kclf_param.h](../kclf_param.h) | 每请求 AArch64 机器码生成、随机私有布局和 EL0 ABI |
+| [test/app](../test/app) | 普通 Android 测试目标、payload、构建和设备回归 |
+| [kclf_tls.S](../kclf_tls.S)、[kclf_tls.h](../kclf_tls.h)、[test/tls](../test/tls) | 驻留的 EL0 TLS 运行时、共享状态布局和 TLS 回归 |
 
 ### 2. 初始化与运行时兼容
 
@@ -39,8 +42,10 @@ KCLF 是 KernelPatch 加载的可重定位 KPM（`ld -r`），不是常规 Linux
 其余情况结合 BTF 和有限版本基线决定，无法确认时拒绝。
 
 没有可验证布局时：
-- mm 使用内核 `get_task_mm` / `mmput_async` 访问器；
-- VMA 使用目标上下文的 `/proc/thread-self/maps`，由 procfs 处理锁与 rb-tree/maple-tree 差异；
+- mm 使用内核 `get_task_mm` / `mmput_async` 访问器；worker 使用自己已持有的借用 mm，
+  避免 `get_task_mm(current)` 对 PF_KTHREAD 返回 NULL；
+- VMA 使用 procfs maps，由内核处理锁与 rb-tree/maple-tree 差异；目标上下文使用
+  `/proc/thread-self/maps`，worker 使用 `/proc/<tgid>/maps`，后者仍受 procfs 访问策略限制；
 - `pt_regs` 大小可从被观察的真实 syscall wrapper 帧学习，不能扫描内核栈猜测；
 - syscall hook 只用 nofault 读取；缺少 nofault 时通过可睡眠 poll task_work 使用 GUP。
 
@@ -55,8 +60,9 @@ KCLF 是 KernelPatch 加载的可重定位 KPM（`ld -r`），不是常规 Linux
 默认 manual，不会在失败时自动切到 linker；重复、冲突或未知选项直接报错。
 
 全局控制命令用原子 busy 标记串行化。最多 4 个请求槽，每个线程只能有一个活动请求。
-持有 `struct pid` 引用避免 PID 重用误认；mm 只记录身份，不长期持有 `mm_users`，
-以免阻碍进程退出和 Binder 清理。跨线程查找在 RCU 下完成，使用前复查身份。
+持有 `struct pid` 引用避免 PID 重用误认；worker 在排队/准备期间持有 mm 与凭据引用，
+准备结束时释放。驻留镜像只记录 mm 身份，不长期持有 `mm_users`，以免阻碍进程退出和
+Binder 清理。跨线程查找在 RCU 下完成；回滚再次核对实际取得的 mm 引用，避免操作 exec 后的新 mm。
 
 正常路径：
 
@@ -69,16 +75,23 @@ ARMED -> cancel/quiesce -> CANCELLED -> reap -> IDLE
 
 `DONE` 表示观察到了完整结果；仍需等待清理，`pending=` / `map=` 表示尚未排空。
 `stage=queue|prepare|hijack|loader|restore` 表示当前阶段或失败位置。
-每个排队和执行中的 task_work 都计入 `pending`，直到回调真正退出才释放引用；
-因此“已从 task_work 链表摘下”不等于“可以重用请求槽”。
+每个排队和执行中的 task_work 都计入 `pending`，直到回调真正退出才释放引用。
+`worker_phase` 单独记录准备/回滚 worker 的所有权，其最后一次 release-store 才允许回收；
+slot、reap 和 quiesce 同时检查两者，不能只根据 pending 为零复用槽位。
+取消 queued 请求必须先认领 worker 所有权；worker 已在准备时返回 EBUSY。
+READY 请求需等 worker 退出并成功移除 task_work，才能交给回滚 worker；取消成功仍需等待排空。
 
 ### 4. 借用目标线程与安全点
 
-`inject` 建立请求后排队 `work_prepare`。默认 `TWA_RESUME` 等待线程自然返回 EL0；
+`inject` 优先提交准备 worker；只有 worker 所需能力不可用时才排队目标线程的 `work_prepare`。
+针对目标线程的 task_work 默认使用 `TWA_RESUME` 等待线程自然返回 EL0；
 `wake` 使用经验证的 `TWA_SIGNAL` 唤醒可中断等待，没有人为挂起的用户信号。
 旧 bool 通知 ABI 不支持 wake，明确返回错误。
 
-prepare 在目标上下文完成可睡眠的文件、映射、符号工作，再排队 `work_hijack`。
+worker 用 `kthread_use_mm()`、`override_creds()` 和 `access_remote_vm()` 完成
+可睡眠的文件、映射、符号工作及框架映射的页填充，再排队 `work_hijack`。
+缺少目标凭据、remote-mm 或其他必要 worker 接口时采用目标线程准备路径。
+四个槽轮询服务；同 mm 的 manual 镜像事务串行，独立目标及 linker 请求可以继续进展。
 hijack 根据已验证/学习的帧大小定位栈顶 `pt_regs`，检查用户 PC/SP、EL0t、
 64 位目标、跟踪/模拟标志、SVE/SME 状态。基础 FPSIMD 可保存，SVE/SME 不支持，
 即使用 force 也拒绝；跟踪目标同样拒绝。
@@ -95,14 +108,23 @@ AAPCS64 的 caller-saved 约定只适用于函数调用边界，不意味着任�
 
 ### 5. 临时映射、参数和现场重定向
 
-`kclf_exec_prepare` 分配一段匿名 RW 区，随机排列代码、ABI 参数、私有参数三个块，
-各为一页；各块之间和首尾可加 0–2 页随机填充。
-优先借用目标线程栈的可用下部空间：要求栈 VMA 至少 128 KiB、SP 下方至少 48 KiB，
-并预留 headroom；无法满足则增加 guard 页和 6–14 页临时栈。
-hijack 时还会检查借用栈的 SP 是否移动过大。
+`kclf_exec_prepare` 分配一段匿名 RW 区，随机排列三块：一页 ABI 参数、一页私有参数、
+一页 guard 加 6–14 页独立临时栈。各块之间和首尾可加 0–2 页随机填充。
+默认在独立临时栈运行，栈顶预留 256 字节余量。即使指定 `borrowstack`，准备时仍分配临时栈。
+只有显式 `borrowstack` 才在 hijack 边界尝试借用目标栈：要求栈 VMA 至少 128 KiB、
+SP 下方至少 48 KiB，并预留 headroom；无法满足则使用已分配的独立栈。
+hijack 还会检查借用 SP 的变化，不再执行 EL0 栈擦除。
 
-所有临时页先随机填充；代码写入后改为 RX，专用栈 guard 改为 PROT_NONE，
-参数和栈保持 RW。代码和数据没有 W+X。完成准备后刷新指令缓存。
+这段匿名区**不含任何可执行页**。每请求的 EL0 跳板是一页独立的私有文件映射：
+`kclf_map_file_code` 打开 payload 文件，把第 0 页以 `PROT_READ|PROT_EXEC` 私有映射进来，
+再用 GUP `FOLL_FORCE|FOLL_WRITE` 把生成的程序写进它的私有 COW 页。
+因此目标地址空间里既不会出现框架创建的匿名 `r-xp`，也不会出现"先映射可写、再改成可执行"
+的过渡映射（SELinux 对后者的要求见第 7 节）。参数页、私有页和临时栈仍为匿名 RW——
+这类映射在普通 Android 进程里大量存在；专用栈的 guard 页为 PROT_NONE。
+
+所有临时页先随机填充；专用栈 guard 改为 PROT_NONE，参数和栈保持 RW。
+代码页从 mmap 起就是 RX，数据页从 mmap 起就是最终权限，整个流程没有 W+X。
+完成准备后刷新指令缓存。
 私有页在前 4 KiB 布局窗口内随机分配保存 GPR、FPSIMD、FPCR/FPSR、结果和 token 的槽，
 ABI 页与私有页没有固定相邻关系。
 
@@ -121,21 +143,32 @@ ABI 页与私有页没有固定相邻关系。
 新镜像的顺序：
 
 1. 用目标凭据打开文件，以有界快照读取，限制 64 MiB。快照避免反复解析变化的文件，
-   不是文件系统原子快照；加载期间不要修改文件。
-2. 验证 ELF64、小端、AArch64、ET_DYN 和 program headers，按 PT_LOAD 分配匿名镜像，
-   预留 1–8 页随机前导 pad 及对齐余量。逐段复制文件内容，BSS 使用匿名页的零填充。
+   不是文件系统原子快照；加载期间不要修改文件。文件句柄保留到所有映射建立完成。
+2. 验证 ELF64、小端、AArch64、ET_DYN 和 program headers，预留 1–8 页随机前导 pad
+   及对齐余量。每个 PT_LOAD 的页用 `MAP_PRIVATE` 从 payload 文件同偏移映射进预留区间，
+   **一次就使用该段的最终权限**（R / RW / RX）；文件未覆盖的 .bss 尾部补匿名 RW 页。
+   镜像因此与 bionic 加载的库同形：每段在 `/proc/<pid>/maps` 中带模块路径，
+   可执行段是文件后备的 `r-xp`，段间空洞保持 PROT_NONE。
 3. 默认擦除内存 ELF 头；程序头在满足首个页及前缀范围限制时一并清除。
    解析元数据已在内核保存，后续不重新依赖这些头。`keepelf` 用于需自查 ELF 头的 payload。
    初始化前扫描动态符号表，识别本地 emutls 并设定 NODELETE 生命周期策略。
 4. 扫描目标 VMA，解析有有效 ELF 和 SONAME 的已加载提供库。maps 路径优先可用，
-   验证的直接 VMA 遍历为回退；不把框架自己的 manual 镜像隐式当作依赖库。
+   验证的直接 VMA 遍历为回退，通过 BTF 校验的 `vm_file/f_path` 和 `d_path()` 取得路径，
+   通过 `vm_pgoff/vm_flags` 取得偏移和权限。provider 元数据优先从文件页缓存读取，
+   按 PT_LOAD 几何换算文件偏移，支持 APK entry；无法按路径重开的文件使用 nofault
+   resident-only 回退，缺页即失败。文件句柄在准备结束时统一释放。
+   不把框架自己的 manual 镜像隐式当作依赖库。
    被保护应用可能额外保留同一 ELF 文件的只读私有映射（完整性扫描用），它与 loader
    的真实映射同 SONAME/路径但可执行段为 `r--`；必须要求每个可执行 PT_LOAD 落在
    可执行 VMA 内，否则跳过该候选，避免把函数地址解析到不可执行副本。
 5. 根据导入对象的路径，为每条 DT_NEEDED 选择同名 SONAME 的提供库，并按稳定顺序
    广度优先展开传递依赖，去重且处理环。
 6. 解析符号、执行可在内核完成的重定位，保存 IFUNC fixup 和初始化/析构表；
-   设置段权限，保存延迟 RELRO 范围，导出 EL0 调用元数据。
+   保存延迟 RELRO 范围，导出 EL0 调用元数据。
+
+可执行段的 `.bss` 尾部同样不能落到匿名可执行页：`p_memsz > p_filesz` 的 RX 段
+用文件内的等价长度页后备并在运行前清零；文件比该尾部还小时明确拒绝。
+前导 pad 是匿名 RW，不继承首个段的权限，因此不会变成匿名可执行页。
 
 提供库路径评分依次优先：完全相同路径、同目录、同 APEX、同分区、
 vendor/odm 来源对应的 VNDK APEX、平台 system/system_ext/product、runtime APEX，
@@ -178,8 +211,14 @@ B 是 load bias，S 是符号地址，A 是 addend；地址加法按 ELF 的模 
 导入提供库的 IFUNC 时记录 resolver、写入位置、addend 三元组，延迟到 EL0，
 不会从 EL1 执行 resolver；需要写 init/fini 数组的 IFUNC fixup 明确拒绝。
 
-镜像先整体 PROT_NONE，再给各 PT_LOAD 设置 R/RW/RX，空洞及尾部对齐空间保持不可访问。
-前导 pad 使用首个段的权限以允许 VMA 合并。
+镜像地址区间先以 PROT_NONE 预留，随后每个 PT_LOAD 直接以最终权限（R/RW/RX）映射，
+空洞及尾部对齐空间保持不可访问，前导 pad 在段映射完成后改为匿名 RW。
+**镜像里不存在"先可写、后加执行"的页**：SELinux 对私有文件映射的
+`mmap(PROT_READ|PROT_WRITE) -> mprotect(PROT_READ|PROT_EXEC)` 要求 `execmod`
+（`avc: denied { execmod } ... tclass=file`），而 `untrusted_app` 没有该权限；
+只读页上的 ELF 头擦除与 .bss 清零因此改走 GUP `FOLL_FORCE` 写私有 COW 页
+（与调试器给共享库 .text 打断点同一机制），既不经过 mmap/mprotect 授权检查，
+也不产生 W+X 映射。
 **GNU_RELRO 在所有 EL0 初始化/析构工作完成后的 cleanup 中由 EL1 应用**；
 构造期间相关页仍可写，即使没有 IFUNC 也一样。失败逐范围重试，
 没有成功应用全部保护就不提交驻留镜像。这比常规 linker 更晚施加 RELRO。
@@ -192,6 +231,8 @@ linker 常把 GNU_RELRO 的 memsz 向上取整到页边界，因此其尾部可�
 每请求随机代码页内容、入口偏移、x19–x26 的八种工作寄存器角色、
 FPSIMD 槽顺序、GPR 恢复顺序及只修改失活临时值的填充指令。
 入口前有一条可落入的 restart pad，入口为 `bti c`。
+生成结果写进 payload 文件第 0 页的私有映射（`kclf_map_file_code`），
+因此 EL0 执行期间 PC 始终落在 `/proc/<pid>/maps` 中有模块路径的映射里。
 
 程序先保存 q0–q31、FPCR、FPSR 到私有页，然后分后端执行：
 
@@ -209,7 +250,8 @@ FPSIMD 槽顺序、GPR 恢复顺序及只修改失活临时值的填充指令。
 
 生成程序自身没有 SVC 指令；其完成尾部也不调用库、不制造故障或信号。
 但 payload、IFUNC 和 linker 调用仍可产生普通系统调用、信号和其他副作用。
-随机布局不构成不可检测保证，x16、匿名映射和中间现场仍可被观察。
+随机布局不构成不可检测保证：文件后备的跳板页、临时匿名 RW 区和中间现场仍可被观察，
+镜像也仍会改变目标的 VMA 数量与 VmSize/VmPeak 记账。
 
 ### 9. 完成观察与清理
 
@@ -221,10 +263,10 @@ EL0 写入 token 不触发专门的内核事件。观察有两条路径：
   在目标上下文用可睡眠 GUP 读取，状态显示 `done=poll`。
   原请求带 wake 时 poll 也允许唤醒，避免目标完成后再次阻塞而无法清理。
 
-token 在最后 RET 前就写入，因此 poll 还检查保存的 PC 已离开整个临时区，
+token 在最后 RET 前就写入，因此 poll 还检查保存的 PC 已离开整个临时区与跳板页，
 避免中断恰落在恢复尾部时提前解除代码映射。
 只在结果字段完整读取后发布 DONE，再排队目标上下文的 cleanup：
-先应用全部 RELRO，随后提交/释放 manual 引用并解除临时区。
+先应用全部 RELRO，随后提交/释放 manual 引用，再解除文件后备的跳板页和临时区。
 RELRO 失败和映射清理失败有有界重试，耗尽后保留所有权和诊断，不能当作成功。
 `status` 先渲染再排队本次 poll，可能需要后续查询才能看到完成。
 
@@ -251,9 +293,10 @@ payload 本地 ELF TLS 由框架自带的 EL0 运行时实现（`kclf_tls.S` / `
 
 - prepare 读取 PT_TLS 的 memsz/filesz/align/vaddr，验证 TLSDESC 目标位于可写段、
   offset 落在 PT_TLS 内，且只接受 payload 自身定义的 `STT_TLS` 符号；外部 TLS 拒绝。
-- 在目标 mm 内建立一段独立映射：RX 代码页，以及经 RELRO 变为只读的状态、descriptor
-  参数和已重定位模板页。首次加载时，EL0 在调用任何构造函数前执行 `pthread_key_create`，
-  失败则返回错误、不进入 payload 构造函数。
+- 在目标 mm 内建立一段独立的匿名 RW 映射存放状态、descriptor 参数和已重定位模板
+  （经 RELRO 变为只读），另用 `kclf_map_file_code` 把 EL0 运行时代码页作为 payload
+  文件的私有 `r-xp` 映射装入。首次加载时，EL0 在调用任何构造函数前执行
+  `pthread_key_create`，失败则返回错误、不进入 payload 构造函数。
 - 每线程首次访问 TLSDESC 时，resolver 用 `pthread_getspecific` 查块；慢路径先屏蔽
   信号再复查，避免信号重入看到半初始化块。线程块用匿名 mmap 提供零填充 .tbss，
   按 PT_TLS 的 align 和首字节偏置定位，并复制已重定位模板。
@@ -280,7 +323,7 @@ manual 明确拒绝：外部/跨 DSO TLS、TLS_DTPMOD/DTPREL/TPREL 等非 TLSDES
 重复或非法对齐/超限的 PT_TLS、外部或无法验证的 emutls、线程析构注册入口、
 需要解析的 payload 自定义 IFUNC、IRELATIVE、GNU_UNIQUE、REL/textrel、
 PT_INTERP、PT_GNU_PROPERTY、可执行栈、非可读或 W+X 段、共享/重叠 PT_LOAD 页、
-不支持的动态 flags/filter/preinit，以及跨 DSO CFI 导入。
+可执行段 `.bss` 尾部大于文件、不支持的动态 flags/filter/preinit，以及跨 DSO CFI 导入。
 初始化/析构入口必须在 payload 自身可执行段。
 
 manual 不把 payload TLS 注册到 bionic TLS，也不插入 soinfo、debugger 或异常展开登记，
@@ -330,9 +373,9 @@ payload 构造函数写 files/hit_<pid>，记录 PID/TID 和构造地址；
 device-test.ps1 支持 manual/linker、重复次数、指定 APK/KPM 和 poll 预期，
 检查 marker、映射回收、引用、取消、多槽、退出/restart、FPSIMD 和排空卸载，
 同时保存日志并检查新增内核告警/App 崩溃。它会安装和停止自建测试 App，
-不会把编译成功当作设备回归通过。`make test` 提供 14 组主机测试；
+不会把编译成功当作设备回归通过。`make test` 提供 16 组主机测试；
 `test/tls/device-test.py` 验证 TLS 和失败回滚。历史实验保留在 dev；
-构建复现和控制命令见 README。
+构建复现和控制命令见 [使用说明](USAGE.md)。
 
 ## English
 
@@ -340,22 +383,24 @@ device-test.ps1 支持 manual/linker、重复次数、指定 APK/KPM 和 poll �
 
 KCLF is a relocatable KernelPatch KPM built with `ld -r`, rather than a standard
 Linux LKM. A controller submits superkey-protected `kpatch ... kpm ctl0 kclf`
-commands. The kernel schedules task_work on the target thread, prepares mappings
-in its mm, credentials and namespaces, redirects its return-to-user pt_regs,
-and lets an EL0 trampoline perform the loading work before resuming the thread.
+commands. Preparation normally runs on the kclf-prep kernel thread with the
+target mm and credentials; unavailable worker capabilities select target task_work
+preparation instead. The worker does not automatically adopt the target mount/PID
+namespaces. Target task_work then redirects return-to-user pt_regs so an EL0
+trampoline can perform loading before resuming the thread.
 User functions, including constructors, execute in EL0.
 
 | Source | Responsibility and entry points |
 | --- | --- |
-| [kclf.c](kclf.c) | KPM lifecycle, commands, request slots, task_work and completion; kclf_ctl0, kclf_work_* |
-| [kclf_internal.h](kclf_internal.h) | States, requests, runtime kernel interfaces and limits |
-| [kclf_compat.c](kclf_compat.c), [kclf_btf.h](kclf_btf.h) | Runtime layouts, ABI validation, BTF and accessor fallbacks |
-| [kclf_exec.c](kclf_exec.c), [kclf_maps.h](kclf_maps.h) | User access, VMA/loader lookup, transient mapping, redirection and cleanup |
-| [kclf_elf.c](kclf_elf.c), [kclf_elf.h](kclf_elf.h) | Bounded ELF64, hash/version lookup and relocation decoding |
-| [kclf_manual.c](kclf_manual.c) | File snapshots, dependencies, protection, call vectors and image references |
-| [kclf_codegen.c](kclf_codegen.c), [kclf_codegen.h](kclf_codegen.h), [kclf_param.h](kclf_param.h) | Per-request AArch64 machine code, private layouts and EL0 ABI |
-| [test/app](test/app) | Android target, payloads, build and device regression |
-| [kclf_tls.S](kclf_tls.S), [kclf_tls.h](kclf_tls.h), [test/tls](test/tls) | Resident EL0 TLS runtime, shared state layout and regression |
+| [kclf.c](../kclf.c) | KPM lifecycle, commands, request slots, task_work and completion; kclf_ctl0, kclf_work_* |
+| [kclf_internal.h](../kclf_internal.h) | States, requests, runtime kernel interfaces and limits |
+| [kclf_compat.c](../kclf_compat.c), [kclf_btf.h](../kclf_btf.h) | Runtime layouts, ABI validation, BTF and accessor fallbacks |
+| [kclf_exec.c](../kclf_exec.c), [kclf_maps.h](../kclf_maps.h) | User access, VMA/loader lookup, transient mapping, redirection and cleanup |
+| [kclf_elf.c](../kclf_elf.c), [kclf_elf.h](../kclf_elf.h) | Bounded ELF64, hash/version lookup and relocation decoding |
+| [kclf_manual.c](../kclf_manual.c) | File snapshots, dependencies, protection, call vectors and image references |
+| [kclf_codegen.c](../kclf_codegen.c), [kclf_codegen.h](../kclf_codegen.h), [kclf_param.h](../kclf_param.h) | Per-request AArch64 machine code, private layouts and EL0 ABI |
+| [test/app](../test/app) | Android target, payloads, build and device regression |
+| [kclf_tls.S](../kclf_tls.S), [kclf_tls.h](../kclf_tls.h), [test/tls](../test/tls) | Resident EL0 TLS runtime, shared state layout and regression |
 
 ### 2. Initialization and runtime compatibility
 
@@ -373,9 +418,11 @@ Unambiguous cancel_match/cancel_func APIs take priority; remaining cases use BTF
 and limited version baselines, rejecting unknown ABIs.
 
 Without verified layouts:
-- mm uses get_task_mm/mmput_async accessors;
-- /proc/thread-self/maps supplies a kernel-locked VMA view independent of
-  rb-tree/maple-tree internals;
+- mm uses get_task_mm/mmput_async accessors; the worker returns its already
+  pinned borrowed mm because get_task_mm(current) returns NULL for PF_KTHREAD;
+- procfs supplies a kernel-locked VMA view independent of rb-tree/maple-tree
+  internals: /proc/thread-self/maps in target context, /proc/<tgid>/maps in the
+  worker, subject to procfs access policy;
 - pt_regs size can be learned from a real observed syscall-wrapper frame,
   without scanning the stack for a plausible frame;
 - syscall hooks use nofault reads only; sleepable poll task_work can use GUP.
@@ -394,8 +441,11 @@ automatic linker fallback. Unknown, duplicate or conflicting options fail.
 
 An atomic busy flag serializes control commands. There are four request slots
 and at most one active request per thread. A struct pid reference prevents PID
-reuse confusion. mm is an identity only: the module does not retain mm_users and
-delay process/Binder teardown. Task lookup uses RCU and identity rechecks.
+reuse confusion. The worker holds mm and credential references during queuing
+and preparation, then drops them when preparation ends. Resident images retain
+mm identity only, without pinning mm_users and delaying process/Binder teardown.
+Task lookup uses RCU. Rollback validates the mm reference actually acquired,
+preventing unmapping through a replacement mm after exec.
 
 ```text
 IDLE -> ARMED -> PREPARING -> READY -> RUNNING -> DONE -> reap -> IDLE
@@ -408,16 +458,26 @@ DONE means a complete result was observed; cleanup may still be pending.
 pending= or map= means draining is incomplete.
 stage=queue|prepare|hijack|loader|restore identifies progress or failure.
 Every queued and executing task_work holds a pending reference until its callback
-actually exits. A detached callback is not yet safe to reuse.
+actually exits. worker_phase separately tracks preparation/rollback ownership;
+its final release-store publishes availability. Slot reuse, reap and quiesce
+check both. Cancellation must claim queued worker ownership first; active
+preparation returns EBUSY. READY cancellation waits for worker exit and successful
+task_work removal before queuing rollback. Accepted cancellation still needs draining.
 
 ### 4. Borrowing a thread and choosing a boundary
 
-inject queues work_prepare. Default TWA_RESUME waits for a natural EL0 return;
+inject submits preparation to the worker, or queues target work_prepare when
+worker capabilities are unavailable. Target task_work defaults to TWA_RESUME,
+waiting for a natural EL0 return;
 wake requests the validated TWA_SIGNAL mechanism to wake interruptible waits
 without synthesizing a pending user signal. Older bool notification ABIs reject wake.
 
-Preparation performs sleepable I/O, mapping and symbol work in target context,
-then queues work_hijack. Hijack locates pt_regs using its verified/learned size,
+The worker uses kthread_use_mm(), override_creds() and access_remote_vm() for
+sleepable I/O, mapping, symbols and framework-page population, then queues
+work_hijack. Missing credential, remote-mm or other required worker services
+select target-thread preparation. Round-robin service covers all four slots;
+manual transactions serialize per mm while independent targets and linker
+requests can progress. Hijack locates pt_regs using its verified/learned size,
 checks PC/SP, EL0t, 64-bit execution, tracing/emulation flags and SVE/SME state.
 Only base FPSIMD is supported. SVE/SME and traced targets remain rejected with force.
 
@@ -436,17 +496,29 @@ intermediate register-restoration states.
 ### 5. Transient mapping, parameters and redirection
 
 kclf_exec_prepare allocates anonymous RW memory and randomly orders three
-one-page blocks: code, ABI parameters and private state. It adds zero to two
-padding pages between blocks and at the ends. It first tries borrowing unused
-space below the target SP, requiring a stack VMA of at least 128 KiB and at least
-48 KiB below SP, with headroom. Otherwise it adds a guard page and a six-to-fourteen
-page temporary stack. Hijack rechecks that a borrowed SP has not moved too far.
+blocks: one page each for ABI parameters and private state, plus a guard page
+and a six-to-fourteen page dedicated stack. Zero to two padding pages separate
+blocks and the ends. The default is the dedicated stack with 256 bytes of
+headroom; it is allocated even with borrowstack. Only explicit borrowstack tries
+target-stack space at hijack, requiring a VMA of at least 128 KiB and at least
+48 KiB below SP with headroom. Otherwise it uses the dedicated stack. Hijack
+rechecks borrowed SP movement. The EL0 trampoline no longer wipes the borrowed stack.
 
-Pages start with random filler. Written code becomes RX, the dedicated stack guard
-becomes PROT_NONE, and parameter/stack pages remain RW. No code/data page is W+X;
-instruction caches are flushed after preparation. Private GPR, FPSIMD, FPCR/FPSR,
-result and token fields occupy random nonoverlapping offsets within a 4 KiB layout
-window, even with larger pages. ABI and private pages are separate randomized blocks.
+That anonymous region contains **no executable page**. The per-request EL0
+trampoline is a separate one-page private file mapping: kclf_map_file_code opens
+the payload, maps file page 0 with PROT_READ|PROT_EXEC, and fills it through its
+private COW page with GUP FOLL_FORCE|FOLL_WRITE. The target therefore never gains
+an anonymous r-xp VMA from KCLF, and no writable mapping is turned executable
+later (the SELinux execmod requirement is described in section 7). Parameter,
+private and temporary-stack pages remain anonymous RW, a mapping form every
+Android process already has in quantity; the dedicated stack guard is PROT_NONE.
+
+Pages start with random filler, the dedicated stack guard becomes PROT_NONE, and
+parameter/stack pages remain RW. The code page is RX from mmap on, data pages use
+their final protection from mmap on, and no mapping is ever W+X; instruction
+caches are flushed after preparation. Private GPR, FPSIMD, FPCR/FPSR, result and
+token fields occupy random nonoverlapping offsets within a 4 KiB layout window,
+even with larger pages. ABI and private pages are separate randomized blocks.
 
 Before redirection, the request saves x0–x30, SP, PC and PSTATE; the private page
 receives GPRs, SP, PC and NZCV. The return frame then receives the trampoline PC/SP,
@@ -464,25 +536,48 @@ For a new image:
 
 1. Open with target credentials and read a bounded snapshot, at most 64 MiB.
    This avoids reparsing changing file contents but is not an atomic filesystem
-   snapshot; do not modify the file during loading.
-2. Validate little-endian ELF64/AArch64 ET_DYN and program headers. Reserve an
-   anonymous image with one-to-eight random leading pages and alignment slack.
-   Copy PT_LOAD file bytes; anonymous zero-fill supplies BSS.
+   snapshot; do not modify the file during loading. The file stays open until all
+   mappings are installed.
+2. Validate little-endian ELF64/AArch64 ET_DYN and program headers. Reserve
+   one-to-eight random leading pages plus alignment slack, then map every PT_LOAD
+   page with MAP_PRIVATE from the payload file at the same offset, **directly with
+   that segment's final protection** (R, RW or RX); anonymous RW pages supply the
+   BSS tail the file does not cover. The image therefore looks like a
+   bionic-loaded library: each segment carries the module pathname in
+   /proc/<pid>/maps, the executable segment is a file-backed r-xp, and the gaps
+   between segments stay PROT_NONE.
 3. Scrub the in-memory ELF header by default. Program headers are also cleared
    when their extent fits the first-page/prefix bounds. Kernel metadata is already
    captured. keepelf supports payloads that inspect their own headers.
    Scan dynsym before initialization to identify local emutls and set NODELETE policy.
 4. Scan VMAs for valid loaded ELF providers with SONAMEs. Prefer maps pathnames,
-   with verified direct VMA traversal as fallback. Existing manual images are
-   excluded as implicit dependency providers. A protected app can keep an extra
-   read-only private mapping of the same ELF file for integrity scanning; it has
-   the same SONAME/path but no executable segment. Every executable PT_LOAD must
-   be covered completely by executable VMAs or the candidate is skipped, so function addresses
-   cannot resolve into a non-executable copy.
+   with verified direct VMA traversal as fallback. The direct walker derives the
+   same metadata from BTF-verified fields: `vm_file` + `f_path` + `d_path()` for
+   the pathname, `vm_pgoff` for the file offset and `vm_flags` for permissions.
+   That matters for non-dumpable targets, where `/proc/<tgid>/maps` is denied even
+   with the target's credentials. Existing manual images are excluded as implicit
+   dependency providers. A protected app can keep an extra read-only private
+   mapping of the same ELF file for integrity scanning; it has the same
+   SONAME/path but no executable segment. Every executable PT_LOAD must be
+   covered completely by executable VMAs or the candidate is skipped, so function
+   addresses cannot resolve into a non-executable copy.
+   Provider ELF headers, dynamic sections and symbol tables are read from the
+   file page cache (`filp_open` + `kernel_read`) and translated from the loaded
+   virtual address back to a file offset through the provider's own PT_LOAD
+   geometry; `vm_pgoff` also supports APK-embedded entries. No provider page is
+   touched through GUP. A memfd/unlinked provider that cannot be reopened by path
+   falls back to `copy_from_user_nofault`: the parse succeeds only for pages that
+   are already resident, and a missing page fails instead of being faulted in.
 5. Resolve each DT_NEEDED using the importing object's origin and expand a stable
    breadth-first transitive dependency closure with deduplication/cycle handling.
 6. Resolve symbols and kernel-side relocations, retain IFUNC fixups and call
-   vectors, set segment permissions, record deferred RELRO and export EL0 metadata.
+   vectors, record deferred RELRO and export EL0 metadata.
+
+An executable segment whose p_memsz exceeds p_filesz must not fall back to an
+anonymous executable tail either: it is backed by an equivalent file range and
+zeroed before the payload runs, and rejected when the file is smaller than that
+tail. The leading pad is anonymous RW rather than inheriting the first segment's
+protection, so it never becomes an anonymous executable page.
 
 Provider ranking prefers exact path, same directory, same APEX, same partition,
 VNDK APEX for vendor/odm importers, platform system/system_ext/product, runtime APEX,
@@ -531,9 +626,17 @@ arithmetic. Processing order is RELR, APS2, regular RELA and PLT RELA, sharing a
 cumulative relocation limit. Imported provider IFUNCs produce resolver/destination/
 addend triples for EL0 execution. IFUNC fixups into init/fini arrays are rejected.
 
-The whole image first becomes PROT_NONE, then PT_LOAD segments receive R/RW/RX.
-Holes and trailing alignment slack remain inaccessible. Leading pad inherits the
-first segment's permissions to allow VMA merging.
+The image address range is reserved PROT_NONE first, then every PT_LOAD is mapped
+with its final protection (R/RW/RX). Holes and trailing alignment slack remain
+inaccessible; the leading pad becomes anonymous RW once the segments are mapped.
+**No page in the image is made writable and then executable**: SELinux requires
+execmod for `mmap(PROT_READ|PROT_WRITE) -> mprotect(PROT_READ|PROT_EXEC)` on a
+private file mapping (`avc: denied { execmod } ... tclass=file`), and
+untrusted_app does not have it. Scrubbing the ELF header and clearing .bss in
+read-only pages therefore go through GUP FOLL_FORCE writes to the private COW
+page (the same mechanism a debugger uses to plant a breakpoint in a shared
+library's .text), which consults neither the mmap nor the mprotect hook and
+never creates a W+X mapping.
 **GNU_RELRO is applied by EL1 cleanup after all EL0 initialization/finalization.**
 Those pages remain writable during constructors, even without IFUNCs.
 Protection is retried per range; no resident image is committed before all ranges
@@ -547,7 +650,9 @@ segment's page-rounded extent; otherwise the image is rejected.
 kclf_prog_build directly encodes AArch64 instructions and patches branches.
 Each request randomizes code-page contents, entry offset, eight working roles
 across x19–x26, FPSIMD slots, GPR restore order and filler touching dead temporaries.
-A fall-through restart pad precedes a bti c entry.
+A fall-through restart pad precedes a bti c entry. The generated program is written
+into a private mapping of payload file page 0 (`kclf_map_file_code`), so EL0 always
+runs with its PC in a mapping that carries the module pathname.
 
 The program saves q0–q31, FPCR and FPSR to the private page, then dispatches:
 
@@ -568,8 +673,10 @@ BTI-protected function does not require a new branch landing pad.
 The generated program contains no SVC instruction, and its completion tail makes
 no library call and deliberately raises no fault/signal. Payload, IFUNC and linker
 calls can still make syscalls or have other side effects.
-Randomized layouts do not guarantee undetectability; x16, mappings and intermediate
-contexts remain observable.
+Randomized layouts do not guarantee undetectability: the file-backed trampoline
+page, the transient anonymous RW region and intermediate contexts remain
+observable, and the image still changes the target's VMA count and VmSize/VmPeak
+accounting.
 
 ### 9. Completion observation and cleanup
 
@@ -584,9 +691,10 @@ Publishing the token triggers no dedicated kernel event. Two observers exist:
   A wake-enabled request also allows poll to wake the thread if it blocks again.
 
 The token precedes the final RET, so poll also verifies that the saved PC has left
-the entire transient allocation before reclaiming it. Complete result reads
-precede publication of DONE. Target-context cleanup then applies every RELRO
-range, commits/releases manual ownership and unmaps the transient region.
+the entire transient region and the trampoline page before reclaiming either.
+Complete result reads precede publication of DONE. Target-context cleanup then
+applies every RELRO range, commits/releases manual ownership, unmaps the
+file-backed trampoline page and finally the transient region.
 Protection and mapping failures have bounded retries; exhaustion retains ownership
 and diagnostics. status renders before queuing its own poll, so a later query may
 be needed to see completion.
@@ -619,9 +727,11 @@ Payload-local ELF TLS is implemented by a framework-owned EL0 runtime
 - prepare reads PT_TLS memsz/filesz/align/vaddr, validates that every TLSDESC target
   is writable and every offset lies inside PT_TLS, and accepts only payload-defined
   `STT_TLS` symbols; external TLS is rejected.
-- A separate target mapping holds an RX code page plus read-only (after RELRO) state,
-  descriptor arguments and the relocated template. On first load, EL0 calls
-  `pthread_key_create` before any payload constructor; failure aborts the load.
+- A separate anonymous RW target mapping holds the state, descriptor arguments and
+  the relocated template (made read-only by RELRO); the EL0 runtime code page is a
+  private r-xp mapping of the payload file installed by `kclf_map_file_code`. On
+  first load, EL0 calls `pthread_key_create` before any payload constructor;
+  failure aborts the load.
 - On a thread's first TLSDESC access the resolver looks the block up with
   `pthread_getspecific`. The slow path blocks signals and rechecks, so a nested
   signal handler cannot observe a half-initialized block. Per-thread blocks are
@@ -653,9 +763,9 @@ Manual rejects external/cross-DSO TLS, TLS_DTPMOD/DTPREL/TPREL and other non-TLS
 relocations, duplicate or invalid/oversized PT_TLS, external/unverifiable emutls,
 thread-destructor registration, resolved payload-defined IFUNCs, IRELATIVE, GNU_UNIQUE,
 REL/textrel, PT_INTERP, PT_GNU_PROPERTY, executable stacks, non-readable/W+X segments,
-overlapping/shared PT_LOAD pages, unsupported dynamic flags/filter/preinit, and
-cross-DSO CFI imports. Initializer/finalizer addresses must lie in the payload's own
-executable segments.
+overlapping/shared PT_LOAD pages, an executable segment `.bss` tail larger than the
+file, unsupported dynamic flags/filter/preinit, and cross-DSO CFI imports.
+Initializer/finalizer addresses must lie in the payload's own executable segments.
 
 It does not register payload TLS with bionic, and does not register soinfo, debugger
 or unwind metadata, or automatically call JNI_OnLoad. TLS variables are visible only
@@ -714,16 +824,18 @@ device-test.ps1 selects manual/linker, repetitions, APK/KPM and expected poll mo
 It checks markers, mapping reclamation, references, cancellation, slots, exit/restart,
 FPSIMD and draining, retaining logs and checking new kernel warnings/app crashes.
 It installs/stops the test app. Compilation success does not establish device
-regression success. `make test` runs 14 host suites; `test/tls/device-test.py` covers TLS and rollback.
+regression success. `make test` runs 16 host suites; `test/tls/device-test.py` covers TLS and rollback.
 Historical experiments remain on dev;
-README supplies reproducible build and control commands.
+[Usage](USAGE.md) supplies reproducible build and control commands.
 
 
-### 1.6.0 TLS compatibility and cost / TLS 兼容性与开销
+### TLS compatibility and cost / TLS 兼容性与开销
 
 权限缓存最多 16,384 个区间（ARM64 约 384 KiB），准备阶段扫描 maps 一次，
-每段二分定位后检查相邻 VMA；不会为每个提供库重读 maps。maps 读取失败会终止准备，
-直接遍历回退仍以 `prot=-1` 标明未知权限，不能据此保证提供库可执行。
+每段二分定位后检查相邻 VMA；不会为每个提供库重读 maps。procfs maps 不可用时，
+direct walker 用 BTF 校验的 `vm_flags` 恢复权限、`vm_pgoff` 恢复文件偏移、
+`d_path()` 恢复路径，因此不再退化为 `prot=-1`。provider 元数据从文件页缓存
+读取，不建立也不读取目标映射页。
 快照与映射解析之间没有 linker 锁；调用方必须保证依赖不被并发卸载。
 
 TLS 热路径一次 pthread_getspecific，无系统调用、分配或全局锁；为保持 TLSDESC ABI，
@@ -734,8 +846,10 @@ TLS 热路径一次 pthread_getspecific，无系统调用、分配或全局锁�
 
 The permission cache holds up to 16,384 ranges (about 384 KiB on ARM64), with one
 maps pass followed by binary searches and adjacent-range checks. Read errors abort
-preparation. Direct-walker fallback retains unknown permissions (`prot=-1`), and
-there is no linker lock against concurrent dependency removal.
+preparation. Since 1.6.3 the direct-walker fallback also recovers permissions,
+file offsets and pathnames from BTF `vm_flags`/`vm_pgoff` and `d_path()`, so it
+no longer degrades to `prot=-1`. There is no linker lock against concurrent
+dependency removal.
 
 A warm TLS access calls pthread_getspecific without syscalls, allocation or a
 global lock, but preserves GPRs, full FPSIMD and FP control/status in an 800-byte

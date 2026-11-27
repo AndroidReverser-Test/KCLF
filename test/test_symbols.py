@@ -19,8 +19,9 @@ PRELUDE = r'''
 #include <string.h>
 #include <sys/types.h>
 typedef uint64_t u64;
+typedef int32_t s32;
 typedef unsigned short umode_t;
-struct task_struct; struct callback_head; struct pid; struct mm_struct; struct vm_area_struct; struct file;
+struct task_struct; struct callback_head; struct pid; struct mm_struct; struct vm_area_struct; struct file; struct cred;
 #define logke(...) ((void)0)
 static void (*kclf_rcu_read_lock)(void), (*kclf_rcu_read_unlock)(void);
 static u64 (*kclf_ktime_get)(void);

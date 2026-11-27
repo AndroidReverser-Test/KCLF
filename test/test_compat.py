@@ -28,8 +28,10 @@ PRELUDE = r'''
 typedef uint64_t u64;
 struct callback_head { int unused; } work;
 struct mm_struct { int unused; } target_mm;
-struct task_struct { unsigned char bytes[16384]; } task;
-#define current (&task)
+struct task_struct { unsigned char bytes[16384]; } mock_current;
+#define current (&mock_current)
+static struct task_struct *kclf_io_worker;
+static struct mm_struct *kclf_io_mm;
 static unsigned int kver;
 static int kclf_mm_off = -1, gets, puts_count;
 static unsigned char *btf;
@@ -37,7 +39,10 @@ static size_t btf_len;
 static int cancel_symbol;
 static struct callback_head *fake_cancel(struct task_struct *p, void (*fn)(struct callback_head *))
 { (void)p; (void)fn; return &work; }
-static struct mm_struct *fake_get(struct task_struct *p) { assert(p == current); gets++; return &target_mm; }
+static struct mm_struct *fake_get(struct task_struct *p) {
+    assert(p == current); gets++;
+    return kclf_io_worker == current ? NULL : &target_mm;
+}
 static void fake_put(struct mm_struct *mm) { assert(mm == &target_mm); puts_count++; }
 static void fake_lock(void *p) { (void)p; }
 static void fake_mmap_lock(struct mm_struct *p) { (void)p; }
@@ -141,6 +146,13 @@ int main(int argc, char **argv) {
     assert(kclf_btf_ok && !kclf_vma_direct && !kclf_regs_size && kclf_mm_off == -1);
     assert(gets == puts_count);
     puts("partial BTF uses accessor/procfs/wrapper fallbacks independently: PASS");
+    kclf_io_worker = current;
+    kclf_io_mm = &target_mm;
+    int worker_gets = gets;
+    assert(kclf_task_mm(current) == &target_mm && gets == worker_gets);
+    kclf_io_worker = NULL;
+    kclf_io_mm = NULL;
+    puts("no-BTF preparation worker uses its pinned mm without get_task_mm(PF_KTHREAD): PASS");
     if (argc == 2) {
         FILE *f = fopen(argv[1], "rb");
         long size;
@@ -156,8 +168,8 @@ int main(int argc, char **argv) {
         fclose(f);
         assert(!kclf_btf_open(&b, btf, btf_len));
         offset = kclf_btf_member_range(&b, "task_struct", "mm", 8, 8);
-        assert(offset > 0 && offset < (int)sizeof(task) - 8);
-        memcpy(task.bytes + offset, &mm, sizeof(mm));
+        assert(offset > 0 && offset < (int)sizeof(mock_current) - 8);
+        memcpy(mock_current.bytes + offset, &mm, sizeof(mm));
         reset(VERSION(6,1,134));
         assert(!kclf_compat_init() && kclf_btf_ok && kclf_vma_direct && kclf_regs_size == 336);
         assert(kclf_mm_off == offset && gets == puts_count);
@@ -170,7 +182,7 @@ int main(int argc, char **argv) {
         kclf_ks.find_vma = NULL;
         assert(!kclf_compat_init() && !kclf_vma_direct);
         reset(VERSION(6,1,134));
-        memset(task.bytes + offset, 0, sizeof(mm));
+        memset(mock_current.bytes + offset, 0, sizeof(mm));
         assert(!kclf_compat_init() && kclf_mm_off == -1);
         assert(kclf_task_mm(current) == &target_mm && gets == puts_count);
         free(btf);

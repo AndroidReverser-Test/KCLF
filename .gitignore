@@ -9,3 +9,4 @@
 *.keystore
 __pycache__/
 /build/
+/prog.bin

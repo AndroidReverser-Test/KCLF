@@ -6,6 +6,7 @@
 #include "kclf_internal.h"
 #include "kclf_elf.h"
 #include "kclf_tls.h"
+#include <log.h>
 #include <kputils.h>
 #include <linux/string.h>
 #include <linux/kernel.h>
@@ -38,11 +39,20 @@
 #define KM_PUT 3
 #define KM_DROP 4
 
+/* values are kept local so the module does not depend on uapi stubs */
+#define KM_PROT_READ 0x1
+#define KM_PROT_WRITE 0x2
+#define KM_PROT_EXEC 0x4
+#define KM_MAP_PRIVATE 0x02
+#define KM_MAP_FIXED 0x10
+#define KM_MAP_ANONYMOUS 0x20
+
 struct kclf_manual_image {
     int state;
     u32 refs, nfini;
     u64 id, mm, map, length, bias;
     u64 tls_map, tls_length;
+    u64 tls_code, tls_code_len; /* EL0 TLS runtime code page (file-backed) */
     struct pid *owner; /* process (TGID), not the borrowed execution thread */
     char path[KCLF_PATH_MAX];
     u64 fini[KM_CALLS];
@@ -52,8 +62,29 @@ struct kclf_manual_image {
     u64 linker_base, linker_end;
 };
 
+struct km_context;
+/* Provider metadata is read from the file's page cache, not from the target's
+ * mapped PT_LOAD pages.  GUP-reading a cold provider page would fault it into
+ * the target mm and raise the target's own VmRSS/VmHWM, which an in-process
+ * integrity checker can observe as "an unknown module was parsed here".  The
+ * view translates target virtual addresses back to file offsets using the
+ * mapping's vm_pgoff and the provider's own PT_LOAD geometry. */
+struct km_provider_view {
+    struct km_context *owner;
+    struct ke_object *object; /* object whose ph[] describes the loaded image */
+    struct file *file;
+    u64 file_size;
+    u64 header_addr; /* mapping address whose file position is header_off */
+    u64 header_off;
+    u64 header_end; /* end of the contiguous ELF header + program-header table */
+    u64 file_base; /* file position of ELF offset zero */
+    u64 bias;
+    u64 string_budget;
+};
 struct km_provider {
     struct ke_object object;
+    struct km_provider_view view;
+    struct ke_io io;
     char name[KE_NAME]; /* DT_SONAME */
     char path[KCLF_PATH_MAX]; /* maps pathname: namespace/load-origin evidence */
 };
@@ -62,9 +93,13 @@ struct km_context {
     struct kclf_req *r;
     struct ke_io io;
     struct ke_object object, candidate;
+    struct km_provider_view probe; /* scratch file view for one candidate */
+    struct ke_phdr probe_ph[KE_PHNUM]; /* raw provider headers, never on stack */
     struct km_provider *providers; /* vmalloc'ed, grown on demand */
     unsigned nproviders, provider_cap;
+    unsigned nfile_providers, nresident_providers; /* discovery source counters */
     unsigned nscope, scope[KM_SCOPE];
+    struct file *file; /* payload, opened with target credentials */
     void *snapshot;
     unsigned long file_size;
     u64 *values;
@@ -121,6 +156,41 @@ static void report(void *context, const char *why, const char *detail)
     if (!c->r->err[0]) kclf_set_err(c->r, "manual: %s%s%s", why, *detail ? ": " : "", detail);
 }
 
+/* Provider read paths: the file-backed view is the primary one and never
+ * touches target pages.  The no-fault fallback only succeeds for pages that are
+ * already resident, so it can recover metadata for a provider whose file is
+ * unlinked or inaccessible without ever faulting a new page into the target. */
+static int provider_view_open(struct km_context *c, const char *path, u64 address, u64 offset,
+                              struct ke_io *io, struct ke_object *o);
+static void provider_view_close(struct km_provider_view *v);
+static void provider_fixup(struct km_context *c);
+
+static int provider_nofault_read(void *context, u64 at, void *p, unsigned long n)
+{
+    (void)context;
+    if (n > 0x7fffffffUL) return -E2BIG;
+    return kclf_urd(at, p, (int)n);
+}
+
+static void provider_report(void *context, const char *why, const char *detail)
+{
+    struct km_provider_view *v = context;
+    if (v && v->owner) report(v->owner, why, detail);
+}
+
+/* Only regular, path-backed files can be reopened for metadata.  Running the
+ * file probe over /dev, /proc and similar mappings would open device nodes with
+ * the target's credentials for no loader benefit. */
+static int provider_path_candidate(const char *path)
+{
+    if (!path || path[0] != '/') return 0;
+    if (!strncmp(path, "/dev/", 5) || !strncmp(path, "/proc/", 6) ||
+        !strncmp(path, "/sys/", 5) || !strncmp(path, "/dmabuf", 7) ||
+        !strncmp(path, "/memfd:", 7) || !strncmp(path, "/ashmem", 7))
+        return 0;
+    return !strstr(path, " (deleted)");
+}
+
 static int own_mapping(u64 mm, u64 address)
 {
     int i, found = 0;
@@ -129,10 +199,25 @@ static int own_mapping(u64 mm, u64 address)
         const struct kclf_manual_image *m = &images[i];
         if (m->state && m->mm == mm &&
             ((address >= m->map && address - m->map < m->length) ||
+             (address >= m->tls_code && address - m->tls_code < m->tls_code_len) ||
              (address >= m->tls_map && address - m->tls_map < m->tls_length))) { found = 1; break; }
     }
     unlock_registry();
     return found;
+}
+
+/* The provider table is reallocated on growth; every embedded view and io
+ * context points into its own provider entry, so rebind them after a move. */
+static void provider_fixup(struct km_context *c)
+{
+    unsigned i;
+    for (i = 0; i < c->nproviders; i++) {
+        struct km_provider *p = &c->providers[i];
+        p->view.owner = c;
+        p->view.object = &p->object;
+        p->io.ctx = &p->view;
+        p->io.string_budget = &p->view.string_budget;
+    }
 }
 
 /* Grow the loaded-provider table geometrically. A target with 543 loaded
@@ -158,6 +243,7 @@ static int provider_reserve(struct km_context *c, unsigned need)
     }
     c->providers = grown;
     c->provider_cap = cap;
+    provider_fixup(c);
     return 0;
 }
 
@@ -194,50 +280,93 @@ static int provider_exec_mapped(struct km_context *c, const struct ke_object *o)
     return 1;
 }
 
-static int collect(u64 address, const char *path, void *context)
+static int collect(u64 address, const char *path, u64 offset, void *context)
 {
     struct km_context *c = context;
-    struct ke_io quiet = c->io;
+    struct ke_io pio;
     struct ke_object *o = &c->candidate;
     struct km_provider *provider;
-    u32 magic;
     unsigned i;
     char name[KE_NAME];
-    int own, rc;
-    quiet.error = 0;
-    /* Provider discovery keeps the bounded SONAME contract and must not
-     * consume the payload's shared symbol-name budget. A candidate that
-     * cannot yield a bounded SONAME is skipped, as before; this scan is not
-     * the dependency-selection result itself. */
-    quiet.string_budget = 0;
-    if (kclf_urds(address, &magic, 4) || magic != 0x464c457fU) return 0;
+    int own, rc, from_file = 0;
+
     own = own_mapping(c->r->mm, address);
     if (own < 0) return own;
     if (own) return 0; /* manual modules are not implicitly dependency providers */
-    if (ke_open(&quiet, address, o, 0) || !o->soname || ke_string(&quiet, o, o->soname, name) ||
-        !provider_exec_mapped(c, o)) return 0;
-    for (i = 0; i < c->nproviders; i++) if (c->providers[i].object.bias == o->bias) return 0;
+    memset(o, 0, sizeof(*o));
+    /* Primary path: parse the provider from its file page cache.  The target's
+     * own mapped pages are never read, so a cold .dynsym/.dynstr page is not
+     * faulted into the target's address space just because it is a dependency. */
+    if (provider_path_candidate(path) && offset != ~0ULL)
+        from_file = !provider_view_open(c, path, address, offset, &pio, o);
+    if (!from_file) {
+        /* A memfd/unlinked provider cannot be reopened by path.  Parse it from
+         * resident target pages only: copy_from_user_nofault fails instead of
+         * faulting a missing page in, so this fallback cannot grow target RSS. */
+        u32 magic;
+        if (kclf_urd(address, &magic, 4) || magic != 0x464c457fU) return 0;
+        memset(&pio, 0, sizeof(pio));
+        pio.ctx = c;
+        pio.limit = kclf_user_limit;
+        pio.read = provider_nofault_read;
+        /* Discovery must not poison r->err with expected misses; a selected
+         * provider gets the reporting error callback below. */
+    }
+    rc = ke_open(&pio, address, o, 0);
+    if (!rc && !o->soname) rc = -ENOEXEC;
+    if (!rc) rc = ke_string(&pio, o, o->soname, name);
+    if (!rc && !provider_exec_mapped(c, o)) rc = -EACCES;
+    if (rc) {
+        rc = 0;
+        goto skip;
+    }
+    for (i = 0; i < c->nproviders; i++) if (c->providers[i].object.bias == o->bias) {
+        rc = 0;
+        goto skip;
+    }
     if (c->nproviders == c->provider_cap) {
         if ((rc = provider_reserve(c, c->nproviders + 1))) {
             report(c, rc == -ENOMEM ? "provider table allocation failed"
                                     : "provider table limit exceeded", "");
-            return rc;
+            goto skip;
         }
     }
     provider = &c->providers[c->nproviders];
     memset(provider, 0, sizeof(*provider));
     memcpy(&provider->object, o, sizeof(*o));
+    provider->view.owner = c;
+    provider->view.object = &provider->object;
+    provider->view.string_budget = KM_STRING_BUDGET;
+    provider->io = pio;
+    provider->io.string_budget = &provider->view.string_budget;
+    provider->io.error = report; /* nofault providers use c as io.ctx */
+    if (from_file) {
+        provider->view = c->probe;
+        provider->view.owner = c;
+        provider->view.object = &provider->object;
+        provider->io = pio;
+        provider->io.ctx = &provider->view;
+        provider->io.error = provider_report;
+        provider->io.string_budget = &provider->view.string_budget;
+        /* Ownership moved to the table entry; do not close it below. */
+        c->probe.file = 0;
+    }
     memcpy(provider->name, name, strlen(name) + 1);
     if (path && *path) {
         strncpy(provider->path, path, sizeof(provider->path) - 1);
         provider->path[sizeof(provider->path) - 1] = 0;
     }
     c->nproviders++;
+    if (from_file) c->nfile_providers++;
+    else c->nresident_providers++;
     if (!strcmp(name, "ld-android.so")) {
         c->r->ld.linker_base = o->bias + o->low;
         c->r->ld.linker_end = o->bias + o->high;
     }
     return 0;
+skip:
+    if (from_file) provider_view_close(&c->probe);
+    return rc;
 }
 
 /* Loaded providers are chosen with the same origin-first idea bionic uses for
@@ -353,19 +482,26 @@ static int select_provider(struct km_context *c, const char *importer, const cha
         return -ENOENT;
     }
     if (distinct) {
+        unsigned k;
+        logki("kclf: ambiguous provider %s importer=%s best=%d\n", name, importer, best);
+        for (k = 0; k < c->nproviders; k++)
+            if (!strcmp(c->providers[k].name, name))
+                logki("kclf:   candidate %s score=%d\n", c->providers[k].path,
+                      provider_score(importer, &c->providers[k]));
         report(c, "ambiguous loaded SONAME (no namespace match)", name);
         return -EEXIST;
     }
     return best;
 }
 
-static int add_needed(struct km_context *c, const struct ke_object *o, const char *importer)
+static int add_needed(struct km_context *c, struct ke_io *io, const struct ke_object *o,
+                      const char *importer)
 {
     unsigned i, j;
     for (i = 0; i < o->nneeded; i++) {
         char name[KE_NAME];
         int found;
-        if (ke_string(&c->io, o, o->needed[i], name)) return -ENOEXEC;
+        if (ke_string(io, o, o->needed[i], name)) return -ENOEXEC;
         if (!name[0]) return -ENOEXEC;
         found = select_provider(c, importer, name);
         if (found < 0) return found;
@@ -514,8 +650,9 @@ static int resolve_import(void *context, u32 index, u64 *value)
         }
         if (ke_required_version(&c->io, o, index, version, &hash)) return -ENOEXEC;
         for (i = 0; i < c->nscope; i++) {
+            struct km_provider *p = &c->providers[c->scope[i]];
             struct ke_sym provider_symbol;
-            rc = ke_lookup(&c->io, &c->providers[c->scope[i]].object, name, version, hash, &provider_symbol, value);
+            rc = ke_lookup(&p->io, &p->object, name, version, hash, &provider_symbol, value);
             if (rc < 0) return rc;
             if (rc) {
                 if ((provider_symbol.info & 15) == 10) {
@@ -593,7 +730,7 @@ static int prepare_tls_runtime(struct km_context *c)
     struct kclf_req *r = c->r;
     struct kclf_manual_image *m = r->image;
     const struct ke_phdr *tls;
-    const struct ke_object *libc;
+    struct km_provider *libc;
     u64 state[KT_SIZE / 8];
     u64 page = kclf_page_size, length, base, args, template;
     unsigned long code_size = (unsigned long)(kclf_tls_end - kclf_tls_start);
@@ -605,11 +742,11 @@ static int prepare_tls_runtime(struct km_context *c)
     if (!code_size || code_size > page) return -E2BIG;
     index = select_provider(c, r->path, "libc.so");
     if (index < 0) return index;
-    libc = &c->providers[index].object;
+    libc = &c->providers[index];
     for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         struct ke_sym s;
         u64 value;
-        rc = ke_lookup(&c->io, libc, names[i], "", 0, &s, &value);
+        rc = ke_lookup(&libc->io, &libc->object, names[i], "", 0, &s, &value);
         if (rc < 0) return rc;
         if (!rc || (s.info & 15) != 2 || (value & 3)) {
             report(c, "TLS runtime requires an ordinary libc function", names[i]);
@@ -617,27 +754,32 @@ static int prepare_tls_runtime(struct km_context *c)
         }
         state[KT_KEY_CREATE / 8 + i] = value;
     }
-    /* One RX code page followed by state, descriptor arguments and a template.
-     * The metadata becomes read-only through the normal completion RELRO pass.
-     * Its mapping is owned by the image before any fallible copy/protection. */
-    length = (page + KT_SIZE + (u64)c->ntls * 16 + tls->filesz + page - 1) & ~(page - 1);
+    /* One EL0 code page plus a separate RW block holding the state,
+     * descriptor arguments and the relocated template. The code page is a
+     * private mapping of the payload file, so the resident TLS runtime does not
+     * create an anonymous executable VMA either. The metadata block becomes
+     * read-only through the normal completion RELRO pass. Its mapping is owned
+     * by the image before any fallible copy/protection. */
+    length = (KT_SIZE + (u64)c->ntls * 16 + tls->filesz + page - 1) & ~(page - 1);
     base = kclf_ks.vm_mmap(0, 0, length, 3, 0x22, 0);
     if (!base || base >= (u64)-4095) return base ? (int)(long)base : -ENOMEM;
     m->tls_map = base;
     m->tls_length = length;
     if (base >= c->io.limit || length > c->io.limit - base) return -EFAULT;
-    args = base + page + KT_SIZE;
+    rc = (int)kclf_map_file_code(r->code_path, kclf_tls_start, page, &m->tls_code);
+    if (rc) return rc;
+    m->tls_code_len = page;
+    args = base + KT_SIZE;
     template = args + (u64)c->ntls * 16;
     state[KT_MEMSZ / 8] = tls->memsz;
     state[KT_FILESZ / 8] = tls->filesz;
     state[KT_ALIGN / 8] = tls->align > 1 ? tls->align : 1;
     state[KT_FIRSTBYTE / 8] = tls->vaddr & (state[KT_ALIGN / 8] - 1);
     state[KT_TEMPLATE / 8] = template;
-    if (kclf_uwr(base, kclf_tls_start, (int)code_size) ||
-        kclf_uwr(base + page, state, sizeof(state))) return -EFAULT;
+    if (kclf_uwr(base, state, sizeof(state))) return -EFAULT;
     for (i = 0; i < c->ntls; i++) {
-        u64 argument[2] = {base + page, c->tls_fixups[i].offset};
-        u64 descriptor[2] = {base + (u64)(kclf_tls_resolve - kclf_tls_start), args + (u64)i * 16};
+        u64 argument[2] = {base, c->tls_fixups[i].offset};
+        u64 descriptor[2] = {m->tls_code + (u64)(kclf_tls_resolve - kclf_tls_start), args + (u64)i * 16};
         if (kclf_uwr(descriptor[1], argument, sizeof(argument)) ||
             kclf_uwr(c->tls_fixups[i].where, descriptor, sizeof(descriptor))) return -EFAULT;
     }
@@ -651,13 +793,11 @@ static int prepare_tls_runtime(struct km_context *c)
             kclf_uwr(template + off, chunk, n)) return -EFAULT;
         off += (u64)n;
     }
-    rc = (int)raw_syscall3(__NR_mprotect, base, page, 5);
-    if (rc) return rc;
     if (r->relro_count == KCLF_MAX_RELRO) return -E2BIG;
-    r->relro[r->relro_count][0] = base + page;
-    r->relro[r->relro_count++][1] = length - page;
-    r->tls_init = base + (u64)(kclf_tls_init - kclf_tls_start);
-    r->tls_arg = base + page;
+    r->relro[r->relro_count][0] = base;
+    r->relro[r->relro_count++][1] = length;
+    r->tls_init = m->tls_code + (u64)(kclf_tls_init - kclf_tls_start);
+    r->tls_arg = base;
     return 0;
 }
 
@@ -721,10 +861,47 @@ static int read_snapshot(struct km_context *c)
         got = kclf_ks.kernel_read(f, (u8 *)c->snapshot + pos, n, &pos);
         if (got <= 0 || (unsigned long)got > n) { rc = got < 0 ? (int)got : -ENOEXEC; break; }
     }
+    /* The snapshot is only the parser's view.  The image itself is mapped from
+     * this file, so the payload's kernel copy can no longer diverge from what
+     * the target executes, and every executable image page keeps the module
+     * pathname in /proc/<pid>/maps.  Keep the file open until all mappings are
+     * installed; the VMAs then own their own references. */
+    if (!rc) c->file = f;
 out:
-    kclf_ks.fput(f);
+    if (rc) kclf_ks.fput(f);
     if (rc) kclf_set_err(c->r, "manual: file snapshot failed rc=%d (limit 64 MiB)", rc);
     return rc;
+}
+
+/* Bytes of the file that can back a segment mapping, page rounded.  A mapping
+ * may include the file's partial last page (the tail reads as zero in a
+ * private mapping) but never a page beyond it, which would SIGBUS on access. */
+static u64 file_backed_length(const struct km_context *c, const struct ke_phdr *p, u64 page)
+{
+    u64 foff, end, limit;
+    if (!p->filesz) return 0; /* pure .bss segment: anonymous pages only */
+    foff = p->offset & ~(page - 1);
+    end = (p->offset + p->filesz + page - 1) & ~(page - 1);
+    limit = (c->file_size + page - 1) & ~(page - 1);
+    if (end > limit) end = limit;
+    return end > foff ? end - foff : 0;
+}
+
+static long map_fixed(u64 want, struct file *file, u64 len, int prot, u64 offset)
+{
+    unsigned long flags = KM_MAP_PRIVATE | KM_MAP_FIXED | (file ? 0 : KM_MAP_ANONYMOUS);
+    u64 got;
+    got = kclf_ks.vm_mmap(file, want, len, (unsigned long)prot, flags, offset);
+    if (!got || got >= (u64)-4095) return got ? (long)got : -ENOMEM;
+    return got == want ? 0 : -EINVAL;
+}
+
+/* Final protection of a PT_LOAD segment. ke_file_layout already rejected
+ * non-readable and writable-executable segments. */
+static unsigned segment_prot(const struct ke_phdr *p)
+{
+    return ((p->flags & 4) ? KM_PROT_READ : 0) | ((p->flags & 2) ? KM_PROT_WRITE : 0) |
+           ((p->flags & 1) ? KM_PROT_EXEC : 0);
 }
 
 static int map_image(struct km_context *c)
@@ -732,37 +909,89 @@ static int map_image(struct km_context *c)
     struct ke_object *o = &c->object;
     struct kclf_manual_image *m = c->r->image;
     struct ke_io fileio = c->io;
+    u64 page = (u64)kclf_page_size;
     u64 base, length, bias, header = 0, pad;
     unsigned i;
     int rc;
     fileio.read = file_read;
-    if ((rc = ke_headers(&fileio, 0, o)) || (rc = ke_file_layout(&fileio, o, c->file_size, kclf_page_size))) return rc;
-    /* A random pad in front of the image keeps the ELF header away from every
-     * VMA boundary: the pad is given the first segment's protection later, so
-     * it merges into one mapping and a scanner that anchors on mapping starts
-     * never reads the header. */
-    pad = (u64)(1 + (int)(get_random_u64() % 8)) * (u64)kclf_page_size;
+    if ((rc = ke_headers(&fileio, 0, o)) || (rc = ke_file_layout(&fileio, o, c->file_size, page))) return rc;
+    if (!c->file) return -EBADF;
+    /* A random pad in front of the image keeps the ELF header away from the
+     * start of the first file-backed VMA: the mapping before it is plain
+     * anonymous RW, which every process already has. */
+    pad = (u64)(1 + (int)(get_random_u64() % 8)) * page;
     length = o->high - o->low + o->alignment + pad;
-    base = kclf_ks.vm_mmap(0, 0, length, 3, 0x22, 0);
+    /* Reserve the address range first, then replace every segment page by a
+     * private mapping of the same file page.  The reservation also guarantees
+     * the mappings are contiguous and cannot be interleaved by another thread
+     * of the target.  Everything not covered by a PT_LOAD stays PROT_NONE. */
+    base = kclf_ks.vm_mmap(0, 0, length, 0, 0x22, 0);
     if (!base || base >= (u64)-4095) return base ? (int)(long)base : -ENOMEM;
     /* Record ownership before any fallible write, so rollback cannot leak it. */
     m->map = base; m->length = length;
-    if (base < o->low || base >= kclf_user_limit || length > kclf_user_limit - base) return -EFAULT;
+    if (base >= kclf_user_limit || length > kclf_user_limit - base) return -EFAULT;
+    if (base + pad < o->low) return -EFAULT;
     bias = (base + pad - o->low + o->alignment - 1) & ~(o->alignment - 1);
+    if (bias >= kclf_user_limit || o->high - o->low > kclf_user_limit - bias ||
+        bias + (o->high - o->low) > base + length) return -EFAULT;
     m->bias = bias;
     for (i = 0; i < o->phnum; i++) {
         const struct ke_phdr *p = &o->ph[i];
-        u64 copied = 0;
+        u64 first, end, flen;
+        unsigned prot;
+        int writable;
         if (p->type != 1 || !p->memsz) continue;
         if (!p->offset) header = bias + p->vaddr;
-        while (copied < p->filesz) {
-            u64 n = p->filesz - copied;
-            if (n > 16384) n = 16384;
-            if (kclf_uwr(bias + p->vaddr + copied, (u8 *)c->snapshot + p->offset + copied, (int)n)) return -EFAULT;
-            copied += n;
+        first = bias + (p->vaddr & ~(page - 1));
+        end = bias + ((p->vaddr + p->memsz + page - 1) & ~(page - 1));
+        flen = file_backed_length(c, p, page);
+        if (flen > end - first) flen = end - first;
+        /* Map with the segment's final protection.  In particular an
+         * executable segment is never mapped writable and mprotected later:
+         * SELinux requires execmod for that transition (see
+         * kclf_map_file_code), and app domains do not have it. */
+        prot = segment_prot(p);
+        writable = !!(prot & KM_PROT_WRITE);
+        if (flen) {
+            rc = map_fixed(first, c->file, flen, (int)prot, p->offset & ~(page - 1));
+            if (rc) return rc;
         }
-        /* Anonymous memory is zero-filled, including partial-page BSS. */
+        if (end - first > flen) {
+            u64 tail = end - first - flen;
+            if (writable) {
+                rc = map_fixed(first + flen, 0, tail, (int)prot, 0);
+            } else if (c->file_size >= tail) {
+                /* A read+execute segment with p_memsz > p_filesz must not get an
+                 * anonymous executable tail: that would be exactly the maps
+                 * signature this backend removes.  Back it with a fully
+                 * populated file range instead (never past EOF, which would
+                 * SIGBUS) and zero it below; the file bytes are overwritten
+                 * before the payload runs. */
+                rc = map_fixed(first + flen, c->file, tail, (int)prot, (c->file_size - tail) & ~(page - 1));
+            } else {
+                report(c, "executable PT_LOAD with a .bss tail larger than the file", "");
+                rc = -EOPNOTSUPP;
+            }
+            if (rc) return rc;
+        }
+        /* The page that holds the end of the file data also carries the
+         * following file bytes, which are not part of this segment's initial
+         * value, and anonymous pages only cover whole pages.  Zero the whole
+         * [filesz, memsz) range explicitly; a read-only segment is written
+         * through FOLL_FORCE because the mapping is not writable. */
+        for (u64 done = 0; done < p->memsz - p->filesz;) {
+            u8 zeros[256];
+            u64 n = p->memsz - p->filesz - done;
+            if (n > sizeof(zeros)) n = sizeof(zeros);
+            memset(zeros, 0, (size_t)n);
+            rc = writable ? kclf_uwr(bias + p->vaddr + p->filesz + done, zeros, (int)n)
+                          : kclf_uwr_force(bias + p->vaddr + p->filesz + done, zeros, (int)n);
+            if (rc) return rc;
+            done += n;
+        }
     }
+    /* The ELF header is part of a read-only segment in most payloads, so the
+     * default scrub goes through the same COW path. */
     return ke_open(&c->io, header, o, 1);
 }
 
@@ -806,19 +1035,15 @@ static int protect_image(struct km_context *c)
     struct kclf_manual_image *m = c->r->image;
     u64 page = kclf_page_size;
     unsigned i;
-    long rc = raw_syscall3(__NR_mprotect, m->map, m->length, 0);
-    if (rc) return (int)rc;
-    for (i = 0; i < o->phnum; i++) {
-        const struct ke_phdr *p = &o->ph[i];
-        u64 first, end;
-        unsigned prot;
-        if (p->type != 1 || !p->memsz) continue;
-        first = (o->bias + p->vaddr) & ~(page - 1);
-        end = (o->bias + p->vaddr + p->memsz + page - 1) & ~(page - 1);
-        prot = ((p->flags & 4) ? 1 : 0) | (p->flags & 2) | ((p->flags & 1) ? 4 : 0);
-        rc = raw_syscall3(__NR_mprotect, first, end - first, prot);
-        if (rc) return (int)rc;
-    }
+    long rc;
+    /*
+     * Every PT_LOAD page already carries its final protection from map_image:
+     * R, RW or RX.  There is deliberately no "map everything writable, then
+     * tighten it" pass, because making an executable segment writable and then
+     * read+execute requires execmod under SELinux, which app domains lack.
+     * Holes, the leading pad and the trailing alignment slack are still the
+     * PROT_NONE pages of the original reservation, so nothing is exposed.
+     */
     /*
      * GNU_RELRO is recorded here but applied later, from the completion path in
      * EL1.  IFUNC resolvers run in EL0 and write their results into .got /
@@ -856,26 +1081,17 @@ static int protect_image(struct km_context *c)
         c->r->relro_count++;
     }
     /*
-     * The randomized pad in front of the image takes the first load segment's
-     * protection.  vm_area merging then makes the header page the middle of a
-     * mapping instead of its start, so a detector that anchors a candidate on
-     * /proc/self/maps region boundaries never sees an ELF header there.
+     * The randomized pad in front of the image stays a plain anonymous RW
+     * range.  It is deliberately NOT given the first segment's protection:
+     * that would turn it into an anonymous executable VMA, the exact maps
+     * signature this backend must not produce.  Anonymous RW is what every
+     * app already has (heap, JIT data, allocator), and the ELF header page
+     * itself is scrubbed by default.
      */
     {
         u64 img = (o->bias + o->low) & ~(page - 1);
-        unsigned prot = 0;
-        int have = 0;
-        for (i = 0; i < o->phnum; i++) {
-            const struct ke_phdr *p = &o->ph[i];
-            if (p->type != 1 || !p->memsz) continue;
-            if (o->low >= p->vaddr && o->low - p->vaddr < p->memsz) {
-                prot = ((p->flags & 4) ? 1 : 0) | (p->flags & 2) | ((p->flags & 1) ? 4 : 0);
-                have = 1;
-                break;
-            }
-        }
-        if (have && img > m->map) {
-            rc = raw_syscall3(__NR_mprotect, m->map, img - m->map, prot);
+        if (img > m->map) {
+            rc = raw_syscall3(__NR_mprotect, m->map, img - m->map, KM_PROT_READ | KM_PROT_WRITE);
             if (rc) return (int)rc;
         }
     }
@@ -889,6 +1105,9 @@ static int protect_image(struct km_context *c)
  * header left in target memory is exactly what a known-payload detector anchors
  * on, so drop it.  "keepelf" keeps the legacy layout for payloads that inspect
  * their own __ehdr_start.
+ *
+ * The header normally lives in a read-only segment, so the scrub writes through
+ * the COW mapping (FOLL_FORCE) rather than making the page writable first.
  */
 static int scrub_headers(struct km_context *c)
 {
@@ -906,7 +1125,7 @@ static int scrub_headers(struct km_context *c)
     memset(zeros, 0, sizeof(zeros));
     for (u64 offset = 0; offset < total;) {
         int n = total - offset > sizeof(zeros) ? (int)sizeof(zeros) : (int)(total - offset);
-        int rc = kclf_uwr(o->header + offset, zeros, n);
+        int rc = kclf_uwr_force(o->header + offset, zeros, n);
         if (rc) return rc;
         offset += (u64)n;
     }
@@ -918,8 +1137,16 @@ static int reserve_image(struct kclf_req *r)
     struct kclf_manual_image *m = 0, *free_slot = 0;
     struct pid *owner;
     int i, rc = 0;
-    /* PIDTYPE_TGID=1 is the supported kernel ABI. get_task_pid takes a ref. */
-    owner = kclf_ks.get_task_pid(current, 1);
+    /* PIDTYPE_TGID=1 is the supported kernel ABI.  The preparation worker
+     * cannot infer the target's thread group from current(), so the control
+     * plane hands the pinned TGID over in the request; the target-thread
+     * fallback is kept for kernels without the worker. */
+    if (r->owner_pid) {
+        owner = r->owner_pid;
+        r->owner_pid = 0;
+    } else {
+        owner = kclf_ks.get_task_pid(current, 1);
+    }
     if (!owner) return -ESRCH;
     if (!lock_registry()) { kclf_ks.put_pid(owner); return -EBUSY; }
     for (i = 0; i < KM_IMAGES; i++) {
@@ -971,6 +1198,22 @@ out:
     return rc;
 }
 
+static void close_providers(struct km_context *c)
+{
+    unsigned i;
+    for (i = 0; i < c->nproviders; i++) {
+        struct km_provider *p = &c->providers[i];
+        if (p->view.file) {
+            kclf_ks.fput(p->view.file);
+            p->view.file = 0;
+        }
+    }
+    if (c->probe.file) {
+        kclf_ks.fput(c->probe.file);
+        c->probe.file = 0;
+    }
+}
+
 long kclf_manual_prepare(struct kclf_req *r)
 {
     struct km_context *c = 0;
@@ -984,6 +1227,11 @@ long kclf_manual_prepare(struct kclf_req *r)
     if ((rc = reserve_image(r))) return rc;
     r->ld.sym = "manual";
     r->ld.close_sym = "manual";
+    /* The per-request trampoline page is a private mapping of the payload, so
+     * the request needs the image path even when it only borrows an existing
+     * image (inject without unload, or release). */
+    strncpy(r->code_path, r->image->path, sizeof(r->code_path) - 1);
+    r->code_path[sizeof(r->code_path) - 1] = 0;
     if (r->image_action != KM_NEW) {
         r->ld.linker_base = r->image->linker_base;
         r->ld.linker_end = r->image->linker_end;
@@ -1020,12 +1268,12 @@ long kclf_manual_prepare(struct kclf_req *r)
     if ((rc = kclf_walk_vmas(r->param_addr, collect, c))) { step = "target mapping scan"; goto out; }
     r->image->linker_base = r->ld.linker_base;
     r->image->linker_end = r->ld.linker_end;
-    if ((rc = add_needed(c, &c->object, r->path))) { step = "payload dependency lookup"; goto out; }
+    if ((rc = add_needed(c, &c->io, &c->object, r->path))) { step = "payload dependency lookup"; goto out; }
     /* Breadth-first DT_NEEDED closure, with stable order and cycle detection.
      * Each edge is resolved using the importing library's load origin. */
     for (i = 0; i < c->nscope; i++) {
-        const struct km_provider *p = &c->providers[c->scope[i]];
-        if ((rc = add_needed(c, &p->object, p->path))) { step = "transitive dependency lookup"; goto out; }
+        struct km_provider *p = &c->providers[c->scope[i]];
+        if ((rc = add_needed(c, &p->io, &p->object, p->path))) { step = "transitive dependency lookup"; goto out; }
     }
     c->values = allocate((unsigned long)c->object.symcount * sizeof(u64));
     c->resolved = allocate(c->object.symcount);
@@ -1047,8 +1295,13 @@ long kclf_manual_prepare(struct kclf_req *r)
             rc = -EFAULT; step = "IFUNC fixup export"; goto out;
         }
     }
+    logki("kclf: manual providers=%u file=%u resident=%u\n", c->nproviders, c->nfile_providers,
+          c->nresident_providers);
 out:
     if (rc && !r->err[0]) kclf_set_err(r, "manual: %s failed rc=%d", step, rc);
+    /* The image and TLS code mappings hold their own file references. */
+    if (c->file) kclf_ks.fput(c->file);
+    close_providers(c);
     if (c->providers) kclf_ks.vfree(c->providers);
     if (c->ranges) kclf_ks.vfree(c->ranges);
     if (c->tls_fixups) kclf_ks.vfree(c->tls_fixups);
@@ -1058,6 +1311,19 @@ out:
     if (c->snapshot) kclf_ks.vfree(c->snapshot);
     kclf_ks.vfree(c);
     return rc;
+}
+
+/* Fault the image and the payload-local TLS runtime pages in from the preparing
+ * context.  The borrowed thread must not take a page fault for memory the
+ * framework installed: that would show up in its /proc per-thread counters. */
+void kclf_manual_prefault(struct kclf_req *r)
+{
+    struct kclf_manual_image *m = r->image;
+
+    if (!m || (r->flags & KCLF_F_LINKER)) return;
+    kclf_prefault_user(m->map, m->length);
+    if (m->tls_code) kclf_prefault_user(m->tls_code, m->tls_code_len);
+    if (m->tls_map) kclf_prefault_user(m->tls_map, m->tls_length);
 }
 
 void kclf_manual_params(struct kclf_req *r, u8 *p)
@@ -1077,6 +1343,183 @@ void kclf_manual_params(struct kclf_req *r, u8 *p)
     *(u64 *)(p + KCLF_P_TLS_ARG) = r->tls_arg;
 }
 
+/* --- provider file view: begin --- */
+/* Read through the page cache at an absolute file position.  A short read is
+ * retried; EOF is an error because every caller already bounded the range by
+ * the provider's own PT_LOAD p_filesz. */
+static int provider_file_read(struct km_provider_view *v, u64 offset, void *p, unsigned long n)
+{
+    loff_t pos;
+    if (!v->file) return -ENOENT;
+    if (offset > v->file_size || n > v->file_size - offset) return -ENOEXEC;
+    pos = (loff_t)offset;
+    while (n) {
+        long got = kclf_ks.kernel_read(v->file, p, n, &pos);
+        if (got <= 0 || (unsigned long)got > n) return got < 0 ? (int)got : -EIO;
+        p = (u8 *)p + got;
+        n -= (unsigned long)got;
+    }
+    return 0;
+}
+
+static int provider_view_read(void *context, u64 at, void *p, unsigned long n)
+{
+    struct km_provider_view *v = context;
+    struct ke_object *o = v->object;
+
+    if (!v->file || !o) return -ENOENT;
+    while (n) {
+        unsigned i;
+        int found = 0;
+        /* ke_headers_impl publishes o->phnum before it reads the phdr table,
+         * so the view cannot key off phnum alone.  The ELF header and phdrs
+         * are a contiguous file range; translate that range directly.  It is
+         * also exactly what p0's segment translation would produce, because
+         * header_off is the file position of p0's p_offset. */
+        if (at >= v->header_addr && at < v->header_end) {
+            u64 delta = at - v->header_addr;
+            u64 chunk = v->header_end - at;
+            if (chunk > n) chunk = n;
+            if (v->header_off > ~0ULL - delta ||
+                provider_file_read(v, v->header_off + delta, p, chunk))
+                return -ENOEXEC;
+            p = (u8 *)p + chunk;
+            at += chunk;
+            n -= (unsigned long)chunk;
+            continue;
+        }
+        if (!o->phnum) return -ENOEXEC;
+        for (i = 0; i < o->phnum; i++) {
+            const struct ke_phdr *ph = &o->ph[i];
+            u64 start, offset, chunk;
+            if (ph->type != 1 || !ph->memsz) continue;
+            start = v->bias + ph->vaddr;
+            if (at < start || at - start >= ph->memsz) continue;
+            offset = at - start;
+            if (offset < ph->filesz) {
+                chunk = ph->filesz - offset;
+                if (chunk > n) chunk = n;
+                if (v->file_base > ~0ULL - ph->offset ||
+                    v->file_base + ph->offset > ~0ULL - offset ||
+                    provider_file_read(v, v->file_base + ph->offset + offset, p, chunk))
+                    return -ENOEXEC;
+            } else {
+                /* p_memsz > p_filesz is the loader's zero-filled .bss. */
+                chunk = ph->memsz - offset;
+                if (chunk > n) chunk = n;
+                memset(p, 0, (size_t)chunk);
+            }
+            p = (u8 *)p + chunk;
+            at += chunk;
+            n -= (unsigned long)chunk;
+            found = 1;
+            break;
+        }
+        if (!found) return -ENOEXEC;
+    }
+    return 0;
+}
+
+static void provider_view_close(struct km_provider_view *v)
+{
+    if (v && v->file) {
+        kclf_ks.fput(v->file);
+        v->file = 0;
+    }
+}
+
+/* Open @path and bind a page-cache view to the loaded instance at @address.
+ * @offset is the mapping's vm_pgoff in bytes: for a normal .so it is zero, for
+ * an APK-embedded library it is the zip entry's data offset.  The ELF header is
+ * therefore at file position @offset; every PT_LOAD is translated through the
+ * same base, which handles both layouts without reading target memory. */
+static int provider_view_open(struct km_context *c, const char *path, u64 address, u64 offset,
+                              struct ke_io *io, struct ke_object *o)
+{
+    struct km_provider_view *v = &c->probe;
+    struct file *file;
+    struct ke_ehdr eh;
+    loff_t file_size;
+    u64 phoff, phbytes, high = 0, bias = 0, file_base = 0, base_filesz = 0;
+    unsigned i, bases = 0;
+    int rc;
+
+    memset(v, 0, sizeof(*v));
+    if (!path || path[0] != '/' || offset == ~0ULL || !address ||
+        address >= kclf_user_limit) return -ENOENT;
+    if (!kclf_ks.filp_open || !kclf_ks.vfs_llseek || !kclf_ks.kernel_read || !kclf_ks.fput)
+        return -EOPNOTSUPP;
+    file = kclf_ks.filp_open(path, 0, 0);
+    if (!file) return -ENOENT;
+    if ((unsigned long)file >= (unsigned long)-4095) return (int)(long)file;
+    v->file = file; /* Own the reference before any fallible size/header read. */
+    file_size = kclf_ks.vfs_llseek(file, 0, 2);
+    /* Unlike the payload snapshot, a provider is read through bounded file
+     * offsets and never copied whole.  Large APKs (>64 MiB) are normal, so do
+     * not apply KM_FILE_MAX here; only reject an unusable/overflowing size. */
+    if (file_size < (loff_t)sizeof(eh) || (u64)file_size > (1ULL << 60)) {
+        rc = -ENOEXEC;
+        goto fail;
+    }
+    v->file_size = (u64)file_size;
+    v->header_addr = address;
+    v->header_off = offset;
+    if ((rc = provider_file_read(v, offset, &eh, sizeof(eh)))) goto fail;
+    if (memcmp(eh.ident, "\177ELF\2\1\1", 7) || eh.ehsize != sizeof(eh) ||
+        eh.phentsize != sizeof(struct ke_phdr) || !eh.phnum || eh.phnum > KE_PHNUM ||
+        eh.phoff < sizeof(eh) || eh.phoff > 1024 * 1024 ||
+        offset > v->file_size || eh.phoff > v->file_size - offset) {
+        rc = -ENOEXEC;
+        goto fail;
+    }
+    phbytes = (u64)eh.phnum * sizeof(struct ke_phdr);
+    phoff = offset + eh.phoff;
+    if (phbytes > v->file_size - phoff) { rc = -ENOEXEC; goto fail; }
+    if (phbytes > kclf_user_limit - address ||
+        eh.phoff > kclf_user_limit - address - phbytes) { rc = -ENOEXEC; goto fail; }
+    if ((rc = provider_file_read(v, phoff, c->probe_ph, (unsigned long)phbytes))) goto fail;
+    v->header_end = address + eh.phoff + phbytes;
+    for (i = 0; i < eh.phnum; i++) {
+        const struct ke_phdr *p = &c->probe_ph[i];
+        if (p->filesz > p->memsz || p->vaddr >= kclf_user_limit ||
+            p->memsz > kclf_user_limit - p->vaddr) { rc = -ENOEXEC; goto fail; }
+        if (p->type != 1) continue;
+        if (p->vaddr + p->memsz > high) high = p->vaddr + p->memsz;
+        if (!p->offset && p->filesz >= sizeof(eh)) {
+            if (bases++ || address < p->vaddr) { rc = -ENOEXEC; goto fail; }
+            bias = address - p->vaddr;
+            file_base = offset - p->offset;
+            base_filesz = p->filesz;
+        }
+    }
+    if (!bases || !high || bias >= kclf_user_limit || high > kclf_user_limit - bias ||
+        eh.phoff > base_filesz || phbytes > base_filesz - eh.phoff) {
+        rc = -ENOEXEC;
+        goto fail;
+    }
+    for (i = 0; i < eh.phnum; i++) {
+        const struct ke_phdr *p = &c->probe_ph[i];
+        if (p->type != 1) continue;
+        if (file_base > v->file_size || p->offset > v->file_size - file_base ||
+            p->filesz > v->file_size - file_base - p->offset) { rc = -ENOEXEC; goto fail; }
+    }
+    v->bias = bias;
+    v->file_base = file_base;
+    v->string_budget = KM_STRING_BUDGET;
+    v->owner = c;
+    v->object = o;
+    memset(io, 0, sizeof(*io));
+    io->ctx = v;
+    io->limit = kclf_user_limit;
+    io->read = provider_view_read;
+    io->string_budget = &v->string_budget;
+    return 0;
+fail:
+    provider_view_close(v);
+    return rc;
+}
+/* --- provider file view: end --- */
+
 long kclf_manual_finish(struct kclf_req *r)
 {
     struct kclf_manual_image *m = r->image;
@@ -1094,6 +1537,11 @@ long kclf_manual_finish(struct kclf_req *r)
     }
     drop = (r->image_action == KM_NEW && (!ok || (r->flags & KCLF_F_UNLOAD))) ||
            (ok && r->image_action == KM_DROP);
+    if (drop && m->tls_code) {
+        rc = kclf_ks.vm_munmap(m->tls_code, m->tls_code_len);
+        if (rc) return rc;
+        m->tls_code = m->tls_code_len = 0;
+    }
     if (drop && m->tls_map) {
         rc = kclf_ks.vm_munmap(m->tls_map, m->tls_length);
         if (rc) return rc;

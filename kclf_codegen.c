@@ -378,7 +378,8 @@ static int kce_resolve(struct kce *c)
 }
 
 int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
-                    const struct kclf_priv_layout *pl, u64 seed, struct kclf_prog *out)
+                    const struct kclf_priv_layout *pl, u64 stack_scrub, u64 seed,
+                    struct kclf_prog *out)
 {
     struct kce c;
     struct kce_roles r;
@@ -388,6 +389,7 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
     int entry_off, i;
     int l_entry, l_manual, l_lok, l_lzero, l_ifunc, l_ifunc_err;
     int l_init, l_init_vectors, l_init_loop, l_fini, l_fini_loop, l_man_done, l_man_err, l_tail, l_wipe;
+    int l_scrub = -1;
 
     if (!page || !out || !pl) return -1;
     if (page_size < 2048 || (page_size & (page_size - 1))) return -1;
@@ -432,6 +434,7 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
     l_man_err = kce_label(&c);
     l_tail = kce_label(&c);
     l_wipe = kce_label(&c);
+    if (stack_scrub >= 16) l_scrub = kce_label(&c);
 
     /* restart pad: a syscall restart may rewind the return PC by 4.  Emit one
      * random fall-through instruction that only touches a dead temporary, so
@@ -613,6 +616,29 @@ int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
      * reclaim this allocation while the saved PC remains inside it. */
     kce_emit(&c, kce_ldr_x(11, r.pb, pl->saved + KCLF_SAVED_SP));
     kce_emit(&c, kce_add_imm12(31, 11, 0, 0)); /* mov sp, x11 */
+
+    /* Wipe the borrowed thread stack below the restored SP.  The payload ran
+     * there, and pop does not clear memory: every frame that saved x30 left a
+     * return address into the transient code page or the module image behind.
+     * After the request those mappings are gone, but a process-local scanner
+     * can still find the stale pointers in the unused stack area and treat
+     * them as injected code.  Zero the whole borrowed allowance that fits in
+     * KCLF_STACK_SCRUB_MAX; the range is mapped stack memory below SP, so no
+     * guard page or live frame is touched.  This runs after SP restoration and
+     * before the GPR restore, while the temporary roles are still scratch. */
+    if (l_scrub >= 0) {
+        u32 lo = (u32)(stack_scrub & 0xfffULL);
+        u32 hi = (u32)((stack_scrub >> 12) & 0xfffULL);
+        kce_emit(&c, kce_sub_imm12(r.t0, 11, 0x100, 0)); /* stack_top */
+        kce_emit(&c, kce_sub_imm12(r.t1, r.t0, lo, 0));
+        if (hi) kce_emit(&c, kce_sub_imm12(r.t1, r.t1, hi, 1));
+        kce_bind(&c, l_scrub);
+        kce_emit(&c, kce_stp_xzr_post(r.t1, 16));
+        kce_emit(&c, kce_cmp_reg(r.t1, r.t0));
+        kce_bcond(&c, 0x3, l_scrub); /* b.lo */
+        kce_junk(&c, &r, kce_below(&c, 2));
+    }
+
     kce_emit(&c, kce_ldr_x(11, r.pb, pl->saved + KCLF_SAVED_NZCV));
     kce_emit(&c, kce_msr(KCE_NZCV, 11));
 

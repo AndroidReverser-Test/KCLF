@@ -12,6 +12,10 @@ int kclf_btf_ok;
 int kclf_vma_start_off = -1;
 int kclf_vma_end_off = -1;
 int kclf_mmap_lock_off = -1;
+int kclf_vma_file_off = -1;
+int kclf_vma_pgoff_off = -1;
+int kclf_vma_flags_off = -1;
+int kclf_file_path_off = -1;
 int kclf_vma_direct;
 int kclf_wake_supported;
 u64 kclf_trace_mask, kclf_vector_mask;
@@ -22,6 +26,9 @@ struct mm_struct *kclf_task_mm(struct task_struct *task)
     struct mm_struct *mm;
 
     if (!task) return 0;
+    /* get_task_mm() deliberately hides a PF_KTHREAD's borrowed mm. The worker
+     * already holds this reference; no BTF layout is needed to return it. */
+    if (task == current && kclf_io_worker == current && kclf_io_mm) return kclf_io_mm;
     if (kclf_mm_off > 0)
         return __atomic_load_n((struct mm_struct **)((char *)task + kclf_mm_off), __ATOMIC_ACQUIRE);
     /* Older KP hosts do not discover task_struct.mm without BTF. Use the
@@ -99,6 +106,16 @@ int kclf_compat_init(void)
         kclf_mm_off = kclf_btf_member_range(&b, "task_struct", "mm", 8, 8);
         kclf_vma_start_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_start", 8, 8);
         kclf_vma_end_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_end", 8, 8);
+        /* Pathname, file offset and permission metadata for the locked walker.
+         * The target may be non-dumpable (PR_SET_DUMPABLE, 0), so procfs maps
+         * is not readable with its credentials.  vm_file + f_path + d_path()
+         * gives the same pathname procfs would print, and vm_pgoff gives the
+         * file offset needed to parse provider ELF metadata from the page cache
+         * instead of touching the target's mapped pages. */
+        kclf_vma_file_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_file", 8, 8);
+        kclf_vma_pgoff_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_pgoff", 8, 8);
+        kclf_vma_flags_off = kclf_btf_member_range(&b, "vm_area_struct", "vm_flags", 8, 8);
+        kclf_file_path_off = kclf_btf_member_range(&b, "file", "f_path", 16, 8);
         t = kclf_btf_find(&b, "rw_semaphore", 0);
         if (t && t->size >= 16 && t->size <= 512) {
             kclf_mmap_lock_off = kclf_btf_member_range(&b, "mm_struct", "mmap_lock", t->size, 8);

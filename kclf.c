@@ -171,6 +171,7 @@ int kclf_sym_lookup_all(void)
     KCLF_KS(find_get_pid, "find_get_pid");
     KCLF_KS(pid_task, "pid_task");
     KCLF_KS(put_pid, "put_pid");
+    kclf_ks.task_pid_nr_ns = (typeof(kclf_ks.task_pid_nr_ns))kclf_lookup("__task_pid_nr_ns");
     kclf_ks.get_task_pid = (typeof(kclf_ks.get_task_pid))kclf_lookup("get_task_pid");
     kclf_ks.vmalloc = (typeof(kclf_ks.vmalloc))kclf_lookup("vmalloc");
     if (!kclf_ks.vmalloc) kclf_ks.vmalloc = (typeof(kclf_ks.vmalloc))kclf_lookup("vmalloc_noprof");
@@ -184,6 +185,11 @@ int kclf_sym_lookup_all(void)
     KCLF_KS(kernel_read, "kernel_read");
     kclf_ks.vfs_read = (typeof(kclf_ks.vfs_read))kclf_lookup("vfs_read");
     KCLF_KS(fput, "fput");
+    /* Optional: lets the locked VMA walker name providers when procfs maps is
+     * inaccessible (non-dumpable target).  Missing means provider pathnames
+     * stay empty and dependency selection falls back to the resident-only,
+     * no-fault in-memory parser. */
+    kclf_ks.d_path = (typeof(kclf_ks.d_path))kclf_lookup("d_path");
     kclf_ks.copy_from_user_nofault = (typeof(kclf_ks.copy_from_user_nofault))kclf_lookup("copy_from_user_nofault");
     if (!kclf_ks.copy_from_user_nofault)
         kclf_ks.copy_from_user_nofault = (typeof(kclf_ks.copy_from_user_nofault))kclf_lookup("probe_user_read");
@@ -191,6 +197,8 @@ int kclf_sym_lookup_all(void)
     kclf_ks.copy_from_user_nofault = 0; /* exercise the sleepable poll fallback */
 #endif
     KCLF_KS(access_process_vm, "access_process_vm");
+    kclf_ks.access_remote_vm = (typeof(kclf_ks.access_remote_vm))kclf_lookup("access_remote_vm");
+    if (!kclf_ks.access_remote_vm) kclf_ks.access_remote_vm = 0;
     KCLF_KS(get_task_mm, "get_task_mm");
     KCLF_KS(mmput_async, "mmput_async");
 #undef KCLF_KS
@@ -203,6 +211,21 @@ int kclf_sym_lookup_all(void)
     kclf_ks.mmap_read_lock = (typeof(kclf_ks.mmap_read_lock))kclf_lookup("mmap_read_lock");
     kclf_ks.mmap_read_unlock = (typeof(kclf_ks.mmap_read_unlock))kclf_lookup("mmap_read_unlock");
     kclf_ks.msleep = (typeof(kclf_ks.msleep))kclf_lookup("msleep");
+    /* Optional: preparation on a kernel worker.  Without these symbols the
+     * framework keeps the historical target-thread preparation, which is
+     * functional but leaves a per-thread min_flt/stime signature. */
+    kclf_ks.kthread_create_on_node =
+        (typeof(kclf_ks.kthread_create_on_node))kclf_lookup("kthread_create_on_node");
+    kclf_ks.wake_up_process = (typeof(kclf_ks.wake_up_process))kclf_lookup("wake_up_process");
+    kclf_ks.kthread_should_stop = (typeof(kclf_ks.kthread_should_stop))kclf_lookup("kthread_should_stop");
+    kclf_ks.kthread_stop = (typeof(kclf_ks.kthread_stop))kclf_lookup("kthread_stop");
+    kclf_ks.kthread_use_mm = (typeof(kclf_ks.kthread_use_mm))kclf_lookup("kthread_use_mm");
+    kclf_ks.kthread_unuse_mm = (typeof(kclf_ks.kthread_unuse_mm))kclf_lookup("kthread_unuse_mm");
+    kclf_ks.mmput = (typeof(kclf_ks.mmput))kclf_lookup("mmput");
+    kclf_ks.get_task_cred = (typeof(kclf_ks.get_task_cred))kclf_lookup("get_task_cred");
+    kclf_ks.override_creds = (typeof(kclf_ks.override_creds))kclf_lookup("override_creds");
+    kclf_ks.revert_creds = (typeof(kclf_ks.revert_creds))kclf_lookup("revert_creds");
+    kclf_ks.put_cred = (typeof(kclf_ks.put_cred))kclf_lookup("put_cred");
     /* Optional: older arm64 kernels may not expose the accessor symbols. */
     kclf_ks.cpu_get_elf_hwcap = (typeof(kclf_ks.cpu_get_elf_hwcap))kclf_lookup("cpu_get_elf_hwcap");
     kclf_ks.cpu_get_elf_hwcap2 = (typeof(kclf_ks.cpu_get_elf_hwcap2))kclf_lookup("cpu_get_elf_hwcap2");
@@ -289,6 +312,12 @@ static void kclf_work_hijack(struct callback_head *head);
 static void kclf_work_cleanup(struct callback_head *head);
 static void kclf_work_poll(struct callback_head *head);
 static int kclf_read_results(struct kclf_req *r, int sleepable);
+static void kclf_release_prep_refs(struct kclf_req *r);
+static int kclf_worker_busy(const struct kclf_req *r)
+{
+    int phase = __atomic_load_n(&r->worker_phase, __ATOMIC_ACQUIRE);
+    return phase != 0 && phase != 3;
+}
 
 static void kclf_slot_reset(struct kclf_req *r)
 {
@@ -297,7 +326,10 @@ static void kclf_slot_reset(struct kclf_req *r)
      * Holding mm_users after the target exits defers exit_mmap(), which in
      * turn defers binder VMA teardown and makes ActivityManager wait for a
      * process that is already gone ("refused to die"). The (pinned) struct pid
-     * keeps the PID identity stable; callbacks verify current->mm instead. */
+     * keeps the PID identity stable; callbacks verify current->mm instead.
+     * The preparation worker is the only holder, and it drops the reference
+     * before the EL0 phase. */
+    kclf_release_prep_refs(r);
     if (r->pid_ref) kclf_ks.put_pid(r->pid_ref);
     memset(r, 0, sizeof(*r));
     kclf_state_store(r, KCLF_IDLE);
@@ -310,6 +342,9 @@ static void kclf_slot_reset(struct kclf_req *r)
 static int kclf_slot_reclaimable(struct kclf_req *r)
 {
     int state;
+    /* task_work pending does not count the preparation/rollback worker. Its
+     * last release-store must precede any inspection or reuse of this slot. */
+    if (kclf_worker_busy(r)) return 0;
     if (!__atomic_load_n(&r->finished, __ATOMIC_ACQUIRE)) return 0;
     state = kclf_state_load(r);
     if (state != KCLF_DONE && state != KCLF_FAILED && state != KCLF_CANCELLED) return 0;
@@ -377,6 +412,8 @@ static void kclf_free_user(struct kclf_req *r, int capture_err)
         kclf_manual_abandon(r);
         r->map_addr = 0;
         r->map_len = 0;
+        r->code_addr = 0;
+        r->code_len = 0;
     }
     __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
 }
@@ -394,6 +431,373 @@ void kclf_fail(struct kclf_req *r, int state, int stage, long err, const char *f
     if (!r->err[0]) snprintf(r->err, sizeof(r->err), "err %ld (0x%llx)", err, (unsigned long long)err);
     kclf_state_store(r, state);
     r->j_done = kclf_now();
+}
+
+/* ------------------------------------------------------------------ */
+/* preparation worker                                                   */
+/*                                                                      */
+/* Mapping the payload, walking every loaded provider and relocating the */
+/* image all fault pages into the target mm and burn CPU time.  Running  */
+/* that on the borrowed thread leaves a monotonic, trivially visible      */
+/* delta in /proc/<pid>/task/<tid>/stat: min_flt jumps by the number of   */
+/* parsed pages and stime by the preparation time, on a thread that is    */
+/* otherwise idle.  The measured cost on the reference target is ~1900    */
+/* minor faults and ~50 ms of system time for an empty payload, because   */
+/* the manual backend parses the provider ELF headers of the whole        */
+/* address space.  In-process anti-cheat drivers poll exactly that file.  */
+/*                                                                       */
+/* A kernel thread that enters the target mm through kthread_use_mm      */
+/* performs the same work against the same address space, with the        */
+/* target's credentials (override_creds) and with the fault/CPU           */
+/* accounting charged to the worker.  The borrowed thread is left with    */
+/* the EL0 payload execution only, and every page the payload can touch   */
+/* has already been populated by kclf_prefault_user().                    */
+/* ------------------------------------------------------------------ */
+
+#define KCLF_WORKER_IDLE_MS 20
+/* The manual registry serializes image transactions within one target mm.
+ * Retry queued siblings without blocking independent targets/backends. */
+#define KCLF_PREP_RETRIES 2000
+#define KCLF_WPHASE_ROLLBACK 4
+
+static struct task_struct *kclf_worker_task;
+static int kclf_worker_ok;
+
+int kclf_worker_available(void)
+{
+    return kclf_worker_ok;
+}
+
+static void kclf_release_prep_refs(struct kclf_req *r)
+{
+    if (r->cred_ref) {
+        if (kclf_ks.put_cred) kclf_ks.put_cred(r->cred_ref);
+        r->cred_ref = 0;
+    }
+    if (r->mm_ref) {
+        if (kclf_ks.mmput) kclf_ks.mmput(r->mm_ref);
+        r->mm_ref = 0;
+    }
+    if (r->owner_pid) {
+        kclf_ks.put_pid(r->owner_pid);
+        r->owner_pid = 0;
+    }
+    /* The caller still owns the slot. Only the worker loop may publish its
+     * final phase after every access, including these reference releases. */
+}
+
+/* Tear a failed preparation down in the worker's target-mm context.  This is
+ * the same teardown as kclf_free_user(), but synchronous: a retry callback
+ * cannot be queued on the worker, which is not the request's own thread. */
+static void kclf_free_user_here(struct kclf_req *r)
+{
+    long rc = kclf_exec_finish(r, 0);
+
+    if (rc) {
+        kclf_set_err(r, "munmap failed rc=%ld; mapping retained", rc);
+        return;
+    }
+    __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+}
+
+/* Works from the target thread itself (legacy path) and from the worker. */
+static int kclf_queue_hijack(struct kclf_req *r)
+{
+    int notify = ((r->flags & KCLF_F_WAKE) && kclf_wake_supported) ? KCLF_TWA_SIGNAL : KCLF_TWA_RESUME;
+    struct task_struct *task;
+    int rc;
+
+    if ((u64)r->task == (u64)current) return kclf_queue_work(r, current, &r->work_hijack, notify);
+    if (!r->pid_ref) return -ESRCH;
+    kclf_rcu_read_lock();
+    task = kclf_ks.pid_task(r->pid_ref, 0);
+    if (task && (u64)task == r->task) rc = kclf_queue_work(r, task, &r->work_hijack, notify);
+    else rc = -ESRCH;
+    kclf_rcu_read_unlock();
+    return rc;
+}
+
+/* Is the borrowed thread (r->pid_ref is its PID, not the TGID) still in the
+ * request's address space?  Compared under RCU: no reference is taken. */
+static int kclf_target_mm_alive(struct kclf_req *r)
+{
+    struct task_struct *task;
+    int alive = 0;
+
+    kclf_rcu_read_lock();
+    task = r->pid_ref ? kclf_ks.pid_task(r->pid_ref, 0) : 0;
+    if (task && (!r->mm || (u64)kclf_task_mm(task) == r->mm)) alive = 1;
+    kclf_rcu_read_unlock();
+    return alive;
+}
+
+/* Match reserve_image's per-mm transaction exclusion, including release and
+ * different paths. Linker requests have no manual registry transaction. */
+static int kclf_prepare_busy(const struct kclf_req *r)
+{
+    int i, busy = 0;
+
+    if (r->flags & KCLF_F_LINKER) return 0;
+    /* ctl0 owns slot reset/reuse. Do not read another slot's identity while a
+     * controller can replace it. Never hold this gate across a sleeping call. */
+    if (__atomic_exchange_n(&kclf_control_busy, 1, __ATOMIC_ACQUIRE)) return 1;
+
+    for (i = 0; i < KCLF_MAX_REQ; i++) {
+        const struct kclf_req *q = &kclf_reqs[i];
+        int st;
+        if (q == r) continue;
+        st = kclf_state_load(q);
+        if (st != KCLF_PREPARING && st != KCLF_READY && st != KCLF_RUNNING) continue;
+        if (q->mm != r->mm || (q->flags & KCLF_F_LINKER)) continue;
+        busy = 1;
+        break;
+    }
+    __atomic_store_n(&kclf_control_busy, 0, __ATOMIC_RELEASE);
+    return busy;
+}
+
+/* Return 1 to retry later. The loop retains exclusive worker ownership until
+ * this function returns and publishes the next phase as its final slot access. */
+static int kclf_worker_prepare(struct kclf_req *r)
+{
+    struct mm_struct *mm = r->mm_ref;
+    const struct cred *old_cred = 0;
+    long rc;
+
+    r->prep_worker = 1;
+    if ((kclf_unloading && !(r->flags & KCLF_F_RELEASE)) || kclf_state_load(r) != KCLF_ARMED) {
+        kclf_fail(r, KCLF_CANCELLED, KCLF_ST_QUEUE, -ECANCELED, "quiescing");
+        __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+        kclf_release_prep_refs(r);
+        return 0;
+    }
+    /* Check death before a same-image retry, so a blocked sibling cannot keep
+     * the exited target's mm pinned for the whole retry budget. */
+    if (!mm || !kclf_target_mm_alive(r)) {
+        kclf_fail(r, KCLF_FAILED, KCLF_ST_PREPARE, -ESRCH, "target address space replaced");
+        __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+        kclf_release_prep_refs(r);
+        return 0;
+    }
+    if (kclf_prepare_busy(r)) {
+        /* Another manual image transaction in this mm has not finished. */
+        if (++r->prep_retries < KCLF_PREP_RETRIES) return 1;
+        kclf_fail(r, KCLF_FAILED, KCLF_ST_PREPARE, -EBUSY, "manual transaction busy in target mm");
+        __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+        kclf_release_prep_refs(r);
+        return 0;
+    }
+    kclf_state_store(r, KCLF_PREPARING);
+    r->stage = KCLF_ST_PREPARE;
+    if (r->cred_ref && kclf_ks.override_creds) old_cred = kclf_ks.override_creds(r->cred_ref);
+    /* The worker is a PF_KTHREAD task, so access_process_vm(current, ...) would
+     * see no mm.  Publish the request's mm for the duration of the preparation;
+     * kclf_remote_vm() addresses it through access_remote_vm(). */
+    kclf_io_mm = mm;
+    kclf_io_worker = current;
+    kclf_io_tgid = r->tgid;
+    kclf_ks.kthread_use_mm(mm);
+    rc = kclf_exec_prepare(r);
+    if (rc) {
+        int cancelled = kclf_state_load(r) == KCLF_CANCELLED;
+        kclf_free_user_here(r);
+        if (!cancelled) kclf_fail(r, KCLF_FAILED, KCLF_ST_PREPARE, rc, 0);
+        goto out;
+    }
+    r->j_ready = kclf_now();
+    r->stage = KCLF_ST_HIJACK;
+    {
+        /* Only publish a fully prepared request. Controllers cannot cancel a
+         * slot while the worker owns it; quiesce is checked by the callback. */
+        int expected = KCLF_PREPARING;
+        if (!__atomic_compare_exchange_n(&r->state, &expected, KCLF_READY, 0, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+            kclf_free_user_here(r);
+            goto out;
+        }
+    }
+    rc = kclf_queue_hijack(r);
+    if (rc) {
+        kclf_free_user_here(r);
+        kclf_fail(r, KCLF_FAILED, KCLF_ST_HIJACK, rc, "cannot arm return boundary work");
+    }
+out:
+    kclf_ks.kthread_unuse_mm(mm);
+    kclf_io_mm = 0;
+    kclf_io_worker = 0;
+    kclf_io_tgid = 0;
+    if (old_cred) kclf_ks.revert_creds(old_cred);
+    /* Drop the address-space reference before the EL0 phase: a request that
+     * waits for its hijack boundary must never delay exit_mmap(). */
+    kclf_release_prep_refs(r);
+    return 0;
+}
+
+static int kclf_worker_take(struct kclf_req **out)
+{
+    static unsigned next;
+    int i;
+
+    for (i = 0; i < KCLF_MAX_REQ; i++) {
+        unsigned index = (next + (unsigned)i) % KCLF_MAX_REQ;
+        struct kclf_req *r = &kclf_reqs[index];
+        int expected = 1;
+
+        if (!__atomic_compare_exchange_n(&r->worker_phase, &expected, 2, 0, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+            continue;
+        *out = r;
+        next = (index + 1) % KCLF_MAX_REQ;
+        return 1;
+    }
+    return 0;
+}
+
+/* Reclaim a prepared-but-never-executed request from the worker: the EL0 phase
+ * did not start, so the transient mapping and the image belong to nobody.  The
+ * target thread may be blocked for a long time; the controller must not have to
+ * wait for its next return boundary. */
+static int kclf_worker_rollback_take(struct kclf_req **out)
+{
+    int i;
+
+    for (i = 0; i < KCLF_MAX_REQ; i++) {
+        struct kclf_req *r = &kclf_reqs[i];
+        int expected = KCLF_WPHASE_ROLLBACK;
+
+        if (!__atomic_compare_exchange_n(&r->worker_phase, &expected, 5, 0, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+            continue;
+        *out = r;
+        return 1;
+    }
+    return 0;
+}
+
+static void kclf_worker_rollback(struct kclf_req *r)
+{
+    struct mm_struct *mm = 0;
+    struct task_struct *task;
+
+    kclf_rcu_read_lock();
+    task = r->pid_ref ? kclf_ks.pid_task(r->pid_ref, 0) : 0;
+    if (task) mm = kclf_ks.get_task_mm(task);
+    kclf_rcu_read_unlock();
+    /* exec can replace task->mm between an identity read and get_task_mm().
+     * Validate the reference actually acquired before entering/unmapping it. */
+    if (mm && (u64)mm != r->mm) {
+        kclf_ks.mmput(mm);
+        mm = 0;
+    }
+    if (mm) {
+        kclf_io_mm = mm;
+        kclf_io_worker = current;
+        kclf_io_tgid = r->tgid;
+        kclf_ks.kthread_use_mm(mm);
+        kclf_free_user_here(r);
+        kclf_ks.kthread_unuse_mm(mm);
+        kclf_io_mm = 0;
+        kclf_io_worker = 0;
+        kclf_io_tgid = 0;
+        kclf_ks.mmput(mm);
+    } else {
+        /* The address space is gone; its mappings went with it. */
+        kclf_manual_abandon(r);
+        r->map_addr = 0;
+        r->map_len = 0;
+        r->code_addr = 0;
+        r->code_len = 0;
+        __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+    }
+}
+
+static int kclf_worker_fn(void *arg)
+{
+    (void)arg;
+    while (!kclf_ks.kthread_should_stop()) {
+        struct kclf_req *r = 0;
+
+        if (kclf_worker_rollback_take(&r)) {
+            kclf_worker_rollback(r);
+            __atomic_store_n(&r->worker_phase, 3, __ATOMIC_RELEASE);
+            continue;
+        }
+        if (!kclf_worker_take(&r)) {
+            if (kclf_ks.msleep) kclf_ks.msleep(KCLF_WORKER_IDLE_MS);
+            continue;
+        }
+        {
+            int retry = kclf_worker_prepare(r);
+            /* FINAL slot access: after this store a controller may cancel or
+             * recycle it. In particular, never write a phase after refs were
+             * dropped and the controller has already reused the slot. */
+            __atomic_store_n(&r->worker_phase, retry ? 1 : 3, __ATOMIC_RELEASE);
+            if (retry) kclf_ks.msleep(5);
+        }
+    }
+    return 0;
+}
+
+int kclf_worker_init(void)
+{
+    if (!kclf_ks.kthread_create_on_node || !kclf_ks.wake_up_process || !kclf_ks.kthread_should_stop ||
+        !kclf_ks.kthread_stop || !kclf_ks.kthread_use_mm || !kclf_ks.kthread_unuse_mm || !kclf_ks.mmput ||
+        !kclf_ks.get_task_cred || !kclf_ks.access_remote_vm ||
+        !kclf_ks.override_creds || !kclf_ks.revert_creds || !kclf_ks.put_cred || !kclf_ks.msleep)
+        return -EOPNOTSUPP;
+    kclf_worker_ok = 1;
+    return 0;
+}
+
+/* The worker is started on the first request rather than at module load: the
+ * module is fully relocated and its syscall hooks are installed by then, and a
+ * controller that never injects pays for no extra kernel thread. */
+static int kclf_worker_start(void)
+{
+    struct task_struct *task;
+
+    if (kclf_worker_task) return 0;
+    if (!kclf_worker_ok) return -EOPNOTSUPP;
+    task = kclf_ks.kthread_create_on_node(kclf_worker_fn, 0, -1 /* NUMA_NO_NODE */, "kclf-prep");
+    if (!task || (unsigned long)task >= (unsigned long)-4095) return -ENOMEM;
+    kclf_worker_task = task;
+    kclf_ks.wake_up_process(task);
+    logki("kclf: preparation worker started\n");
+    return 0;
+}
+
+void kclf_worker_shutdown(void)
+{
+    struct task_struct *task = kclf_worker_task;
+
+    if (!task) return;
+    kclf_worker_task = 0;
+    if (kclf_ks.kthread_stop) (void)kclf_ks.kthread_stop(task);
+}
+
+int kclf_worker_submit(struct kclf_req *r)
+{
+    int rc = kclf_worker_start();
+
+    if (rc) {
+        /* Submission owns mm_ref/cred_ref even when thread creation fails. */
+        kclf_release_prep_refs(r);
+        return rc;
+    }
+    __atomic_store_n(&r->worker_phase, 1, __ATOMIC_RELEASE);
+    kclf_ks.wake_up_process(kclf_worker_task);
+    return 0;
+}
+
+/* 0: cancelled before the worker started; -EBUSY: already running. */
+int kclf_worker_cancel(struct kclf_req *r)
+{
+    int expected = 1;
+
+    if (!__atomic_compare_exchange_n(&r->worker_phase, &expected, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return -EBUSY;
+    kclf_release_prep_refs(r);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -524,6 +928,8 @@ static void kclf_work_cleanup_body(struct callback_head *head)
         kclf_manual_abandon(r);
         r->map_addr = 0;
         r->map_len = 0;
+        r->code_addr = 0;
+        r->code_len = 0;
     }
     __atomic_store_n(&r->finished, !r->map_addr, __ATOMIC_RELEASE);
 
@@ -777,6 +1183,13 @@ static void kclf_hook_remove(void)
 static void kclf_status_line(char *out, int outlen, int *off, struct kclf_req *r)
 {
     int i = KCLF_SLOT_OFFSET(r);
+    if (kclf_worker_busy(r)) {
+        *off += kclf_scnprintf(out + *off, outlen - *off,
+                              "#%d id=%llu pid=%d(%s) state=%s pending=worker\n", i,
+                              (unsigned long long)r->id, r->pid, r->comm,
+                              kclf_state_name(kclf_state_load(r)));
+        return;
+    }
     *off += kclf_scnprintf(out + *off, outlen - *off, "#%d id=%llu pid=%d(%s) state=%s stage=%s", i,
                            (unsigned long long)r->id, r->pid, r->comm, kclf_state_name(kclf_state_load(r)),
                            kclf_stage_name(r->stage));
@@ -804,10 +1217,11 @@ static void kclf_status_line(char *out, int outlen, int *off, struct kclf_req *r
             if (r->ld.close_sym) *off += kclf_scnprintf(out + *off, outlen - *off, " by=%s", r->ld.close_sym);
         }
     }
-    if (r->map_addr)
-        *off += kclf_scnprintf(out + *off, outlen - *off, " map=%llx+%llu code=%llx guard=%llx stack=%s/%u",
+    if (r->map_addr || r->code_addr)
+        *off += kclf_scnprintf(out + *off, outlen - *off, " map=%llx+%llu code=%llx+%llu guard=%llx stack=%s/%u",
                                (unsigned long long)r->map_addr, (unsigned long long)r->map_len,
-                               (unsigned long long)r->code_addr, (unsigned long long)r->guard_addr,
+                               (unsigned long long)r->code_addr, (unsigned long long)r->code_len,
+                               (unsigned long long)r->guard_addr,
                                r->stack_borrowed ? "task" : "transient", r->stack_state);
     if (r->err[0]) *off += kclf_scnprintf(out + *off, outlen - *off, " err=\"%s\"", r->err);
     *off += kclf_scnprintf(out + *off, outlen - *off, "\n");
@@ -856,6 +1270,8 @@ static int kclf_parse_flags(char *tok[], int ntok, int release, int *result)
             flag = KCLF_F_UNLOAD;
         else if (!strcmp(tok[i], "keepelf") && !release)
             flag = KCLF_F_KEEPELF;
+        else if (!strcmp(tok[i], "borrowstack") && !release)
+            flag = KCLF_F_BORROWSTACK;
         else
             return -EINVAL;
         if (flags & flag) return -EINVAL;
@@ -929,7 +1345,7 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *q = &kclf_reqs[i];
         if (kclf_state_load(q) != KCLF_IDLE && q->pid == (pid_t)pid &&
-            (!__atomic_load_n(&q->finished, __ATOMIC_ACQUIRE) || q->map_addr ||
+            (kclf_worker_busy(q) || !__atomic_load_n(&q->finished, __ATOMIC_ACQUIRE) || q->map_addr ||
              __atomic_load_n(&q->pending, __ATOMIC_ACQUIRE))) {
             *off += kclf_scnprintf(out + *off, outlen - *off, "error: task already has a request\n");
             return -EBUSY;
@@ -964,9 +1380,6 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
     r->pid = (pid_t)pid;
     r->pid_ref = pid_ref;
     r->mm = (u64)mm;
-    /* Only the address-space identity is needed; release the temporary
-     * reference immediately so a later target exit is not held up. */
-    kclf_ks.mmput_async(mm);
     r->task = (u64)task;
     r->flags = flags;
     r->image_id = requested_image;
@@ -978,37 +1391,89 @@ static long kclf_cmd_inject(char *tok[], int ntok, char *out, int outlen, int *o
 
     /* Queue before notification; never synthesize TIF_SIGPENDING. */
     r->woke = !!(flags & KCLF_F_WAKE);
-    rc = kclf_queue_work(r, task, &r->work_prepare, r->woke ? KCLF_TWA_SIGNAL : KCLF_TWA_RESUME);
-    kclf_rcu_read_unlock();
+    if (kclf_worker_available()) {
+        /* The worker owns the address-space and credential references while it
+         * prepares; the historical immediate mmput_async() would free the mm
+         * identity it needs.  They are dropped again before the EL0 phase.
+         * Everything task-derived is captured under RCU here; releasing the
+         * references (mmput may sleep) happens outside of it. */
+        r->mm_ref = mm;
+        if (kclf_ks.get_task_cred) r->cred_ref = kclf_ks.get_task_cred(task);
+        if (kclf_ks.get_task_pid) r->owner_pid = kclf_ks.get_task_pid(task, 1 /* PIDTYPE_TGID */);
+        if (kclf_ks.task_pid_nr_ns) r->tgid = kclf_ks.task_pid_nr_ns(task, 1 /* PIDTYPE_TGID */, 0);
+        kclf_rcu_read_unlock();
+        rc = kclf_worker_submit(r);
+    } else {
+        /* Only the address-space identity is needed; release the temporary
+         * reference immediately so a later target exit is not held up. */
+        kclf_ks.mmput_async(mm);
+        rc = kclf_queue_work(r, task, &r->work_prepare, r->woke ? KCLF_TWA_SIGNAL : KCLF_TWA_RESUME);
+        kclf_rcu_read_unlock();
+    }
     if (rc) {
         *off += kclf_scnprintf(out + *off, outlen - *off, "error: queue failed %d\n", rc);
-        kclf_fail(r, KCLF_FAILED, KCLF_ST_QUEUE, rc, "task_work_add failed");
+        kclf_fail(r, KCLF_FAILED, KCLF_ST_QUEUE, rc, "preparation queue failed");
         __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
         return rc;
     }
 
-    *off += kclf_scnprintf(out + *off, outlen - *off, "queued id=%llu tid=%d comm=%s path=%s mode=%s%s%s\n",
+    *off += kclf_scnprintf(out + *off, outlen - *off, "queued id=%llu tid=%d comm=%s path=%s mode=%s%s%s prep=%s\n",
                            (unsigned long long)r->id, r->pid, r->comm, r->path,
                            (flags & KCLF_F_FORCE) ? "force" : "safe", (flags & KCLF_F_WAKE) ? ",wake" : "",
-                           (flags & KCLF_F_UNLOAD) ? ",unload" : "");
+                           (flags & KCLF_F_UNLOAD) ? ",unload" : "",
+                           kclf_worker_available() ? "worker" : "task");
     return 0;
+}
+
+/* Cancel a request that has not started executing in EL0 yet.  A request may be
+ * queued for preparation (ARMED) or already prepared while its target thread is
+ * still blocked (READY); the latter only needs the pending hijack dropped and
+ * the worker asked to reclaim the mappings. */
+static long kclf_cancel_request(struct kclf_req *r)
+{
+    int st = kclf_state_load(r);
+
+    if (st == KCLF_ARMED || st == KCLF_PREPARING) {
+        if (!kclf_worker_available()) {
+            if (st != KCLF_ARMED || !kclf_cancel_work(r, &r->work_prepare)) return -EBUSY;
+            kclf_fail(r, KCLF_CANCELLED, KCLF_ST_QUEUE, -ECANCELED, "cancelled by controller");
+            __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+            return 0;
+        }
+        /* Claim QUEUED before writing state or releasing refs. Once RUNNING,
+         * the worker may be publishing READY or queuing a live callback.
+         * Return EBUSY so the controller can retry; never overwrite its state. */
+        if (st != KCLF_ARMED || kclf_worker_cancel(r)) return -EBUSY;
+        kclf_fail(r, KCLF_CANCELLED, KCLF_ST_QUEUE, -ECANCELED, "cancelled by controller");
+        __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    if (st == KCLF_READY && kclf_worker_available()) {
+        if (kclf_worker_busy(r)) return -EBUSY;
+        if (!kclf_cancel_work(r, &r->work_hijack)) return -EBUSY;
+        kclf_fail(r, KCLF_CANCELLED, KCLF_ST_HIJACK, -ECANCELED, "cancelled before execution");
+        __atomic_store_n(&r->worker_phase, KCLF_WPHASE_ROLLBACK, __ATOMIC_RELEASE);
+        if (kclf_worker_task) kclf_ks.wake_up_process(kclf_worker_task);
+        return 0;
+    }
+    return -EBUSY;
 }
 
 static long kclf_cmd_cancel(char *tok[], int ntok, char *out, int outlen, int *off)
 {
     u64 idx;
     struct kclf_req *r;
+    long rc;
 
     if (ntok != 2 || kclf_parse_uint(tok[1], KCLF_MAX_REQ - 1, &idx)) return -EINVAL;
     r = &kclf_reqs[idx];
-    if (kclf_state_load(r) != KCLF_ARMED || !kclf_cancel_work(r, &r->work_prepare)) {
+    rc = kclf_cancel_request(r);
+    if (rc) {
         *off += kclf_scnprintf(out + *off, outlen - *off, "error: work already running or not armed\n");
         return -EBUSY;
     }
-    kclf_fail(r, KCLF_CANCELLED, KCLF_ST_QUEUE, -ECANCELED, "cancelled by controller");
-    __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
     *off += kclf_scnprintf(out + *off, outlen - *off, "cancelled #%u id=%llu\n", (unsigned)idx,
-                          (unsigned long long)r->id);
+                           (unsigned long long)r->id);
     return 0;
 }
 
@@ -1043,7 +1508,8 @@ static long kclf_cmd_reap(char *out, int outlen, int *off)
         struct kclf_req *r = &kclf_reqs[i];
         struct task_struct *task;
         int alive;
-        if (kclf_state_load(r) == KCLF_IDLE || __atomic_load_n(&r->pending, __ATOMIC_ACQUIRE) || r->completing)
+        if (kclf_worker_busy(r) || kclf_state_load(r) == KCLF_IDLE ||
+            __atomic_load_n(&r->pending, __ATOMIC_ACQUIRE) || r->completing)
             continue;
         kclf_rcu_read_lock();
         task = r->pid_ref ? kclf_ks.pid_task(r->pid_ref, 0) : 0;
@@ -1078,6 +1544,7 @@ static int kclf_has_work(void)
     int i;
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
+        if (kclf_worker_busy(r)) return 1;
         if (kclf_state_load(r) != KCLF_IDLE && !kclf_slot_reclaimable(r)) return 1;
     }
     return kclf_manual_busy();
@@ -1089,10 +1556,11 @@ static long kclf_cmd_quiesce(char *out, int outlen, int *off)
     __atomic_store_n(&kclf_unloading, 1, __ATOMIC_RELEASE);
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
-        if (!(r->flags & KCLF_F_RELEASE) && kclf_state_load(r) == KCLF_ARMED && kclf_cancel_work(r, &r->work_prepare)) {
-            kclf_fail(r, KCLF_CANCELLED, KCLF_ST_QUEUE, -ECANCELED, "quiescing");
-            __atomic_store_n(&r->finished, 1, __ATOMIC_RELEASE);
-        }
+        if ((r->flags & KCLF_F_RELEASE)) continue;
+        if (kclf_state_load(r) != KCLF_ARMED && kclf_state_load(r) != KCLF_READY) continue;
+        /* A detached callback or an active worker retains ownership on EBUSY.
+         * Its own quiesce check will stop it at the next safe boundary. */
+        (void)kclf_cancel_request(r);
     }
     kclf_poll_running();
     kclf_manual_reap();
@@ -1188,7 +1656,7 @@ static void kclf_usage(char *out, int outlen, int *off)
     *off += kclf_scnprintf(out + *off, outlen - *off,
                            "kclf " KCLF_VER " - no-ptrace library loading\n"
                            "  probe                      runtime compatibility diagnostics\n"
-                           "  inject,<tid>,<path>[,manual|linker][,force][,wake][,unload][,keepelf]\n"
+                           "  inject,<tid>,<path>[,manual|linker][,force][,wake][,unload][,keepelf][,borrowstack]\n"
                            "  images[,cursor]            list resident manual images (paged)\n"
                            "  release,<tid>,<image-id>[,wake][,force]   release one manual reference\n"
                            "  status                     request table\n"
@@ -1295,6 +1763,15 @@ static long kclf_init(const char *args, const char *event, void *reserved)
     if (rc) return rc;
     kclf_exec_init();
 
+    /* Preparation outside the borrowed thread is what keeps a protected
+     * target's per-thread /proc accounting clean; a kernel without the kthread
+     * helpers still loads, using the historical target-thread preparation. */
+    rc = kclf_worker_init();
+    if (rc) {
+        logkw("kclf: preparation worker unavailable (%d); preparing in the target thread\n", rc);
+        rc = 0;
+    }
+
     rc = kclf_hook_install();
     if (rc) {
         /* Keep the module loaded so the failure is inspectable.  The controller
@@ -1316,6 +1793,7 @@ static int kclf_exit_unsafe(void)
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
         int st = kclf_state_load(r);
+        if (kclf_worker_busy(r)) return 1;
         if (st == KCLF_IDLE) continue;
         if (st == KCLF_RUNNING || st == KCLF_PREPARING || st == KCLF_READY) return 1;
         if (r->busy || r->completing || __atomic_load_n(&r->pending, __ATOMIC_ACQUIRE)) return 1;
@@ -1336,6 +1814,10 @@ static long kclf_exit(void *reserved)
      * module text. A task_work callback that is still queued cannot be fixed
      * from here; quiesce/drain is the only safe path. */
     kclf_unloading = 1;
+    /* Stop the preparation worker first: it executes module text and must not
+     * be able to enter it after this point.  kthread_stop() waits for the
+     * current preparation iteration to finish. */
+    kclf_worker_shutdown();
     for (i = 0; i < KCLF_MAX_REQ; i++) {
         struct kclf_req *r = &kclf_reqs[i];
         if (kclf_state_load(r) == KCLF_ARMED && kclf_cancel_work(r, &r->work_prepare)) {

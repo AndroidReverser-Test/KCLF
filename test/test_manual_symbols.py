@@ -27,7 +27,7 @@ PRELUDE = r'''
 static unsigned char memory[CAP];
 struct kclf_manual_image { int nodelete; };
 struct kclf_req { char err[256]; unsigned flags; struct kclf_manual_image *image; };
-struct km_provider { struct ke_object object; };
+struct km_provider { struct ke_object object; struct ke_io io; };
 struct km_context {
     struct kclf_req *r;
     struct ke_io io;
@@ -91,6 +91,7 @@ static void reset(unsigned length, unsigned shndx, unsigned binding) {
     s[1] = (struct ke_sym){1, (u8)((binding << 4) | 2), 0, (u16)shndx, 0x4000, 104};
     for (unsigned i = 0; i < length; i++) memory[0x10001 + i] = (u8)('a' + i % 26);
     provider.object = c.object;
+    provider.io = c.io;
     provider.object.symtab = BASE + 0x2000; provider.object.strtab = BASE + 0x30000;
     provider.object.hash = BASE + 0x2800;
     memcpy(memory + 0x30000, memory + 0x10000, length + 2);

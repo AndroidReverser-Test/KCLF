@@ -47,7 +47,7 @@ static int kclf_user_tbi = 1;
 struct callback_head { int unused; };
 struct kclf_req {
     int state, stage, busy, completing, finished, cleanup_tries, flags;
-    u64 mm, map_addr, map_len, image_id;
+    u64 mm, map_addr, map_len, code_addr, code_len, image_id;
     void *image;
     u32 relro_count, relro_done;
     u64 relro[KCLF_MAX_RELRO][2];
@@ -101,6 +101,12 @@ static int copy_user(void *task, unsigned long at, void *buf, int len, unsigned 
 static struct {
     int (*access_process_vm)(void *, unsigned long, void *, int, unsigned);
 } kclf_ks = {copy_user};
+/* Preparation-worker io context is unused in this fixture. */
+static void *kclf_io_worker __attribute__((unused));
+static struct mm_struct *kclf_io_mm __attribute__((unused));
+static int kclf_remote_vm(u64 addr, void *buf, int len, unsigned gup_flags) {
+    return kclf_ks.access_process_vm(current, addr, buf, len, gup_flags);
+}
 '''
 
 MAIN = r'''

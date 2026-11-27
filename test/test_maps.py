@@ -21,11 +21,22 @@ typedef int64_t loff_t;
 #define KCLF_MAX_VMA 16384
 struct mm_struct { int unused; } mm;
 #define current ((void *)1)
+/* Preparation-worker io context: zero in this fixture, so the iterator opens
+ * the target-thread procfs file exactly as before. */
+static void *kclf_io_worker;
+static int kclf_io_tgid;
 static struct mm_struct *kclf_task_mm(void *task) { assert(task == current); return &mm; }
 struct kclf_vm_range { u64 start, end; int prot; };
-struct vm_area_struct { u64 start, end; } vmas[] = {{0x1000, 0x2000}, {0x3000, 0x4000}, {0x5000, 0x6000}};
+struct fake_file { char pad[16]; char path[64]; };
+static struct fake_file fake_file = { .path = "/system/lib64/libfoo.so" };
+struct vm_area_struct { u64 start, end, file, pgoff, flags; } vmas[] = {
+    {0x1000, 0x2000, 0, 0, 5}, {0x3000, 0x4000, (u64)&fake_file, 3, 7}, {0x5000, 0x6000, 0, 0, 0}
+};
 struct file { int unused; } file;
 static int kclf_vma_direct, kclf_vma_start_off, kclf_vma_end_off = 8;
+static int kclf_vma_file_off = -1, kclf_vma_pgoff_off = -1, kclf_vma_flags_off = -1;
+static int kclf_file_path_off = -1;
+static int kclf_page_size = 4096;
 static int locks, opened, closed, io_error, open_error, copy_error;
 static size_t chunk = 512;
 static char text[8192], scratch[512];
@@ -60,12 +71,19 @@ static struct vm_area_struct *fake_find(struct mm_struct *m, unsigned long addr)
     for (unsigned int i = 0; i < 3; i++) if (vmas[i].end > addr) return &vmas[i];
     return NULL;
 }
+static char *fake_d_path(const void *path, char *buf, int len)
+{
+    assert(len == 256);
+    snprintf(buf, (size_t)len, "%s", (const char *)path);
+    return buf;
+}
 static struct {
     struct file *(*filp_open)(const char *, int, unsigned short);
     long (*vfs_read)(struct file *, char *, unsigned long, loff_t *);
     void (*fput)(struct file *);
     struct vm_area_struct *(*find_vma)(struct mm_struct *, unsigned long);
-} kclf_ks = {fake_open, fake_read, fake_close, fake_find};
+    char *(*d_path)(const void *, char *, int);
+} kclf_ks = {fake_open, fake_read, fake_close, fake_find, fake_d_path};
 '''
 MAIN = r'''
 int main(void) {
@@ -80,10 +98,17 @@ int main(void) {
     for (unsigned int i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
         assert(kclf_maps_range(bad[i], KCLF_USER_MAX, &first, &last));
     puts("maps hex/range/overflow/delimiter checks: PASS");
+    u64 fileoff = 0;
+    assert(!kclf_maps_offset("1000-2000 r-xp 00001000 00:00 0 /x", &fileoff) && fileoff == 0x1000);
+    assert(!kclf_maps_offset("1000-2000 r-xp 0 00:00 0", &fileoff) && fileoff == 0);
+    assert(kclf_maps_offset("1000-2000 r-xp", &fileoff));
+    assert(kclf_maps_offset("1000-2000 r-xp zz 00:00 0", &fileoff));
+    assert(kclf_maps_offset("1000-2000 r-xp 1x", &fileoff));
+    puts("maps file-offset parsing: PASS");
     strcpy(text, "1000-2000 r-xp 00000000 00:00 0 ");
     size_t n = strlen(text);
     memset(text + n, 'x', 3000); /* path longer than every buffer */
-    strcpy(text + n + 3000, "\n3000-4000 rw-p 0 00:00 0 /system/lib64/libc.so\n5000-6000 ---p 0 00:00 0"); /* no final newline */
+    strcpy(text + n + 3000, "\n3000-4000 rw-p 00001000 00:00 0 /system/lib64/libc.so\n5000-6000 ---p 0 00:00 0"); /* no final newline */
     const size_t chunks[] = {1, 2, 7, 31, 47, 48, 511, 512};
     for (unsigned int c = 0; c < sizeof(chunks) / sizeof(chunks[0]); c++) {
         chunk = chunks[c];
@@ -91,6 +116,7 @@ int main(void) {
         for (unsigned int i = 0; i < 3; i++) {
             assert(kclf_vma_next(&it, &v) == 1);
             assert(v.start == vmas[i].start && v.end == vmas[i].end);
+            assert(v.offset == (i == 1 ? 0x1000 : 0));
             if (i == 1) assert(!strcmp(v.path, "/system/lib64/libc.so"));
             else assert(!v.path[0]);
         }
@@ -120,17 +146,23 @@ int main(void) {
     assert(opened == closed);
     puts("maps errors remain errors, never mistaken for successful reclamation: PASS");
     kclf_vma_direct = 1;
+    kclf_vma_file_off = 16; kclf_vma_pgoff_off = 24; kclf_vma_flags_off = 32;
+    kclf_file_path_off = 16;
     assert(!kclf_vma_iter_open(&it, &mm, 0, 0));
     for (unsigned int i = 0; i < 3; i++) {
         assert(kclf_vma_next(&it, &v) == 1 && !locks);
         assert(v.start == vmas[i].start && v.end == vmas[i].end);
+        assert(v.offset == vmas[i].pgoff * 4096);
+        assert(v.prot == (int)vmas[i].flags);
+        if (i == 1) assert(!strcmp(v.path, "/system/lib64/libfoo.so"));
+        else assert(!v.path[0]);
     }
     assert(!kclf_vma_next(&it, &v) && !locks);
     kclf_vma_iter_close(&it);
     assert(!kclf_vma_at(&mm, 0x3800, &v, 0) && v.start == 0x3000);
     assert(kclf_vma_at(&mm, 0x8000, &v, 0) == -ENOENT);
     open_error = -EACCES;
-    assert(kclf_snapshot_vmas(0, ranges, 3) == 3 && ranges[0].prot == -1);
+    assert(kclf_snapshot_vmas(0, ranges, 3) == 3 && ranges[0].prot == 5);
     open_error = 0;
     vmas[0].end = KCLF_USER_MAX + 1;
     assert(kclf_vma_at(&mm, 0, &v, 0) == -EFAULT && !locks);

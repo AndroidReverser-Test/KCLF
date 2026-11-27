@@ -1,5 +1,9 @@
 # ELF TLS regression
 
+[Documentation](README.md) · [Build and use](USAGE.md)
+
+Run commands from the repository root. Fixture sources live in [test/tls](../test/tls).
+
 These sources exercise the manual backend's payload-local ELF TLS runtime
 (`kclf_tls.S` / `kclf_tls.h`) and the `R_AARCH64_TLSDESC` relocation path.
 
@@ -20,7 +24,7 @@ These sources exercise the manual backend's payload-local ELF TLS runtime
 
 ## Automated regression
 
-Run `make test` on Linux/WSL for all 14 host suites. Build Android fixtures with:
+Run `make test` on Linux/WSL for all 16 host suites. Build Android fixtures with:
 
 ```powershell
 python test/tls/build.py --clang D:/androidSDK/ndk/27.0.12077973/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe

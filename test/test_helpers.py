@@ -38,7 +38,7 @@ static u64 kclf_user_limit = 1ULL << 48;
 static unsigned char arena[4096] __attribute__((aligned(16)));
 enum { KCLF_IDLE, KCLF_ARMED, KCLF_PREPARING, KCLF_READY, KCLF_RUNNING,
        KCLF_DONE, KCLF_FAILED, KCLF_CANCELLED };
-struct kclf_req { int state, finished, pending, busy, completing; u64 map_addr; };
+struct kclf_req { int state, finished, pending, busy, completing, worker_phase; u64 map_addr; };
 static int kclf_state_load(const struct kclf_req *r) {
     return __atomic_load_n(&r->state, __ATOMIC_ACQUIRE);
 }
@@ -124,6 +124,7 @@ int main(void) {
     puts("ctl0 rejects duplicate/conflicting/unsupported options: PASS");
 
     struct kclf_req request = {.state = KCLF_RUNNING};
+    assert(!kclf_worker_busy(&request));
     assert(!kclf_slot_reclaimable(&request));
     request.state = KCLF_DONE;
     assert(!kclf_slot_reclaimable(&request));
@@ -139,6 +140,11 @@ int main(void) {
     assert(!kclf_slot_reclaimable(&request));
     request.busy = 0; request.state = KCLF_CANCELLED;
     assert(kclf_slot_reclaimable(&request));
+    for (int phase = 1; phase <= 5; phase++) {
+        request.worker_phase = phase;
+        assert(kclf_slot_reclaimable(&request) == (phase == 3));
+    }
+    request.worker_phase = 0;
     puts("slot reclamation waits for completion AND callback release: PASS");
 
     struct kclf_ehdr *eh = (void *)arena;
@@ -213,7 +219,8 @@ reclaim = function(control, "static int kclf_slot_reclaimable(")
 assert reclaim.index("&r->finished") < reclaim.index("&r->pending")
 parts += [function(control, signature) for signature in (
     "static int kclf_tokenize(", "static int kclf_parse_uint(", "static int kclf_parse_flags(")]
-parts += [function(compat, "int kclf_scnprintf("), reclaim]
+parts += [function(compat, "int kclf_scnprintf("),
+          function(control, "static int kclf_worker_busy("), reclaim]
 header = (MODULE / "kclf_internal.h").read_text()
 flags = header[header.index("#define KCLF_F_FORCE"):header.index("struct kclf_manual_image;")]
 with tempfile.TemporaryDirectory(prefix="kclf-helpers-") as directory:

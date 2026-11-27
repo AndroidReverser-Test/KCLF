@@ -1,340 +1,49 @@
-# KCLF 1.6.0
+# KCLF
 
 Kernel Controlled Loading Framework — Android ARM64 / KernelPatch KPM
 
-[中文](#中文) · [English](#english) · [实现 / Implementation](IMPLEMENTATION.md)
+KCLF 通过内核 `task_work` 借用目标线程，在 EL0 执行 SO 的构造与析构函数。
+默认 `manual` 后端映射并重定位 ELF；可显式选择 `linker` 后端调用目标 bionic loader。
 
-## 中文
+KCLF runs SO constructors and finalizers in a target ARM64 thread through kernel
+`task_work`. It provides a manual ELF loader and an explicit bionic linker backend.
 
-KCLF 通过内核 `task_work` 借用目标线程，在 EL0 执行 SO 的构造/析构函数。
-默认 `manual` 后端自行映射和重定位 ELF；显式 `linker` 后端调用目标 bionic loader。
-`main` 维护框架、构建配置、14 组主机回归、测试 App、TLS 设备夹具及兼容性报告；
-历史检测实验和其他设备夹具保留在 `dev`。
+[下载 / Releases](https://github.com/AndroidReverser-Test/KCLF/releases/latest) ·
+[文档 / Documentation](docs/README.md) · [使用 / Usage](docs/USAGE.md)
 
-### 1.6.0 更新与验证
+## 快速开始 / Quick start
 
-- payload 本地 ELF TLS（PT_TLS + `R_AARCH64_TLSDESC`）由框架 EL0 运行时按线程分配，
-  镜像标记 `nodelete=tls`，驻留到目标 mm 退出；首次 `unload` 和显式 `release` 拒绝。
-  外部 TLS、TPREL/DTPREL、initial-exec/local-exec 和线程析构注册仍不支持。
-- TLS 模板取自已重定位镜像，支持指针初值；校验模板与 PT_LOAD 的文件/地址对应关系，
-  限制线程分配总量，并明确拒绝模板中的延迟 IFUNC。失败回滚保留可重试的映射所有权。
-- 提供库权限只读取一次 maps 快照，用二分查找检查完整可执行段；direct walker 回退
-  仍可能没有权限信息。RELRO 支持合法的页对齐尾部。
-- 14 组主机测试（含 ASan/UBSan、模拟内核 ABI、4K/16K/64K）和真实设备 BTF 回归通过；
-  未新增内核符号导入或结构偏移依赖。
-- Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4K：正式产物通过 93 项 TLS、
-  236 项普通 App manual、219 项 linker 断言；关闭 BTF/nofault 的独立构建通过
-  106 项 TLS、255 项普通 App manual 断言。完整结果见报告。
-- 1.5.7 的长符号名与 `nodelete=emutls` 策略保留；其他内核及 16K/64K 真机没有在本轮
-  实测，模拟用例不能代替真机认证。
-
-实现、审计依据、产物 SHA-256 和证据范围见
-[1.6.0 兼容性报告](COMPATIBILITY_1.6.0.md)；产物见
-[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.6.0)。
-
-### 编译
-
-模块需要 GNU Make、AArch64 bare-metal GCC/binutils，以及一份 KernelPatch 源码。
-在本仓库根目录运行（Linux/WSL 示例，路径按实际环境替换）：
+在 Linux/WSL 中使用 GNU Make、AArch64 GCC/binutils 和 KernelPatch 源码构建：
+Build on Linux/WSL with GNU Make, AArch64 GCC/binutils and KernelPatch sources:
 
 ```sh
-make KP_DIR=/path/to/KernelPatch TARGET_COMPILE=/path/to/bin/aarch64-none-elf-
-```
-
-产物为 `kclf.kpm`；`make clean` 清理模块产物。位于 KernelPatch 的
-`kpms/kclf` 时可省略 `KP_DIR`（默认 `../..`）。本仓库不内置 KernelPatch 头文件。
-`make test` 在 Linux/WSL 运行主机测试，需要 Python 3、主机 GCC 和
-`aarch64-linux-gnu-gcc`（自动生成 ELF 夹具，无需预编译测试二进制）。
-
-测试 App 需要 Windows PowerShell、JDK（`java/javac/keytool` 在 PATH 中）、
-Android SDK platform 35 或更新、build-tools 和 NDK：
-
-```powershell
-.\test\app\build.ps1 -SdkRoot D:\androidSDK -NdkRoot D:\androidSDK\ndk\27.0.12077973
-```
-
-生成 `build/kclf-apptest/app.apk`，包名 `com.kclf.apptest`，包含普通、FP 状态破坏、
-延时构造和 ELF TLS 四种 payload。可用 `-OutDir` 指定输出目录；调试签名密钥会在输出目录复用。
-
-ELF TLS / TLSDESC 回归的构建和设备步骤见
-[test/tls/README.md](test/tls/README.md)；端到端 payload 必须用
-`-fno-emulated-tls` 编译，否则 Android clang 会使用 compiler-rt emutls。
-
-### 使用
-
-设备需已安装可用的 KernelPatch，且能用 superkey 调用 `kpatch`。
-仅支持 64 位 ARM64 目标；代码适配范围为 Linux 5.x/6.x，实际可用性取决于运行时 ABI、
-符号和设备配置，不能据此认为全部内核或 16K/64K 页设备已通过测试。
-
-```sh
-adb install -r -t build/kclf-apptest/app.apk
-adb shell am start -W -n com.kclf.apptest/.MainActivity
-adb shell pidof com.kclf.apptest
-adb shell logcat -d -s KCLFAPP:I
+make KP_DIR=/path/to/KernelPatch TARGET_COMPILE=aarch64-linux-gnu-
+make test
 adb push kclf.kpm /data/local/tmp/kclf.kpm
-```
-
-以下命令在主机 shell 执行：先将 `KEY` 设为你的 superkey（不要提交到仓库），
-`TID` 设为目标线程 ID（主线程即 PID），`LIBDIR` 设为上述日志中的 `libdir`。
-
-```sh
 adb shell /data/local/tmp/kpatch "$KEY" kpm load /data/local/tmp/kclf.kpm
 adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf probe
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf "inject,$TID,$LIBDIR/libkclfapp_payload.so,wake"
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf status
-adb shell run-as com.kclf.apptest cat /data/user/0/com.kclf.apptest/files/hit_$TID
 ```
 
-此例注入主线程，因此 marker 文件后缀也是 PID。重复查看 `status`，
-直到出现 `state=done`、`via=manual`、`refs=1` 且没有 `pending=` / `map=`。
-此例让 SO 保持驻留；需要卸载时按下文 `images` / `release` 流程释放。
-命令返回 `queued` 只表示已排队。追加 `,linker` 可选择 bionic 后端。
+`KEY` 是本地设置的 KernelPatch superkey；测试 App、注入命令和卸载步骤见[使用说明](docs/USAGE.md)。
+Set `KEY` locally to your KernelPatch superkey. See [usage](docs/USAGE.md) for the test app, injection and unloading.
 
-#### SO 路径要求
+## 适用范围 / Scope
 
-`,$LIBDIR/libkclfapp_payload.so` 中的逗号是命令参数分隔符，后面才是 SO 路径。
-`LIBDIR` 是**设备上的目录**，由主机 shell 展开；本示例应填写测试 App 日志中的
-`libdir`，例如 `/data/app/~~.../com.kclf.apptest-.../lib/arm64`，并确认其中已有
-由测试 APK 安装的 `libkclfapp_payload.so`。注入其他 SO 时替换为实际完整路径。
+- 仅支持 ARM64 64 位目标；兼容性取决于运行时 ABI 和设备配置。
+  ARM64 targets only; compatibility depends on runtime ABI and device configuration.
+- 1.6.4 实测为 Pixel 6 / Android 16 / Linux 6.1.134 / 4K；其他内核及 16K/64K 真机未认证。
+  Device validation covers this configuration; host simulations do not certify other kernels or page sizes.
+- 需选择 x16 已无活跃值的协作边界，保持 manual 依赖驻留，并在 `quiesce=idle` 后卸载 KPM。
+  Use a cooperative boundary where x16 is dead, keep manual dependencies loaded, and drain before KPM unload.
 
-- 展开后的路径必须是设备端绝对路径，最多 255 字节，不能包含逗号、空格、制表符、
-  换行等分隔符；给命令加引号也不能让这些字符成为路径的一部分。
-- SO 必须是框架支持的 64 位小端 AArch64 ELF 共享库（`ET_DYN`）。
-- 准备阶段使用**目标进程的凭据**打开文件；目标需能读取 SO、访问各级目录，
-  并满足 SELinux 策略。控制端取得 root 不等于目标 App 获得文件访问权限。
-- `manual` 不强制使用 App 的 native library 目录，也可使用目标有权读取的
-  `/data/user/0/<包名>/files/<模块>.so`；依赖仍需预先加载，映射权限仍受设备策略限制。
-  `linker` 还要求路径属于目标 linker namespace 允许的范围，并允许文件的可执行映射；
-  本示例使用安装后的 native library 目录。`/data/local/tmp` 不能视为普通 App 通用可用的路径。
+## 文档 / Documentation
 
-常用控制字符串（作为 `kpm ctl0 kclf` 的最后一个参数）：
-
-| 命令 | 含义 |
+| 内容 / Topic | 文档 / Guide |
 | --- | --- |
-| `inject,<tid>,<绝对路径>[,manual\|linker][,wake][,unload][,keepelf][,force]` | 默认 manual；设备端路径最多 255 字节，不支持逗号或空白分隔符 |
-| `status` / `probe` / `sym` | 请求状态 / 兼容性 / 内核符号诊断 |
-| `images[,cursor]` | 枚举 manual 驻留镜像；有 `next=N` 时继续 `images,N` |
-| `release,<tid>,<image-id>[,wake][,force]` | 释放一个 manual 引用；最后一次执行析构并解除映射 |
-| `cancel,<slot>` / `reap` | 取消尚未执行的排队请求 / 回收完成槽及死亡目标记录 |
-| `quiesce` | 禁止新加载并检查能否卸载；重新加载 KPM 才恢复接收 |
+| 构建、命令、测试 App / Build, commands, test app | [USAGE](docs/USAGE.md) |
+| 架构、实现和限制 / Architecture and limits | [IMPLEMENTATION](docs/IMPLEMENTATION.md) |
+| ELF TLS 回归 / ELF TLS regression | [TLS_TESTING](docs/TLS_TESTING.md) |
+| 1.6.4 审计与验证 / Audit and validation | [AUDIT](docs/AUDIT_1.6.4.md) |
+| 版本与历史报告 / Changes and historical reports | [CHANGELOG](docs/CHANGELOG.md) · [文档目录 / Index](docs/README.md) |
 
-`wake` 可唤醒可中断睡眠；省略时等待线程自然返回用户态。
-`unload` 用于一次性加载：manual 新镜像在构造函数返回后执行析构并解除映射；
-linker 在加载后调用 `dlclose` 释放本次引用，实际卸载取决于 linker 的引用计数等规则。
-省略 `unload` 则保持驻留。它控制的是注入 SO 的生命周期。
-
-**`unload` 的副作用：框架不会自动等待 SO 创建的后台线程退出，也不会注销其异步回调、
-定时器或 hook。** 构造函数返回时这些任务可能仍在执行；解除映射后继续使用其中的代码、
-数据或函数指针，可能导致崩溃、死锁或 App 卡住。仅在所有工作已同步完成、没有后续使用者时
-使用 `unload`。需要后台任务或持续回调的 SO 应保持驻留，先通过 payload 自身的机制停止任务、
-注销回调并确认不再执行，再释放。已有 manual 驻留镜像应通过 `release` 释放引用；
-重复 `inject,...,unload` 不会替代这一步。
-
-`keepelf` 只用于 manual，保留内存 ELF 头。
-`force` 仅跳过安全点启发式。**恢复路径会改写 x16/IP0，必须选择 x16 不再使用的协作边界**；
-系统调用白名单无法证明这一点，也无法证明目标未持有锁。
-manual 要求全部依赖已加载且在 payload 存活期间保持加载。payload 本地 ELF TLS 以
-每线程匿名块和私有 pthread key 实现，首次加载后镜像为 `nodelete=tls`；不注册
-bionic soinfo/TLS，也不支持完整 C++/JNI loader 集成。详见[实现与限制](IMPLEMENTATION.md)。
-
-`nodelete=emutls` / `nodelete=tls` / `nodelete=elf` 镜像在目标 mm 存活期间不能 release；必须先让
-目标进程退出，再 `reap` 并确认 `quiesce=idle`。完全不在 dynsym 中的隐藏 emutls
-无法自动识别，payload 使用方仍需自行保证生命周期安全。
-
-卸载前先 `quiesce`；驻留模式需要通过 `images` / `release` 排空所有引用，
-并先停止 payload 线程和异步回调。再执行：
-
-```sh
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf reap
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf quiesce
-# 必须确认 quiesce=idle 后再执行：
-adb shell /data/local/tmp/kpatch "$KEY" kpm unload kclf
-```
-
-自动 App 回归（会安装并重启本仓库测试 App、加载和排空 KPM）：
-
-```powershell
-.\test\app\device-test.ps1 -SuperKey (Read-Host 'KernelPatch superkey') -Serial '<SERIAL>' -Backend manual -Repeat 10
-# -Backend linker 测试另一后端；-Apk / -Kpm 可指定产物
-```
-
-## English
-
-KCLF borrows a target thread through kernel `task_work` to run SO constructors and
-finalizers in EL0. The default `manual` backend maps and relocates ELF itself;
-the explicit `linker` backend calls the target bionic loader.
-`main` contains the framework, build configuration, 14 host suites, test app,
-TLS device fixtures and compatibility reports. Historical detection experiments
-and other device fixtures remain on `dev`.
-
-### 1.6.0 changes and validation
-
-- Payload-local ELF TLS (`PT_TLS` + `R_AARCH64_TLSDESC`) uses a framework EL0 runtime
-  with per-thread allocations and `nodelete=tls`. Images stay mapped until mm exit;
-  first-load `unload` and explicit `release` are rejected. External TLS, TPREL/DTPREL,
-  initial-exec/local-exec and thread-destructor registration remain unsupported.
-- Templates come from the relocated image, including pointer initializers. Template
-  file/virtual ranges and total per-thread allocation are bounded; deferred IFUNC
-  writes into the template are rejected. Rollback retains retryable mapping ownership.
-- Provider permissions use one maps snapshot and binary searches over complete
-  executable segments. The direct-walker fallback may lack permission information.
-  GNU_RELRO accepts valid page-rounded tails.
-- All 14 host suites and the real-device BTF regression passed, including sanitizer
-  checks, simulated kernel ABIs and 4K/16K/64K layouts. No new kernel imports or offsets.
-- Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4K: the release artifact passed 93 TLS,
-  236 ordinary-app manual and 219 linker assertions. A no-BTF/no-nofault build passed
-  106 TLS and 255 ordinary-app manual assertions. See the report for complete results.
-- 1.5.7 long-symbol and `nodelete=emutls` support is retained. Other kernels and 16K/64K
-  devices were not tested; simulated cases do not certify those devices.
-
-See the [1.6.0 compatibility report](COMPATIBILITY_1.6.0.md) for implementation,
-audit evidence, artifact SHA-256 and validation limits, and the
-[GitHub Release](https://github.com/AndroidReverser-Test/KCLF/releases/tag/v1.6.0) for downloads.
-
-### Build
-
-The module requires GNU Make, AArch64 bare-metal GCC/binutils and a KernelPatch
-source tree. Run from this repository root (Linux/WSL; replace the paths):
-
-```sh
-make KP_DIR=/path/to/KernelPatch TARGET_COMPILE=/path/to/bin/aarch64-none-elf-
-```
-
-Output: `kclf.kpm`. Run `make clean` to remove module outputs.
-`KP_DIR` defaults to `../..`, suitable for a checkout at KernelPatch's
-`kpms/kclf`. KernelPatch headers are external dependencies.
-`make test` runs the host suites on Linux/WSL with Python 3, host GCC and
-`aarch64-linux-gnu-gcc`; it builds its ELF fixture from source.
-
-The test app requires Windows PowerShell, a JDK with `java/javac/keytool` on PATH,
-Android SDK platform 35 or newer, build-tools and an NDK:
-
-```powershell
-.\test\app\build.ps1 -SdkRoot D:\androidSDK -NdkRoot D:\androidSDK\ndk\27.0.12077973
-```
-
-Output: `build/kclf-apptest/app.apk`, package `com.kclf.apptest`.
-It includes normal, FP-clobbering, delayed-constructor and ELF TLS payloads.
-`-OutDir` changes the output location; the debug signing key is reused there.
-
-The ELF TLS / TLSDESC regression build and device steps are in
-[test/tls/README.md](test/tls/README.md). Build the end-to-end payload with
-`-fno-emulated-tls`; otherwise Android clang emits compiler-rt emutls.
-
-### Use
-
-The device must already run KernelPatch and allow superkey-authenticated
-`kpatch` commands. Targets must be 64-bit ARM64. The implementation addresses
-Linux 5.x/6.x ABIs; availability still depends on runtime ABI, symbols and device
-configuration. This does not certify all kernels or 16K/64K devices.
-
-```sh
-adb install -r -t build/kclf-apptest/app.apk
-adb shell am start -W -n com.kclf.apptest/.MainActivity
-adb shell pidof com.kclf.apptest
-adb shell logcat -d -s KCLFAPP:I
-adb push kclf.kpm /data/local/tmp/kclf.kpm
-```
-
-For the host-shell commands below, set `KEY` to your superkey (never commit it),
-`TID` to the target thread ID (PID for the main thread), and `LIBDIR` to the
-`libdir` printed in the app log.
-
-```sh
-adb shell /data/local/tmp/kpatch "$KEY" kpm load /data/local/tmp/kclf.kpm
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf probe
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf "inject,$TID,$LIBDIR/libkclfapp_payload.so,wake"
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf status
-adb shell run-as com.kclf.apptest cat /data/user/0/com.kclf.apptest/files/hit_$TID
-```
-
-This example targets the main thread, so the marker suffix is also the PID.
-Poll `status` until it reports `state=done`, `via=manual`, `refs=1`, with no
-`pending=` or `map=`. This example keeps the SO resident; use the `images` /
-`release` procedure below when it is ready to unload. A `queued` response only
-acknowledges scheduling. Append `,linker` for bionic loading.
-
-#### SO path requirements
-
-In `,$LIBDIR/libkclfapp_payload.so`, the comma separates command arguments; the
-SO path follows it. `LIBDIR` is a **directory on the device**, expanded by the
-host shell. For this example, use the test app's logged `libdir`, such as
-`/data/app/~~.../com.kclf.apptest-.../lib/arm64`, and verify that it contains
-`libkclfapp_payload.so` installed by the test APK. Replace the full path when
-injecting another SO.
-
-- The expanded path must be absolute on the device, at most 255 bytes, and
-  contain no commas, spaces, tabs, newlines or other argument separators.
-  Quoting the command does not make these characters valid within the path.
-- The SO must be a supported 64-bit little-endian AArch64 ELF shared object
-  (`ET_DYN`).
-- Preparation opens the file using **the target process's credentials**. The
-  target must be able to read the SO, traverse its parent directories and
-  satisfy SELinux policy. Root access for the controller does not grant file
-  access to the target app.
-- `manual` also accepts a target-readable path such as
-  `/data/user/0/<package>/files/<module>.so`; dependencies must already be loaded
-  and mapping permissions remain subject to device policy. `linker` additionally
-  requires an allowed path in the target linker namespace and permission for
-  executable file mappings. This example uses the installed native library
-  directory. Do not assume `/data/local/tmp` is usable by an ordinary app.
-
-Common control strings, passed as the last argument to `kpm ctl0 kclf`:
-
-| Command | Meaning |
-| --- | --- |
-| `inject,<tid>,<absolute-path>[,manual\|linker][,wake][,unload][,keepelf][,force]` | Defaults to manual; device path is at most 255 bytes and cannot contain commas or whitespace separators |
-| `status` / `probe` / `sym` | Requests / compatibility / kernel-symbol diagnostics |
-| `images[,cursor]` | List resident manual images; follow `next=N` with `images,N` |
-| `release,<tid>,<image-id>[,wake][,force]` | Release one manual reference; the last release runs finalizers and unmaps |
-| `cancel,<slot>` / `reap` | Cancel queued work before execution / reclaim finished slots and dead-target records |
-| `quiesce` | Disable new loads and check drain status; reload the KPM to accept loads again |
-
-`wake` wakes interruptible waits; otherwise work waits for a natural return to EL0.
-`unload` requests a one-shot load: a new manual image runs finalizers after its
-constructors return and is then unmapped. The linker backend calls `dlclose` to
-release this load's reference; actual unloading depends on linker reference
-counts and other rules. Omitting `unload` keeps the SO resident. This option
-controls the injected SO's lifetime.
-
-**Side effects of `unload`: the framework does not automatically wait for SO-created
-threads to exit or unregister asynchronous callbacks, timers or hooks.** These may
-outlive the constructors. Accessing unmapped code, data or function pointers can
-crash, deadlock or freeze the app. Use `unload` only when all work has completed
-synchronously and no later users remain. Keep SOs with background work or persistent
-callbacks resident; stop their work and unregister callbacks through the payload's
-own mechanism, then confirm execution has ended before releasing them. Use
-`release` for existing resident manual references; repeating `inject,...,unload`
-does not release those references.
-
-`keepelf` retains in-memory ELF headers for manual images.
-`force` only bypasses safe-point heuristics. **The restore tail overwrites x16/IP0:
-use a cooperative boundary where x16 is dead.** The syscall allowlist cannot prove
-this or the absence of held locks. Manual loading requires every dependency to
-already be loaded and remain resident. Payload-local ELF TLS uses per-thread anonymous
-blocks behind a private pthread key and marks the image `nodelete=tls`; the image is not
-registered with bionic soinfo/TLS. Full C++/JNI loader integration is unsupported.
-See [implementation and limits](IMPLEMENTATION.md).
-
-Images marked `nodelete=emutls`, `nodelete=tls` or `nodelete=elf` cannot be released while their
-target mm is alive. Let the target process exit, then `reap` and confirm
-`quiesce=idle` before unloading the module. Hidden emutls absent from dynsym
-cannot be detected automatically; callers still own payload lifetime safety.
-
-Before unloading, issue `quiesce`. For resident manual images, drain every
-reference using `images` / `release`, after stopping payload threads and callbacks.
-Then:
-
-```sh
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf reap
-adb shell /data/local/tmp/kpatch "$KEY" kpm ctl0 kclf quiesce
-# Continue only after quiesce=idle:
-adb shell /data/local/tmp/kpatch "$KEY" kpm unload kclf
-```
-
-Automated app regression installs/restarts this test app and loads/drains the KPM:
-
-```powershell
-.\test\app\device-test.ps1 -SuperKey (Read-Host 'KernelPatch superkey') -Serial '<SERIAL>' -Backend manual -Repeat 10
-# Use -Backend linker for bionic; -Apk / -Kpm select custom outputs.
-```
+许可证 / License: [GPL-2.0](LICENSE)

@@ -33,7 +33,7 @@
 struct file;
 
 #define KCLF_NAME "kclf"
-#define KCLF_VER "1.6.0"
+#define KCLF_VER "1.6.4"
 
 #define KCLF_MAX_REQ 4
 #define KCLF_MAX_IMAGES 32
@@ -43,15 +43,24 @@ struct file;
  * phase finished (IFUNC results must be written before they turn read-only). */
 #define KCLF_MAX_RELRO 8
 
-/* mapping layout: one anonymous region whose blocks (RX code, RW ABI
- * parameter page, RW private parameter page and, only when the target's own
- * stack cannot be borrowed, a PROT_NONE guard + RW
- * stack) are placed in a random order with random pad pages between them.  The
- * private page is therefore not adjacent to the ABI page.  Sizes are randomized
- * too.  Every page that is not immediately overwritten carries random data. */
+/* mapping layout: the anonymous transient region carries only non-executable
+ * blocks (the RW ABI parameter page, the RW private parameter page and, only
+ * when the target's own stack cannot be borrowed, a PROT_NONE guard + RW
+ * stack) placed in a random order with random pad pages between them.  The
+ * private page is therefore not adjacent to the ABI page.  The EL0 trampoline
+ * is not part of that region: every executable page the framework creates in
+ * a target is a private file-backed mapping of the payload, because a
+ * process-local /proc/<pid>/maps scan treats r-xp without a pathname as
+ * injected code.  Sizes are randomized too.  Every transient page that is not
+ * immediately overwritten carries random data. */
 #define KCLF_MIN_STACK_PAGES 6
 #define KCLF_STACK_PAGES_SPAN 9
 #define KCLF_STACK_HEADROOM 0x100
+/* Upper bound on how much of a borrowed thread stack the EL0 tail wipes
+ * before resuming.  Payload frames otherwise leave return addresses into the
+ * transient code page and the module image in the unused stack area, where a
+ * process-local scanner can still find them after the request completed. */
+#define KCLF_STACK_SCRUB_MAX (256 * 1024)
 
 /* request states, only mutated by the owner of the request */
 enum kclf_state
@@ -83,6 +92,7 @@ enum kclf_stage
 #define KCLF_F_LINKER 0x10 /* explicit legacy bionic backend; manual is default */
 #define KCLF_F_RELEASE 0x20 /* release a manual image reference */
 #define KCLF_F_KEEPELF 0x40 /* keep in-memory ELF/program headers (manual) */
+#define KCLF_F_BORROWSTACK 0x80 /* legacy: run on the interrupted thread stack */
 
 struct kclf_manual_image;
 
@@ -94,6 +104,8 @@ struct kclf_regs
     u64 pc;
     u64 pstate;
 };
+
+struct cred;
 
 struct kclf_loader
 {
@@ -121,16 +133,20 @@ struct kclf_req
     u64 task; /* informational only, never dereferenced */
     char comm[16];
     char path[KCLF_PATH_MAX];
+    char code_path[KCLF_PATH_MAX]; /* file whose first page backs code_addr */
 
     /* transient mapping inside the target */
     u64 map_addr;
     u64 map_len;
-    u64 code_addr;
+    u64 code_addr; /* one-page EL0 trampoline, private file mapping of code_path */
+    u64 code_len;
     u64 guard_addr; /* PROT_NONE page below the transient stack */
     u64 param_addr;
     u64 priv_addr; /* separate page: saved register/FPSIMD file and keys */
     u64 stack_top;
     u64 stack_ref_sp; /* user SP observed when stack_top was chosen */
+    u64 stack_scrub; /* borrowed-stack bytes the EL0 tail wipes, zero if none */
+    u64 dedicated_stack_top; /* transient stack top fixed at preparation time */
     u64 entry_pc; /* where EL0 starts executing the generated program */
     u64 done_token; /* per-request EL0 completion marker (never a fixed magic) */
     u8 stack_borrowed; /* stack_top points into the interrupted thread stack */
@@ -180,6 +196,23 @@ struct kclf_req
     int pending; /* queued + executing task_work references; acquire/release */
     u64 run_task; /* task currently executing the payload */
 
+    /* Preparation context.  Mapping, ELF parsing and relocation all run on a
+     * kernel worker that entered the target mm (kthread_use_mm), never on the
+     * borrowed target thread: every page the loader faults in would otherwise
+     * be charged to that thread's /proc/<pid>/task/<tid>/stat accounting
+     * (min_flt/stime), which is a trivially observable "code just ran here"
+     * signature for an in-process anti-cheat.  The references below keep the
+     * address space, the target credentials and the process identity alive
+     * while the worker runs; they are dropped before the EL0 phase so a
+     * target exit is never held up by a pending request. */
+    struct mm_struct *mm_ref;
+    const struct cred *cred_ref;
+    struct pid *owner_pid;
+    int worker_phase; /* 0 none, 1 queued, 2 preparing, 3 idle, 4 rollback queued, 5 rollback running */
+    u32 prep_worker;
+    u32 prep_retries;
+    s32 tgid; /* target thread-group id for /proc/<tgid>/maps in the worker */
+
     struct callback_head work_prepare;
     struct callback_head work_hijack;
     struct callback_head work_cleanup;
@@ -208,6 +241,9 @@ struct kclf_syms
     struct task_struct *(*pid_task)(struct pid *pid, int type);
     void (*put_pid)(struct pid *pid);
     struct pid *(*get_task_pid)(struct task_struct *task, int type);
+    /* Rendered pid_t of a task in the caller's pid namespace: the preparation
+     * worker needs the target's TGID to read /proc/<tgid>/maps for it. */
+    s32 (*task_pid_nr_ns)(struct task_struct *task, int type, void *ns);
     void *(*vmalloc)(unsigned long size);
     void (*vfree)(const void *ptr);
     loff_t (*vfs_llseek)(struct file *file, loff_t offset, int whence);
@@ -217,10 +253,18 @@ struct kclf_syms
     struct vm_area_struct *(*find_vma)(struct mm_struct *mm, unsigned long addr);
     long (*copy_from_user_nofault)(void *to, const void *from, unsigned long n);
     int (*access_process_vm)(struct task_struct *tsk, unsigned long addr, void *buf, int len, unsigned int gup_flags);
+    /* access_process_vm() goes through get_task_mm(), which deliberately returns
+     * NULL for PF_KTHREAD tasks, so the preparation worker addresses the target
+     * address space through access_remote_vm() instead. */
+    int (*access_remote_vm)(struct mm_struct *mm, unsigned long addr, void *buf, int len, unsigned int gup_flags);
     struct file *(*filp_open)(const char *name, int flags, umode_t mode);
     long (*kernel_read)(struct file *file, void *buf, unsigned long count, loff_t *pos);
     long (*vfs_read)(struct file *file, char *buf, unsigned long count, loff_t *pos);
     void (*fput)(struct file *file);
+    /* Resolve an open file's path from its struct path.  The manual backend
+     * uses it to give every provider a real pathname even when the target is
+     * non-dumpable and /proc/<tgid>/maps cannot be opened with its credentials. */
+    char *(*d_path)(const void *path, char *buf, int buflen);
     struct mm_struct *(*get_task_mm)(struct task_struct *task);
     void (*mmput_async)(struct mm_struct *mm);
     void (*mmap_read_lock)(struct mm_struct *mm);
@@ -228,6 +272,21 @@ struct kclf_syms
     void (*down_read)(void *sem);
     void (*up_read)(void *sem);
     void (*msleep)(unsigned int msecs);
+    /* Preparation worker: a kernel thread that enters the target mm so the
+     * borrowed thread's scheduling/page-fault accounting stays untouched. */
+    struct task_struct *(*kthread_create_on_node)(int (*fn)(void *), void *data, int node, const char *name, ...);
+    int (*wake_up_process)(struct task_struct *task);
+    int (*kthread_should_stop)(void);
+    int (*kthread_stop)(struct task_struct *task);
+    void (*kthread_use_mm)(struct mm_struct *mm);
+    void (*kthread_unuse_mm)(struct mm_struct *mm);
+    void (*mmput)(struct mm_struct *mm);
+    /* The payload file must still be opened with the target's credentials, also
+     * when the worker (a kernel thread) performs the open. */
+    const struct cred *(*get_task_cred)(struct task_struct *task);
+    const struct cred *(*override_creds)(const struct cred *cred);
+    void (*revert_creds)(const struct cred *old);
+    void (*put_cred)(const struct cred *cred);
     /* AArch64 ELF_HWCAP accessors. The target may be non-dumpable, so its
      * /proc/<pid>/auxv can be unreadable even from its own credentials. */
     u64 (*cpu_get_elf_hwcap)(void);
@@ -254,6 +313,13 @@ void kclf_fail(struct kclf_req *r, int state, int stage, long err, const char *f
     __attribute__((format(printf, 5, 6)));
 void kclf_set_err(struct kclf_req *r, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 u64 kclf_now(void);
+/* preparation worker (task_work-free, target mm via kthread_use_mm) */
+int kclf_worker_init(void);
+void kclf_worker_shutdown(void);
+int kclf_worker_available(void);
+/* Takes ownership of preparation references, including on submission failure. */
+int kclf_worker_submit(struct kclf_req *r);
+int kclf_worker_cancel(struct kclf_req *r);
 
 /* kclf_exec.c */
 long kclf_exec_prepare(struct kclf_req *r);
@@ -263,10 +329,20 @@ long kclf_apply_relro(struct kclf_req *r);
 long kclf_exec_finish(struct kclf_req *r, int capture_err);
 int kclf_exec_probe(char *out, int outlen);
 int kclf_exec_init(void);
+/* Map one page of @path read+execute and write @code through its private COW
+ * page (GUP FOLL_FORCE). The VMA keeps vm_file, so the page appears in
+ * /proc/<pid>/maps with the module path instead of as anonymous r-xp. */
+long kclf_map_file_code(const char *path, const void *code, u64 page, u64 *addr);
 int kclf_urd(u64 addr, void *buf, int len);
 int kclf_urds(u64 addr, void *buf, int len);
 int kclf_uwr(u64 addr, const void *buf, int len);
-int kclf_walk_vmas(u64 scratch, int (*visit)(u64, const char *, void *), void *context);
+/* Fault every page of a target range in from the calling context, so the
+ * borrowed thread that later executes the payload takes no page fault (and
+ * therefore no min_flt) for pages the framework itself installed. */
+void kclf_prefault_user(u64 start, u64 len);
+/* Write through a COW mapping that is not writable from EL0 (FOLL_FORCE). */
+int kclf_uwr_force(u64 addr, const void *buf, int len);
+int kclf_walk_vmas(u64 scratch, int (*visit)(u64, const char *, u64, void *), void *context);
 struct kclf_vm_range { u64 start, end; int prot; };
 int kclf_snapshot_vmas(u64 scratch, struct kclf_vm_range *ranges, unsigned capacity);
 /* 0 only when the process identity disappeared or demonstrably exec'd. */
@@ -277,6 +353,7 @@ long kclf_manual_prepare(struct kclf_req *r);
 void kclf_manual_params(struct kclf_req *r, u8 *params);
 long kclf_manual_finish(struct kclf_req *r);
 void kclf_manual_abandon(struct kclf_req *r);
+void kclf_manual_prefault(struct kclf_req *r);
 void kclf_manual_reap(void);
 int kclf_manual_status(char *out, int length, unsigned start);
 int kclf_manual_busy(void);
@@ -285,6 +362,10 @@ int kclf_manual_shutdown(void);
 /* kclf_compat.c: runtime layout, no version-based structure guesses. */
 extern int kclf_regs_size;
 extern int kclf_vma_start_off, kclf_vma_end_off, kclf_mmap_lock_off;
+/* Verified by BTF: the locked VMA walker can recover the same metadata procfs
+ * exposes (pathname, file offset, permissions), which non-dumpable app
+ * processes deny to /proc/<tgid>/maps. */
+extern int kclf_vma_file_off, kclf_vma_pgoff_off, kclf_vma_flags_off, kclf_file_path_off;
 extern int kclf_btf_ok;
 extern int kclf_vma_direct;
 extern int kclf_wake_supported;
@@ -302,5 +383,12 @@ extern int kclf_mm_off;
 /* Current's mm stays live during its callback. For another task the caller
  * holds RCU and may only compare this borrowed identity, never dereference it. */
 struct mm_struct *kclf_task_mm(struct task_struct *task);
+
+/* Non-NULL only while the preparation worker is inside the target mm.  Target
+ * memory access must then go through the request's mm: the worker is a kernel
+ * thread and get_task_mm() hides its mm from access_process_vm(). */
+extern struct mm_struct *kclf_io_mm;
+extern struct task_struct *kclf_io_worker;
+extern s32 kclf_io_tgid;
 
 #endif

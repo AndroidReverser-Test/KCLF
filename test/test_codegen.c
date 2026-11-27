@@ -70,7 +70,7 @@ int main(int argc, char **argv)
         pl.end = 0x398;
 
         memset(page, 0, sizeof(page));
-        if (kclf_prog_build(page, page_size, 0x7f12345000ULL, 0x7f12347000ULL, &pl, seed, &prog)) {
+        if (kclf_prog_build(page, page_size, 0x7f12345000ULL, 0x7f12347000ULL, &pl, 0, seed, &prog)) {
             fprintf(stderr, "seed %u: build failed\n", seed);
             return 1;
         }

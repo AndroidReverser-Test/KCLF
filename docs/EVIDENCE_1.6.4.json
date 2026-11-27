@@ -1,0 +1,63 @@
+{
+  "version": "1.6.4",
+  "date": "2026-11-27 Asia/Shanghai",
+  "device": "Pixel 6 / Android 16 / Linux 6.1.134 / ARM64 / 4096-byte pages",
+  "compiler": "aarch64-linux-gnu-gcc 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)",
+  "host_suites": 16,
+  "clean_release_build_matches_device_tested_artifact": true,
+  "kpm_sha256": "56599d4acbdb1f0b469e356bbaaf547e2a458598130230134751ce8fcf948560",
+  "fallback_kpm_sha256": "d56d276e208b414f58af5bb91cb4e66d4e4857c220d6c1a9e02fa10c771ace68",
+  "test_apk_sha256": "4bac842f55cf39f3fecb53128bf6cdf880c9c5439a5ac712db9c1dd88b79cf76",
+  "device_checks": {
+    "manual": {
+      "passed_assertions": 273,
+      "evidence": "build/kclf-app-a79ecc1d2d45/results.txt"
+    },
+    "linker": {
+      "passed_assertions": 251,
+      "evidence": "build/kclf-app-32af4ef6936e/results.txt"
+    },
+    "fallback_manual": {
+      "passed_assertions": 227,
+      "evidence": "build/kclf-app-668706db5596/results.txt"
+    },
+    "tls": {
+      "passed_assertions": 93,
+      "evidence": "build/kclf-tls-c87d86703129/results.json"
+    },
+    "fallback_tls": {
+      "passed_assertions": 106,
+      "evidence": "build/kclf-tls-378d39dc36ce/results.json"
+    }
+  },
+  "local_evidence_sha256": {
+    "build/kclf-app-a79ecc1d2d45/results.txt": "707b2d44f2d3e04ba3ac66d092379a85f1aba2483dcf2ac44f94aaea8531d3f7",
+    "build/kclf-app-32af4ef6936e/results.txt": "b42e928a5de3c96d4784f442e32df67272c2ea8575928ed8a6047a3f1c779939",
+    "build/kclf-app-668706db5596/results.txt": "731e1681e09776084decefce0fa8ce36912ab49c5616752488f2386d2ae06150",
+    "build/kclf-tls-c87d86703129/results.json": "1a293fd30ec9458694b0ac80082d5dbcdbc7ab41fe2972a5425b6e0292497e2c",
+    "build/kclf-tls-378d39dc36ce/results.json": "7b2dfe60616be64dca38e08ffeefc847978a8573134bdb099df0e59445596831",
+    "build/audit-20261127/host-final.log": "fcf7143c3ea6e2785b39e84f9f1d348bf73ff909322f0fafa18048dfcfaae130",
+    "build/audit-20261127/real-btf.log": "113a10d866682667af867dc15f6ca88a7e0929e947ccf87bef29f1a250cc462c",
+    "build/audit-20261127/benchmark.json": "efb679b9ada61f989bd1b03f8f5eef7734c0efea976992de016da00c535c9f60",
+    "build/release-1.6.4/host-tests.log": "985d92b387822f0ded7a3cc5ed23341ea7403e810b51d9e111f257ac12219cd5",
+    "build/release-1.6.4/build.log": "bd9884065b598967839dea098aa6f0d5bb38600a52b9edca3c5567c32714f028"
+  },
+  "production_source_sha256": {
+    "kclf.c": "4a0e13df5a41eadb0361fc2603314b7a88f5c86b878502b3e47f4dd9446a952f",
+    "kclf_btf.h": "f1f0cc9c7ac2690dc4c0803734a6f1b8b9263ac762740a9eb7e8938e82400b5c",
+    "kclf_codegen.c": "4321b587997030d5135c72c30d95ea021e90049bbff362124184bd6c76d3ffbc",
+    "kclf_codegen.h": "758a3bb4983d7511d0366d09bc396d6d893c8370dee0e6d7adb3356ae61892b1",
+    "kclf_compat.c": "afb6218991d08d03534d4d2bdbada8a99c5d90cec042d300b4fdcbe4740535f4",
+    "kclf_elf.c": "95e7c464f45dc7d4681223d5a78b41294b25460dcfd7ceccb1a55c94bdb64ad5",
+    "kclf_elf.h": "2871e02244b47495611332b1f992f13c16fd6a906c4dd179142384ce1529a30d",
+    "kclf_exec.c": "04aae821cb1f5ef9d0a5468267b49e19f6d89b2301f6015762d511f1efcdec96",
+    "kclf_internal.h": "3c19fb51af406f71b0619f7d498ce7908101c5f9e28ad6be1dbfbf6b46bf1b7b",
+    "kclf_manual.c": "d26af07a7a963b9cdeb9f28df82ba172dfd917feb15f21cbe44a70be6e306fa0",
+    "kclf_maps.h": "a636d91fff0391853ef4117afa359ff3bcbbbcfdc277dcb14be6f2bb9da04ba3",
+    "kclf_param.h": "3795f075fc3b03b3929e7356242ca9539a86f7781e591c8c1b45919f266d619d",
+    "kclf_tls.h": "1d013d589141f778a397f97429df4be3317f86314f0b783b936defc68c011652",
+    "kclf_tls.S": "2d1d3f32b72ff605e44038cdddad8d7a2ad5d4ec9f77bf1a46527c8a7f674825",
+    "Makefile": "e52dfea21f3f91c4d6e4da4b21ead3028aef84f65fc6ce236abda3a5b4388ae6"
+  },
+  "scope": "One device configuration. Host 4K/16K/64K and simulated kernel ABI cases are not device certification. Raw evidence stays local under build/."
+}

@@ -64,6 +64,23 @@ static int kclf_maps_prot(const char *line, int *prot)
     return 0;
 }
 
+/* Decode the file offset field (third field) of a maps line.  A provider's
+ * ELF header is located by "mapping start + vm_pgoff", so the manual backend
+ * needs this value to read metadata from the file page cache instead of
+ * faulting the target's own library pages in through GUP.  Returns -1 on a
+ * malformed prefix, otherwise 0. */
+static int kclf_maps_offset(const char *line, uint64_t *offset)
+{
+    unsigned int field;
+
+    for (field = 0; field < 2; field++) {
+        while (*line && *line != ' ') line++;
+        while (*line == ' ') line++;
+    }
+    if (kclf_maps_hex(&line, offset)) return -1;
+    return (*line == ' ' || *line == 0) ? 0 : -1;
+}
+
 /* Extract the optional pathname from a maps line:
  *   start-end perms offset dev inode [pathname]
  * Anonymous mappings have no pathname. The result is always NUL-terminated and

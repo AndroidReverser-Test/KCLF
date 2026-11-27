@@ -22,32 +22,73 @@ PRELUDE = r'''
 #define KM_PROVIDERS_MAX 4096
 #define KE_NAME 256
 #define KCLF_PATH_MAX 256
+#define KM_STRING_BUDGET (256ULL * 1024 * 1024)
+#define kclf_user_limit (1ULL << 48)
 
 typedef uint64_t u64;
+typedef int64_t s64;
 typedef uint32_t u32;
+struct file;
 struct ke_phdr { unsigned type, flags; u64 vaddr, memsz; };
 struct ke_object { u64 bias, low, high; unsigned soname, phnum; struct ke_phdr ph[2]; };
 struct kclf_vm_range { u64 start, end; int prot; };
-struct ke_io { void *error; void *string_budget; };
+struct ke_io {
+    void *ctx;
+    u64 limit;
+    int (*read)(void *, u64, void *, unsigned long);
+    int (*write)(void *, u64, const void *, unsigned long);
+    void (*error)(void *, const char *, const char *);
+    int (*defer_ifunc)(void *, u64, u32, s64);
+    u64 *string_budget;
+    int (*tlsdesc)(void *, u64, u64);
+};
 struct kclf_req {
     u64 mm;
     struct { u64 linker_base, linker_end; } ld;
 };
-
+struct km_context;
+struct km_provider_view {
+    struct km_context *owner;
+    struct ke_object *object;
+    struct file *file;
+    u64 file_size, header_addr, header_off, file_base, bias;
+    u64 string_budget;
+};
 struct km_provider {
     unsigned long marker;
     struct ke_object object;
+    struct km_provider_view view;
+    struct ke_io io;
     char name[KE_NAME], path[KCLF_PATH_MAX];
 };
 struct km_context {
     struct kclf_req *r;
     struct ke_io io;
     struct ke_object candidate;
+    struct km_provider_view probe;
     struct km_provider *providers;
-    unsigned nproviders, provider_cap;
+    unsigned nproviders, provider_cap, nfile_providers, nresident_providers;
     struct kclf_vm_range *ranges;
     unsigned nranges;
 };
+static int provider_path_candidate(const char *path) { (void)path; return 1; }
+static int provider_view_open(struct km_context *c, const char *path, u64 address, u64 offset,
+                              struct ke_io *io, struct ke_object *o)
+{
+    (void)c; (void)path; (void)address; (void)offset; (void)io; (void)o;
+    return -ENOENT;
+}
+static void provider_view_close(struct km_provider_view *v) { (void)v; }
+static void provider_fixup(struct km_context *c) { (void)c; }
+static int provider_nofault_read(void *context, u64 at, void *p, unsigned long n)
+{
+    (void)context; (void)at; (void)p; (void)n;
+    return 0;
+}
+static void provider_report(void *context, const char *why, const char *detail)
+{
+    (void)context; (void)why; (void)detail;
+}
 struct kclf_syms {
     void *(*vmalloc)(unsigned long);
     void (*vfree)(const void *);
@@ -70,6 +111,7 @@ static int kclf_urds(u64 address, void *out, int size)
     memcpy(out, &magic, 4);
     return 0;
 }
+static int kclf_urd(u64 address, void *out, int size) { return kclf_urds(address, out, size); }
 static int own_mapping(u64 mm, u64 address)
 {
     (void)mm; (void)address;
@@ -89,9 +131,9 @@ static int ke_string(struct ke_io *io, const struct ke_object *o, u32 offset, ch
     strcpy(name, "libc++.so");
     return 0;
 }
-static void report(struct km_context *c, const char *why, const char *detail)
+static void report(void *context, const char *why, const char *detail)
 {
-    (void)c; (void)detail;
+    (void)context; (void)detail;
     snprintf(last_error, sizeof(last_error), "%s", why);
 }
 '''
@@ -172,19 +214,19 @@ int main(void)
 
     reset();
     fail_next = 1;
-    assert(collect(0x10000000, "/system/lib64/libc++.so", &c) == -ENOMEM);
+    assert(collect(0x10000000, "/system/lib64/libc++.so", 0, &c) == -ENOMEM);
     assert(!c.providers && !c.nproviders && !c.provider_cap);
     assert(strstr(last_error, "provider table allocation failed"));
     puts("first provider allocation failure aborts the mapping walk: PASS");
 
     reset();
     for (unsigned i = 0; i < KM_PROVIDERS_INIT; i++)
-        assert(!collect(0x10000000ULL + i * 0x10000ULL, "/system/lib64/libc++.so", &c));
+        assert(!collect(0x10000000ULL + i * 0x10000ULL, "/system/lib64/libc++.so", 0, &c));
     original = c.providers;
     fail_next = 1;
     /* This later same-SONAME object would win an ART importer's origin match.
      * Dropping it and continuing would silently select a system provider. */
-    assert(collect(0x20000000, "/apex/com.android.art/lib64/libc++.so", &c) == -ENOMEM);
+    assert(collect(0x20000000, "/apex/com.android.art/lib64/libc++.so", 0, &c) == -ENOMEM);
     assert(c.providers == original && c.nproviders == KM_PROVIDERS_INIT);
     assert(strstr(last_error, "provider table allocation failed"));
     for (unsigned i = 0; i < c.nproviders; i++)
@@ -193,11 +235,11 @@ int main(void)
 
     reset();
     for (unsigned i = 0; i < KM_PROVIDERS_MAX; i++)
-        assert(!collect(0x10000000ULL + i * 0x10000ULL, "/system/lib64/libc++.so", &c));
+        assert(!collect(0x10000000ULL + i * 0x10000ULL, "/system/lib64/libc++.so", 0, &c));
     assert(c.nproviders == KM_PROVIDERS_MAX && c.provider_cap == KM_PROVIDERS_MAX);
     /* Repeated VMAs for one image do not consume an extra provider slot. */
-    assert(!collect(0x10000000, "/system/lib64/libc++.so", &c));
-    assert(collect(0x80000000, "/apex/com.android.art/lib64/libc++.so", &c) == -ENOSPC);
+    assert(!collect(0x10000000, "/system/lib64/libc++.so", 0, &c));
+    assert(collect(0x80000000, "/apex/com.android.art/lib64/libc++.so", 0, &c) == -ENOSPC);
     assert(c.nproviders == KM_PROVIDERS_MAX && c.provider_cap == KM_PROVIDERS_MAX);
     assert(strstr(last_error, "provider table limit exceeded"));
     puts("provider hard limit aborts before a later preferred origin can be lost: PASS");

@@ -115,7 +115,7 @@ rt_sigprocmask 的故障注入并再次通过；这些用例有意让隔离子�
 - 仅测试的无 BTF/nofault 产物 SHA-256：
   `013d44bf949076160cdf5a53b94741c211ad5f2036f1f56acf109386dff0b300`，不上传到 Release。
 - Android 测试夹具：NDK 27.0.12077973，TLS payload 使用 `-fno-emulated-tls`。
-  构建/运行步骤见 [TLS 回归说明](test/tls/README.md)。
+  构建/运行步骤见 [TLS 回归说明](TLS_TESTING.md)。
 
 Releases 发布正式 `kclf.kpm` 与 SHA256SUMS，源码由 v1.6.0 tag 标识。原始设备日志、
 凭据、调试签名和本地构建目录均不进入提交或 Release。

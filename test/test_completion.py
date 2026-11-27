@@ -38,7 +38,7 @@ struct kclf_req {
     int state, priv_layout_ok, flags, completing, busy, stage, unloaded, poll_queued;
     s32 unload_rc;
     s64 handle;
-    u64 err_user, priv_addr, mm, done_token, map_addr, map_len, j_done, task;
+    u64 err_user, priv_addr, mm, done_token, map_addr, map_len, code_addr, code_len, j_done, task;
     void *pid_ref;
     u8 completion_via;
     struct { u64 done, handle, errptr, rc; } pl;

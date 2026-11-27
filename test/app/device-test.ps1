@@ -117,6 +117,7 @@ function Inject-App([int]$TargetId, [int]$ThreadId, [string]$Flags, [string]$Pay
     Check ($Status -match 'done=(syscall|poll)') 'EL0 completion independently observed'
     Verify-Marker $TargetId $ThreadId
     $Maps = Root "cat /proc/$TargetId/maps"
+    Check ($Maps -notmatch '(?m)^\S+ r.xp 00000000 00:00 0\s*$') 'no anonymous executable mapping in the app after injection'
     $PayloadName = [regex]::Escape(($Payload -split '/')[-1])
     $Marker = (Invoke-Adb @('shell', 'run-as', $Package, 'cat', "files/hit_$TargetId")).Text
     Check ($Marker -match 'marker=0x([0-9a-f]+)') 'fresh constructor address recorded'
@@ -158,6 +159,27 @@ function Await-Running {
         Start-Sleep -Milliseconds 50
     } while ($Watch.ElapsedMilliseconds -lt 5000)
     throw 'Did not observe app constructor running'
+}
+
+function Cancel-Slot([int]$Slot) {
+    $Watch = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $Result = Ctl "cancel,$Slot" -AllowFailure
+        if ($Result.Code -eq 0) { return }
+        if ($Result.Text -notmatch 'work already running or not armed') { throw $Result.Text }
+        Start-Sleep -Milliseconds 20
+    } while ($Watch.ElapsedMilliseconds -lt 5000)
+    throw "Cancellation remained busy for slot $Slot"
+}
+function Await-Drained {
+    $Watch = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Ctl 'reap' | Out-Null
+        $Text = (Ctl 'status').Text
+        if ($Text -match 'no requests[\s\S]*loading=0') { return }
+        Start-Sleep -Milliseconds 20
+    } while ($Watch.ElapsedMilliseconds -lt 5000)
+    throw "Request resources did not drain: $Text"
 }
 
 if (-not $Serial) {
@@ -237,15 +259,55 @@ try {
     $IdleIds = @(0..3 | ForEach-Object { Find-Thread $TargetId "kclf-idle$_" })
     foreach ($ThreadId in $IdleIds) { Ctl "inject,$ThreadId,$Library,unload" | Out-Null }
     $Queued = (Ctl 'status').Text
-    Check (([regex]::Matches($Queued, 'state=armed')).Count -eq 4) 'all four ordinary-app requests remain queued without wake'
+    # Preparation runs on the kernel worker, so a request is already prepared
+    # (state=ready, hijack waiting for its blocked thread) while same-payload
+    # siblings wait their turn (state=armed).  What matters is that all four
+    # slots are tracked and none of them failed.
+    Check ((([regex]::Matches($Queued, 'state=(armed|ready|preparing)')).Count -eq 4) -and
+           ($Queued -notmatch 'state=failed')) 'all four ordinary-app requests tracked without corrupted slots'
     Check ((Ctl "inject,$($IdleIds[0]),$Library,unload" -AllowFailure).Code -ne 0) 'duplicate request does not corrupt existing queue'
     Check ((Ctl "inject,$TargetId,$Library,wake" -AllowFailure).Code -ne 0) 'full request table reports failure without corrupting slots'
-    foreach ($Slot in 0..3) { Ctl "cancel,$Slot" | Out-Null }
+    foreach ($Slot in 0..3) { Cancel-Slot $Slot }
     Check (([regex]::Matches((Ctl 'status').Text, 'state=cancelled')).Count -eq 4) 'all app callbacks cancelled before execution'
-    Ctl 'reap' | Out-Null
+    Await-Drained
     Check ((Ctl 'status').Text -match 'no requests') 'all cancelled app slots reclaimed'
     Check ((Invoke-Adb @('shell', 'run-as', $Package, 'cat', "files/hit_$TargetId")).Text -eq $MarkerBefore) 'cancelled requests did not run a constructor'
     Inject-App $TargetId $IdleIds[0] ',wake,unload'
+
+    Log "CASE: $Repeat immediate queue/cancel/reap cycles"
+    for ($i = 1; $i -le $Repeat; $i++) {
+        Ctl "inject,$($IdleIds[1]),$Library,unload" | Out-Null
+        Cancel-Slot 0
+        Await-Drained
+        Check ((Ctl 'images').Text -match 'no manual images') "cancel cycle $i leaves no image transaction"
+    }
+
+    if ($Backend -eq 'manual') {
+        Log 'CASE: blocked manual requests do not starve an independent linker request'
+        Ctl "inject,$($IdleIds[0]),$Library,unload" | Out-Null
+        $Watch = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $Text = (Ctl 'status').Text
+            if ($Text -match "pid=$($IdleIds[0])\([^\r\n]*state=ready") { break }
+            Start-Sleep -Milliseconds 20
+        } while ($Watch.ElapsedMilliseconds -lt 5000)
+        Check ($Text -match "pid=$($IdleIds[0])\([^\r\n]*state=ready") 'first payload waits at a blocked return boundary'
+        Ctl "inject,$($IdleIds[1]),$Library,unload" | Out-Null
+        $Watch.Restart()
+        Kpm @('ctl0', 'kclf', "inject,$($IdleIds[2]),$FpLibrary,wake,unload,linker") | Out-Null
+        do {
+            $Line = @((Ctl 'status').Text -split "`n" | Where-Object { $_ -match "pid=$($IdleIds[2])\(" }) -join ''
+            if ($Line -match 'state=done' -and $Line -notmatch 'pending=| map=') { break }
+            Start-Sleep -Milliseconds 20
+        } while ($Watch.ElapsedMilliseconds -lt 5000)
+        Check ($Line -match 'state=done.*via=__loader_dlopen' -and $Line -notmatch 'pending=| map=') 'independent linker request completes before the blocked sibling retry budget'
+        Log ("fairness completion including adb polling: $($Watch.ElapsedMilliseconds) ms")
+        Verify-Marker $TargetId $IdleIds[2]
+        Cancel-Slot 0
+        Cancel-Slot 1
+        Await-Drained
+        Check ((Ctl 'images').Text -match 'no manual images') 'fairness scenario drains all transactions'
+    }
 
     Log 'CASE: missing SO failure and recovery'
     Ctl "inject,$TargetId,$Library.missing,wake" | Out-Null
@@ -283,7 +345,9 @@ try {
     Log 'CASE: force-stop while app callback is queued'
     $IdleId = Find-Thread $TargetId 'kclf-idle0'
     Ctl "inject,$IdleId,$Library,unload" | Out-Null
-    Check ((Ctl 'status').Text -match 'state=armed') 'app work queued before target exit'
+    # Preparation runs on the kernel worker now, so the request may already be
+    # prepared; either way it must still be pending (not executed) here.
+    Check ((Ctl 'status').Text -match 'state=(armed|preparing|ready)') 'app work queued before target exit'
     $TargetId = Start-App
     Ctl 'reap' | Out-Null
     Check ((Ctl 'status').Text -match 'no requests[\s\S]*loading=0') 'exiting app drains queued task_work'
@@ -300,17 +364,18 @@ try {
     $IdleId = Find-Thread $TargetId 'kclf-idle0'
     Ctl "inject,$IdleId,$HoldLibrary,wake,unload" | Out-Null
     $Running = Await-Running
-    Check ($Running -match 'map=([0-9a-f]+)\+(\d+)') 'app trampoline mapping observed'
+    Check ($Running -match 'map=([0-9a-f]+)\+(\d+)') 'app transient mapping observed'
     $MapStart = [Convert]::ToUInt64($Matches[1], 16)
     $MapSize = [UInt64]$Matches[2]
-    Check ($Running -match 'code=([0-9a-f]+) guard=([0-9a-f]+)') 'randomized code and guard positions reported'
+    Check ($Running -match 'code=([0-9a-f]+)\+(\d+) guard=([0-9a-f]+)') 'randomized trampoline page and guard positions reported'
     $CodeStart = [Convert]::ToUInt64($Matches[1], 16)
-    $GuardStart = [Convert]::ToUInt64($Matches[2], 16)
+    $CodeSize = [UInt64]$Matches[2]
+    $GuardStart = [Convert]::ToUInt64($Matches[3], 16)
     Check ($Probe -match 'page=(\d+)') 'page size reported'
     $PageSize = [UInt64]$Matches[1]
     $MapEnd = $MapStart + $MapSize
     $CodeHex = $CodeStart.ToString('x')
-    $CodeEndHex = ($CodeStart + $PageSize).ToString('x')
+    $CodeEndHex = ($CodeStart + $CodeSize).ToString('x')
     $GuardHex = $GuardStart.ToString('x')
     $GuardEndHex = ($GuardStart + $PageSize).ToString('x')
     $StackHex = ($GuardStart + $PageSize).ToString('x')
@@ -322,12 +387,19 @@ try {
             $Begin -ge $MapStart -and $Begin -lt $MapEnd
         }
     })
-    Check ($CodeStart -ge $MapStart -and $CodeStart + $PageSize -le $MapEnd) 'code lies inside the transient region'
-    Check (@($Range | Where-Object { $_ -match "^$CodeHex-$CodeEndHex r-xp " }).Count -eq 1) 'exactly one RX page at the reported random code offset'
+    # The trampoline is a private file mapping of the payload: it must not be an
+    # anonymous executable page inside the RW transient region.
+    Check ($CodeStart -lt $MapStart -or $CodeStart -ge $MapEnd) 'trampoline page is a separate mapping outside the RW transient region'
+    Check ($CodeSize -eq $PageSize) 'trampoline page is exactly one page'
+    $HoldName = [regex]::Escape(($HoldLibrary -split '/')[-1])
+    $TrampolinePattern = '^{0}-{1} r-xp .*{2}$' -f $CodeHex, $CodeEndHex, $HoldName
+    Check (@($Maps -split "`n" | Where-Object { $_ -match $TrampolinePattern }).Count -eq 1) `
+        'trampoline page is file-backed and carries the module pathname'
+    Check ($Maps -notmatch '(?m)^\S+ r.xp 00000000 00:00 0\s*$') 'no anonymous executable mapping while the trampoline runs'
     if ($Running -match 'stack=task/') {
-        Check ($MapSize -ge 3 * $PageSize -and $MapSize -le 11 * $PageSize -and $GuardStart -eq 0) 'borrowed stack uses 3..11 transient pages without an extra guard'
+        Check ($MapSize -ge 2 * $PageSize -and $MapSize -le 8 * $PageSize -and $GuardStart -eq 0) 'borrowed stack uses 2..8 transient pages without an extra guard'
     } else {
-        Check ($MapSize -ge 10 * $PageSize -and $MapSize -le 28 * $PageSize) 'dedicated stack uses 10..28 transient pages'
+        Check ($MapSize -ge 9 * $PageSize -and $MapSize -le 25 * $PageSize) 'dedicated stack uses 9..25 transient pages'
         Check ($GuardStart -ge $MapStart -and $GuardStart + $PageSize -le $MapEnd) 'guard lies inside the transient region'
         Check (@($Range | Where-Object { $_ -match "^$GuardHex-$GuardEndHex ---p " }).Count -eq 1) 'PROT_NONE guard at the reported random position'
         Check (@($Range | Where-Object { $_ -match "^$StackHex-\S+ rw-p " }).Count -eq 1) 'transient stack starts immediately above the guard'

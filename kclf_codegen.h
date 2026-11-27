@@ -85,6 +85,7 @@ struct kclf_prog
  * Returns 0 on success.
  */
 int kclf_prog_build(u8 *page, int page_size, u64 param_addr, u64 priv_addr,
-                    const struct kclf_priv_layout *pl, u64 seed, struct kclf_prog *out);
+                    const struct kclf_priv_layout *pl, u64 stack_scrub, u64 seed,
+                    struct kclf_prog *out);
 
 #endif

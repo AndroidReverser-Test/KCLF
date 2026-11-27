@@ -134,6 +134,20 @@ static inline int kclf_is_err(const void *p)
 
 static struct pt_regs *kclf_find_regs(void);
 
+/* Set only while the preparation worker runs (kclf_io_worker == current then),
+ * so target memory access can address the request's mm directly.  A kernel
+ * thread has no user mm that access_process_vm() would accept. */
+struct mm_struct *kclf_io_mm;
+struct task_struct *kclf_io_worker;
+s32 kclf_io_tgid;
+
+static int kclf_remote_vm(u64 addr, void *buf, int len, unsigned int gup_flags)
+{
+    if (kclf_io_mm && kclf_io_worker == current && kclf_ks.access_remote_vm)
+        return kclf_ks.access_remote_vm(kclf_io_mm, (unsigned long)addr, buf, len, gup_flags);
+    return kclf_ks.access_process_vm(current, addr, buf, len, gup_flags);
+}
+
 /* ------------------------------------------------------------------ */
 /* user memory access                                                   */
 /* ------------------------------------------------------------------ */
@@ -156,7 +170,7 @@ int kclf_urds(u64 addr, void *buf, int len)
 {
     if (kclf_user_tbi) addr &= 0x00ffffffffffffffULL;
     if (len < 0 || !kclf_user_range(addr, (u64)len)) return -EFAULT;
-    return kclf_ks.access_process_vm(current, addr, buf, len, 0) == len ? 0 : -EFAULT;
+    return kclf_remote_vm(addr, buf, len, 0) == len ? 0 : -EFAULT;
 }
 
 static int kclf_urds_u32(u64 addr, u32 *out)
@@ -170,7 +184,86 @@ int kclf_uwr(u64 addr, const void *buf, int len)
     if (len < 0 || !kclf_user_range(addr, (u64)len)) return -EFAULT;
     /* FOLL_WRITE=1 is stable on the supported kernels. GUP handles PAN,
      * cold pages and the mmap lock; never use a raw arch uaccess symbol. */
-    return kclf_ks.access_process_vm(current, addr, (void *)buf, len, 1) == len ? 0 : -EFAULT;
+    return kclf_remote_vm(addr, (void *)buf, len, 1) == len ? 0 : -EFAULT;
+}
+
+/* Write through a mapping that is readable but not writable from EL0.  GUP
+ * with FOLL_FORCE|FOLL_WRITE breaks COW on a private mapping even when the VMA
+ * lacks VM_WRITE, which is how a debugger plants a breakpoint in a library's
+ * .text.  It is needed here because SELinux requires execmod for the
+ * mmap(PROT_READ|PROT_WRITE) -> mprotect(PROT_READ|PROT_EXEC) transition, and
+ * app domains do not have it: a file-backed executable page must be mapped
+ * read+execute from the start, then filled through its private copy.  FOLL
+ * values are stable across the supported kernels (v6.1: WRITE=0x01, FORCE=0x10). */
+int kclf_uwr_force(u64 addr, const void *buf, int len)
+{
+    if (kclf_user_tbi) addr &= 0x00ffffffffffffffULL;
+    if (len < 0 || !kclf_user_range(addr, (u64)len)) return -EFAULT;
+    return kclf_remote_vm(addr, (void *)buf, len, 0x11) == len ? 0 : -EFAULT;
+}
+
+/* Fault a target range in without writing to it.  Called from whichever
+ * context performed the mapping: a page that is already present costs nothing,
+ * a missing one is charged to the caller.  Moving this cost out of the borrowed
+ * thread is the point: /proc/<pid>/task/<tid>/stat min_flt and stime are
+ * cumulative per-thread counters, so a few thousand faults raised while the
+ * thread was inside the framework's preparation are visible to any in-process
+ * sampler as "this thread just started executing unknown code".  A PROT_NONE
+ * hole, the guard page or a not-yet-populated sparse region simply fails the
+ * read and is skipped. */
+void kclf_prefault_user(u64 start, u64 len)
+{
+    u64 page = (u64)kclf_page_size;
+    u64 off;
+
+    if (!page || !start || !len || !kclf_ks.access_process_vm) return;
+    for (off = 0; off < len; off += page) {
+        u8 byte;
+        (void)kclf_urds(start + off, &byte, 1);
+    }
+}
+
+/* Every executable page the framework installs in a target is a private,
+ * file-backed mapping of the payload.  A process-local /proc/<pid>/maps scan
+ * treats executable memory without a module pathname (anonymous r-xp, the
+ * classic signature of a manual loader) as injected code, so the trampoline
+ * and the TLS runtime never get an anonymous RX page of their own.
+ *
+ * The page is mapped PROT_READ|PROT_EXEC from the start and then filled through
+ * its private copy with FOLL_FORCE.  It must NOT be mapped writable and later
+ * mprotected executable: SELinux requires execmod for that transition and app
+ * domains do not have it (avc: denied { execmod } ... tclass=file).  Writing
+ * through GUP does not consult the mmap/mprotect hooks, leaves the payload file
+ * unmodified and never creates a W+X VMA.  Offset zero is the ELF header page,
+ * which every payload has, so the mapping can never fault beyond EOF.  The
+ * caller flushes the instruction cache after its last call. */
+long kclf_map_file_code(const char *path, const void *code, u64 page, u64 *addr)
+{
+    struct file *f;
+    u64 at;
+    long rc;
+
+    if (!path || !path[0] || !code || !addr) return -EINVAL;
+    if (page < 2048 || (page & (page - 1))) return -EINVAL;
+    if (!kclf_ks.filp_open || !kclf_ks.vm_mmap || !kclf_ks.fput || !kclf_ks.vm_munmap) return -EOPNOTSUPP;
+    f = kclf_ks.filp_open(path, KCLF_O_RDONLY, 0);
+    if (!f) return -ENOENT;
+    if (kclf_is_err(f)) return (long)(unsigned long)f;
+    at = kclf_ks.vm_mmap(f, 0, page, KCLF_PROT_READ | KCLF_PROT_EXEC, KCLF_MAP_PRIVATE, 0);
+    kclf_ks.fput(f);
+    if (!at || kclf_is_err((void *)at)) return at ? (long)at : -ENOMEM;
+    if (!kclf_user_range(at, page)) {
+        rc = -EFAULT;
+    } else {
+        rc = kclf_uwr_force(at, code, (int)page);
+    }
+    if (rc) {
+        /* Never leave a half-initialised executable page behind. */
+        kclf_ks.vm_munmap(at, page);
+        return rc;
+    }
+    *addr = at;
+    return 0;
 }
 
 /* bounded, NUL terminated user string copy (fault-tolerant) */
@@ -408,7 +501,8 @@ struct kclf_vma
 {
     u64 start;
     u64 end;
-    int prot; /* VM_READ/WRITE/EXEC bits from procfs, -1 when unavailable */
+    u64 offset; /* file offset of start (vm_pgoff << PAGE_SHIFT / maps field 3) */
+    int prot; /* VM_READ/WRITE/EXEC bits from maps/vm_flags, -1 when unavailable */
     char path[KCLF_MAPS_PATH];
 };
 
@@ -433,11 +527,23 @@ static long kclf_vma_iter_open(struct kclf_vma_iter *it, struct mm_struct *mm, u
     it->mm = mm;
     it->user_buffer = user_buffer;
     if (force_proc || !kclf_vma_direct) {
+        char path[40];
+        const char *maps = "/proc/thread-self/maps";
+
         if (!kclf_ks.vfs_read) return -ENOSYS;
         /* This callback is current in the target mount/PID namespace. procfs
          * owns the VMA locking and handles both rb-tree and maple-tree kernels.
-         * Read it only in sleepable target callbacks, never in ctl0/hooks. */
-        it->file = kclf_ks.filp_open("/proc/thread-self/maps", KCLF_O_RDONLY, 0);
+         * Read it only in sleepable target callbacks, never in ctl0/hooks.
+         *
+         * On the preparation worker "thread-self" names the kernel thread,
+         * whose proc entry the target's SELinux domain cannot search (and which
+         * has no mm anyway).  Address the target process by its TGID instead:
+         * /proc/<tgid>/maps is the same file the target would read itself. */
+        if (kclf_io_worker == current && kclf_io_tgid > 0) {
+            snprintf(path, sizeof(path), "/proc/%d/maps", kclf_io_tgid);
+            maps = path;
+        }
+        it->file = kclf_ks.filp_open(maps, KCLF_O_RDONLY, 0);
         if (!it->file) return -ENOENT;
         if (kclf_is_err(it->file)) {
             long rc = (long)it->file;
@@ -460,6 +566,8 @@ static long kclf_vma_next(struct kclf_vma_iter *it, struct kclf_vma *out)
 {
     if (!it->file) {
         struct vm_area_struct *vma;
+        u64 offset = 0;
+        int prot = -1;
         kclf_mmap_read_lock(it->mm);
         vma = kclf_ks.find_vma(it->mm, it->addr);
         if (!vma) {
@@ -468,10 +576,40 @@ static long kclf_vma_next(struct kclf_vma_iter *it, struct kclf_vma *out)
         }
         out->start = *(u64 *)((char *)vma + kclf_vma_start_off);
         out->end = *(u64 *)((char *)vma + kclf_vma_end_off);
+        /* vm_flags uses the stable VM_READ/WRITE/EXEC bit values (1/2/4).
+         * The same bits are reported by the procfs permission field. */
+        if (kclf_vma_flags_off >= 0) {
+            u64 flags = *(u64 *)((char *)vma + kclf_vma_flags_off);
+            prot = (int)((flags & 1) | (flags & 2) | (flags & 4));
+        }
+        if (kclf_vma_pgoff_off >= 0) {
+            u64 pgoff = *(u64 *)((char *)vma + kclf_vma_pgoff_off);
+            offset = pgoff <= (~0ULL / (u64)kclf_page_size)
+                         ? pgoff * (u64)kclf_page_size
+                         : ~0ULL;
+        }
+        out->offset = offset;
+        out->prot = prot;
+        out->path[0] = 0;
+        /* A non-dumpable target denies /proc/<tgid>/maps even with its own
+         * credentials.  The file behind vm_file still has a stable path: render
+         * it under mmap_read_lock so the file cannot be released while d_path
+         * walks its dentry.  The path is only an offline metadata source; the
+         * provider's own pages are never dereferenced during discovery. */
+        if (kclf_vma_file_off >= 0 && kclf_file_path_off >= 0 && kclf_ks.d_path) {
+            struct file *file = *(struct file **)((char *)vma + kclf_vma_file_off);
+            char *name = file ? kclf_ks.d_path((char *)file + kclf_file_path_off, out->path,
+                                               (int)sizeof(out->path))
+                              : 0;
+            if (!name || kclf_is_err(name)) {
+                out->path[0] = 0;
+            } else if (name != out->path) {
+                memmove(out->path, name, strlen(name) + 1);
+            }
+            if (out->path[0] != '/') out->path[0] = 0;
+        }
         kclf_mmap_read_unlock(it->mm);
         if (out->end <= out->start || out->end <= it->addr || out->end > KCLF_USER_MAX) return -EFAULT;
-        out->prot = -1;
-        out->path[0] = 0;
         it->addr = out->end;
         return 1;
     }
@@ -504,6 +642,7 @@ static long kclf_vma_next(struct kclf_vma_iter *it, struct kclf_vma *out)
         line[n] = 0;
         if (kclf_maps_range(line, KCLF_USER_MAX, &out->start, &out->end)) return -EINVAL;
         if (kclf_maps_prot(line, &out->prot)) return -EINVAL;
+        if (kclf_maps_offset(line, &out->offset)) return -EINVAL;
         if (kclf_maps_path(line, out->path, sizeof(out->path))) return -EINVAL;
         if (out->end <= it->addr) continue;
         it->addr = out->end;
@@ -554,7 +693,7 @@ int kclf_snapshot_vmas(u64 scratch, struct kclf_vm_range *ranges, unsigned capac
     return rc < 0 ? (int)rc : (int)n;
 }
 
-int kclf_walk_vmas(u64 scratch, int (*visit)(u64, const char *, void *), void *context)
+int kclf_walk_vmas(u64 scratch, int (*visit)(u64, const char *, u64, void *), void *context)
 {
     struct kclf_vma_iter it;
     struct kclf_vma vma;
@@ -569,7 +708,7 @@ int kclf_walk_vmas(u64 scratch, int (*visit)(u64, const char *, void *), void *c
     for (i = 0; i < KCLF_MAX_VMA; i++) {
         rc = (int)kclf_vma_next(&it, &vma);
         if (rc <= 0) break;
-        rc = visit(vma.start, vma.path, context);
+        rc = visit(vma.start, vma.path, vma.offset, context);
         if (rc) break;
     }
     kclf_vma_iter_close(&it);
@@ -958,9 +1097,12 @@ static long kclf_check_library(const char *path)
  * short-lived anonymous block.  If the frame cannot be located, the stack is a
  * small altstack, or the thread is too close to its guard page, the caller
  * keeps the dedicated transient stack block. */
-static int kclf_choose_stack(struct kclf_req *r)
+/* Choose the interrupted thread's own stack, below its current SP.  This is an
+ * explicit legacy mode (borrowstack): the payload then runs on the thread's
+ * stack, and the EL0 tail cannot wipe it without faulting those pages in from
+ * the borrowed thread itself. */
+static int kclf_choose_stack(struct kclf_req *r, struct pt_regs *regs)
 {
-    struct pt_regs *regs = kclf_find_regs();
     struct mm_struct *mm = kclf_task_mm(current);
     struct kclf_vma vma;
     u64 sp, scratch, top;
@@ -981,6 +1123,18 @@ static int kclf_choose_stack(struct kclf_req *r)
     r->stack_top = top;
     r->stack_ref_sp = sp;
     r->stack_borrowed = 1;
+    /* The payload and its callees run on this stack.  Their frames leave
+     * copies of return addresses into the transient code page and the loaded
+     * image in the unused stack area below SP.  That area survives the
+     * request, so a process-local stack scan can still find code pointers
+     * that no module owns.  Record how much of it the EL0 tail must wipe
+     * before it resumes the interrupted context.  The range stays inside the
+     * stack VMA, so the wipe touches normal stack pages only. */
+    {
+        u64 avail = top - vma.start;
+        if (avail > KCLF_STACK_SCRUB_MAX) avail = KCLF_STACK_SCRUB_MAX;
+        r->stack_scrub = avail & ~0xfULL;
+    }
     r->stack_state = 6;
     return 0;
 }
@@ -1024,9 +1178,6 @@ long kclf_exec_prepare(struct kclf_req *r)
 
     if (!mm || (u64)mm != r->mm) return -ESRCH;
     if (!page) return -EINVAL;
-    /* Optional: borrow the thread's own stack.  A failure here is not fatal;
-     * the dedicated stack block below remains the fallback. */
-    (void)kclf_choose_stack(r);
 
     if (r->flags & KCLF_F_LINKER) {
         rc = kclf_check_library(r->path);
@@ -1034,16 +1185,26 @@ long kclf_exec_prepare(struct kclf_req *r)
             kclf_set_err(r, "open library failed rc=%ld", rc);
             return rc;
         }
+        /* The trampoline page is a private mapping of the same file, so the
+         * target sees an executable VMA with the library pathname instead of
+         * an anonymous one. */
+        memcpy(r->code_path, r->path, sizeof(r->code_path));
+        r->code_path[sizeof(r->code_path) - 1] = 0;
     }
 
     /* The transient region is one anonymous mapping whose blocks are placed in
-     * a random order with random pad pages between them: RX code (1 page), RW
-     * ABI parameters (1 page), RW private parameters (1 page) and, only when
-     * the thread's own stack cannot be borrowed, a PROT_NONE guard + RW stack
-     * (1 + S pages, S = 6..14).  The code page is therefore not the region
-     * base, the private page is an independent block rather than ABI+page, the
-     * guard position and the total length are unpredictable, and every page
-     * that is not immediately overwritten is filled with random data. */
+     * a random order with random pad pages between them: RW ABI parameters
+     * (1 page), RW private parameters (1 page) and a PROT_NONE guard + RW stack
+     * (1 + S pages, S = 6..14).  Nothing executable lives here.  The EL0
+     * trampoline is a separate private file mapping of the payload
+     * (kclf_map_file_code), so the target address space never gains an
+     * anonymous r-xp VMA, and the pad pages, the guard position and the total
+     * length stay unpredictable.
+     *
+     * The dedicated stack block is always reserved, even in the legacy
+     * borrowstack mode: the borrowed-stack decision needs the interrupted
+     * SP, which only exists at the hijack boundary, and this function may run
+     * on the preparation worker where no target register file is available. */
     seed = get_random_u64();
     if (kclf_layout_init(r, seed)) {
         kclf_set_err(r, "private layout generation failed");
@@ -1051,13 +1212,13 @@ long kclf_exec_prepare(struct kclf_req *r)
     }
     stack_pages = KCLF_MIN_STACK_PAGES + kclf_rand_below(KCLF_STACK_PAGES_SPAN);
     {
-        /* code, ABI, private, guard+stack */
-        int order[4] = { 0, 1, 2, 3 };
-        u64 block[4] = { 0, 0, 0, 0 };
+        /* ABI, private, guard+stack -- always all three blocks. */
+        int order[3] = { 0, 1, 2 };
+        u64 block[3] = { 0, 0, 0 };
         u64 cursor;
-        int pads[5];
-        int nblocks = r->stack_borrowed ? 3 : 4;
-        int pages = 3 + (r->stack_borrowed ? 0 : 1 + stack_pages);
+        int pads[4];
+        int nblocks = 3;
+        int pages = 2 + 1 + stack_pages;
         int k;
 
         for (i = nblocks - 1; i > 0; i--) {
@@ -1082,24 +1243,25 @@ long kclf_exec_prepare(struct kclf_req *r)
         cursor = addr + (u64)pads[0] * page;
         for (k = 0; k < nblocks; k++) {
             int b = order[k];
-            u64 size = (b == 3) ? (u64)(1 + stack_pages) * page : page;
+            u64 size = (b == 2) ? (u64)(1 + stack_pages) * page : page;
             block[b] = cursor;
             cursor += size + (u64)pads[k + 1] * page;
         }
-        r->code_addr = block[0];
-        r->param_addr = block[1];
-        r->priv_addr = block[2];
-        if (!r->stack_borrowed) {
-            r->guard_addr = block[3];
-            /* Leave a little slack above the trampoline's initial SP: its own
-             * frame is empty, but the payload's constructors run on this stack
-             * and a callee's frame starts below SP. */
-            r->stack_top = block[3] + (u64)(1 + stack_pages) * page - KCLF_STACK_HEADROOM;
-        }
+        r->param_addr = block[0];
+        r->priv_addr = block[1];
+        r->guard_addr = block[2];
+        /* Leave a little slack above the transient stack's initial SP: its
+         * own frame is empty, but the payload's constructors run on this
+         * stack and a callee's frame starts below SP. */
+        r->dedicated_stack_top = block[2] + (u64)(1 + stack_pages) * page - KCLF_STACK_HEADROOM;
+        r->stack_top = r->dedicated_stack_top;
+        r->stack_borrowed = 0;
+        r->stack_ref_sp = 0;
+        r->stack_state = 0;
     }
     /* Randomize the region before anything writes its real contents: pad pages
-     * and the transient stack keep the random data, the code/parameter pages
-     * are overwritten below. */
+     * and the transient stack keep the random data, the parameter pages are
+     * overwritten below. */
     if (kclf_fill_random(r->map_addr, r->map_len)) {
         kclf_set_err(r, "randomize transient pages failed");
         return -EFAULT;
@@ -1114,27 +1276,36 @@ long kclf_exec_prepare(struct kclf_req *r)
     if (!r->done_token) r->done_token = 1;
 
     /* Per-request generated trampoline: no fixed blob, no fixed entry, no
-     * syscall, no library call and no faulting store. */
+     * syscall, no library call and no faulting store.  It is written through
+     * the private COW page of a file-backed RX mapping of the payload, so the
+     * executed page always carries the module pathname.
+     *
+     * The trampoline never wipes a borrowed stack any more: the payload runs on
+     * the dedicated transient stack by default, and a stack wipe executed in
+     * EL0 would have to fault the wiped pages in from the borrowed thread,
+     * which is exactly the per-thread accounting signature this backend now
+     * avoids.  The legacy borrowstack mode therefore trades the wipe for a
+     * quiet target thread. */
     scratch = kclf_ks.vmalloc((unsigned long)page);
     if (!scratch) {
         kclf_set_err(r, "trampoline allocation failed");
         rc = -ENOMEM;
         goto fail;
     }
-    if (kclf_prog_build(scratch, (int)page, r->param_addr, r->priv_addr, &r->pl, seed, &prog)) {
+    if (kclf_prog_build(scratch, (int)page, r->param_addr, r->priv_addr, &r->pl, 0, seed, &prog)) {
         kclf_ks.vfree(scratch);
         kclf_set_err(r, "trampoline generation failed");
         rc = -EFAULT;
         goto fail;
     }
-    if (kclf_uwr(r->code_addr, scratch, (int)page)) {
-        kclf_ks.vfree(scratch);
-        kclf_set_err(r, "copy trampoline failed");
-        rc = -EFAULT;
+    rc = kclf_map_file_code(r->code_path, scratch, page, &r->code_addr);
+    kclf_ks.vfree(scratch);
+    if (rc) {
+        kclf_set_err(r, "trampoline file mapping failed rc=%ld path=%s", rc, r->code_path);
         goto fail;
     }
+    r->code_len = page;
     r->entry_pc = r->code_addr + prog.entry_off;
-    kclf_ks.vfree(scratch);
 
     kclf_init_params(r, pbuf);
 
@@ -1151,22 +1322,23 @@ long kclf_exec_prepare(struct kclf_req *r)
         goto fail;
     }
 
-    /* code page becomes read+execute, no RWX mapping is left behind */
-    mret = raw_syscall3(__NR_mprotect, (long)r->code_addr, (long)page, KCLF_PROT_READ | KCLF_PROT_EXEC);
+    /* The trampoline page is already read+execute (kclf_map_file_code); the
+     * anonymous region has no executable page at all. */
+    mret = raw_syscall3(__NR_mprotect, (long)r->guard_addr, (long)page, 0);
     if (mret) {
-        kclf_set_err(r, "mprotect failed rc=%ld", mret);
+        kclf_set_err(r, "stack guard failed rc=%ld", mret);
         rc = mret;
         goto fail;
     }
-    if (!r->stack_borrowed) {
-        mret = raw_syscall3(__NR_mprotect, (long)r->guard_addr, (long)page, 0);
-        if (mret) {
-            kclf_set_err(r, "stack guard failed rc=%ld", mret);
-            rc = mret;
-            goto fail;
-        }
-    }
     flush_icache_all();
+    /* Pre-fault every page the EL0 phase can touch while the *preparing*
+     * context is still current: the trampoline page, the transient region
+     * (parameter/private pages and the dedicated stack) and the payload image.
+     * The borrowed thread then executes pre-populated page tables and its
+     * per-thread min_flt/stime do not move. */
+    kclf_prefault_user(r->code_addr, r->code_len);
+    kclf_prefault_user(r->map_addr, r->map_len);
+    kclf_manual_prefault(r);
     return 0;
 
 fail:
@@ -1235,11 +1407,14 @@ static struct pt_regs *kclf_find_regs(void)
 
 /* A timer interrupt can run poll task_work between the EL0 token store and
  * the final branch. Do not reclaim the instruction/private pages until the
- * interrupted PC has left the transient allocation. */
+ * interrupted PC has left both the transient region and the trampoline page. */
 int kclf_exec_poll_ready(const struct kclf_req *r)
 {
     struct pt_regs *regs = kclf_find_regs();
-    return regs && !(regs->pc >= r->map_addr && regs->pc - r->map_addr < r->map_len);
+    if (!regs) return 0;
+    if (regs->pc >= r->map_addr && regs->pc - r->map_addr < r->map_len) return 0;
+    if (r->code_len && regs->pc >= r->code_addr && regs->pc - r->code_addr < r->code_len) return 0;
+    return 1;
 }
 
 /* Heuristic only: syscall numbers cannot prove that a userspace lock is not
@@ -1308,6 +1483,23 @@ int kclf_exec_hijack(struct kclf_req *r)
     if (regs->pstate & PSR_MODE32_BIT) {
         kclf_set_err(r, "32-bit target unsupported");
         return -EOPNOTSUPP;
+    }
+    /* Stack selection needs the interrupted SP, so it happens here and not
+     * during preparation (which may run on the worker).  The default is the
+     * dedicated transient stack: the payload's frames then live in a mapping
+     * that is torn down with the request, never in the target thread's own
+     * stack, and no page has to be faulted in from the borrowed thread.
+     * "borrowstack" keeps the historical behaviour for payloads that rely on
+     * the interrupted thread's stack contents. */
+    r->stack_borrowed = 0;
+    r->stack_top = r->dedicated_stack_top;
+    r->stack_ref_sp = 0;
+    r->stack_scrub = 0;
+    r->stack_state = 0;
+    if (r->flags & KCLF_F_BORROWSTACK) (void)kclf_choose_stack(r, regs);
+    if (!r->stack_top) {
+        kclf_set_err(r, "no usable stack");
+        return -EFAULT;
     }
     if (r->stack_borrowed && r->stack_ref_sp) {
         u64 sp = regs->sp;
@@ -1408,6 +1600,22 @@ long kclf_exec_finish(struct kclf_req *r, int capture_err)
         }
         r->err_user = 0;
     }
+    /* Reclaim the executable page first: it is the mapping a process-local
+     * scanner looks for, and the EL0 tail has already left it. */
+    if (r->code_addr) {
+        rc = kclf_ks.vm_munmap(r->code_addr, r->code_len);
+        if (rc == -EINVAL) {
+            struct mm_struct *mm = kclf_task_mm(current);
+            struct kclf_vma check;
+            if (mm) {
+                long found = kclf_vma_at(mm, r->code_addr, &check, r->param_addr);
+                if (found == -ENOENT || (!found && check.start >= r->code_addr + r->code_len)) rc = 0;
+            }
+        }
+        if (rc) return rc;
+        r->code_addr = 0;
+        r->code_len = 0;
+    }
     if (r->map_addr) {
         rc = kclf_ks.vm_munmap(r->map_addr, r->map_len);
         if (rc == -EINVAL) {
@@ -1442,11 +1650,17 @@ int kclf_exec_probe(char *out, int outlen)
                           regs ? "ok" : "unavailable", kclf_regs_size, thread_size, kclf_page_size);
     off += kclf_scnprintf(out + off, outlen - off, "user_limit=%llx tbi=%d\n", (unsigned long long)kclf_user_limit,
                           kclf_user_tbi);
-    off += kclf_scnprintf(out + off, outlen - off, "vma_backend=%s mm_access=%s\n",
-                          kclf_vma_direct ? "locked" : "proc_maps", kclf_mm_off > 0 ? "offset" : "get_task_mm");
+    off += kclf_scnprintf(out + off, outlen - off, "vma_backend=%s mm_access=%s vma_meta=%d dpath=%d\n",
+                          kclf_vma_direct ? "locked" : "proc_maps", kclf_mm_off > 0 ? "offset" : "get_task_mm",
+                          kclf_vma_file_off >= 0 && kclf_vma_pgoff_off >= 0 && kclf_vma_flags_off >= 0 &&
+                                  kclf_file_path_off >= 0,
+                          !!kclf_ks.d_path);
     off += kclf_scnprintf(out + off, outlen - off, "cancel=%s user_io=access_process_vm wake=%s quiescing=%d\n",
                           kclf_ks.task_work_cancel_match ? "match" : (kclf_ks.task_work_cancel_object ? "object" : "func"),
                           kclf_wake_supported ? "task_work_signal" : "unsupported", kclf_unloading);
+    off += kclf_scnprintf(out + off, outlen - off, "prep=%s thread_prepare=%s\n",
+                          kclf_worker_available() ? "worker" : "task",
+                          kclf_worker_available() ? "off" : "on");
     off += kclf_scnprintf(out + off, outlen - off, "wake_abi=%s trace_mask=%llx vector_mask=%llx nofault=%d poll_io=gup\n",
                           kclf_wake_abi, (unsigned long long)kclf_trace_mask, (unsigned long long)kclf_vector_mask,
                           !!kclf_ks.copy_from_user_nofault);
