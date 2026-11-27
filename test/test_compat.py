@@ -51,7 +51,7 @@ static struct {
     void (*mmput_async)(struct mm_struct *);
     void (*down_read)(void *), (*up_read)(void *);
     void (*mmap_read_lock)(struct mm_struct *), (*mmap_read_unlock)(struct mm_struct *);
-    void *find_vma;
+    void *find_vma, *find_vma_prev;
     struct callback_head *(*task_work_cancel_func)(struct task_struct *, void (*)(struct callback_head *));
     void *task_work_cancel_match;
     bool (*task_work_cancel_object)(struct task_struct *, struct callback_head *);
@@ -65,6 +65,23 @@ static unsigned long kclf_lookup(const char *name) {
 }
 '''
 MAIN = r'''
+static size_t vma_fixture(struct btf_fixture *f) {
+    struct kclf_btf_header h = { .magic=0xeb9f, .version=1, .hdr_len=24 };
+    unsigned int e[6], word, lock;
+    memset(f, 0, sizeof(*f)); f->used = sizeof(h); f->string_used = 1;
+    e[0] = 64;
+    word = bf_type(f, "unsigned long", 1, 8, 0, e, 1);
+    e[0] = bf_string(f, "vm_start"); e[1] = word; e[2] = 0;
+    e[3] = bf_string(f, "vm_end"); e[4] = word; e[5] = 64;
+    bf_type(f, "vm_area_struct", 4, 16, 2, e, 6);
+    lock = bf_type(f, "rw_semaphore", 4, 16, 0, NULL, 0);
+    e[0] = bf_string(f, "mmap_lock"); e[1] = lock; e[2] = 64;
+    bf_type(f, "mm_struct", 4, 24, 1, e, 3);
+    h.type_len = f->used - sizeof(h); h.str_off = h.type_len; h.str_len = f->string_used;
+    memcpy(f->bytes, &h, sizeof(h));
+    memcpy(f->bytes + f->used, f->strings, f->string_used);
+    return f->used + f->string_used;
+}
 static void reset(unsigned int version) {
     kver = version;
     kclf_mm_off = kclf_vma_start_off = kclf_vma_end_off = kclf_mmap_lock_off = -1;
@@ -77,6 +94,7 @@ static void reset(unsigned int version) {
     kclf_ks.down_read = kclf_ks.up_read = fake_lock;
     kclf_ks.mmap_read_lock = kclf_ks.mmap_read_unlock = NULL;
     kclf_ks.find_vma = (void *)1;
+    kclf_ks.find_vma_prev = NULL;
     gets = puts_count = 0;
 }
 int main(int argc, char **argv) {
@@ -136,6 +154,20 @@ int main(int argc, char **argv) {
         }
     }
     puts("BTF wins over version labels; bool/enum backports and both cancel ABIs: PASS");
+    btf_len = vma_fixture(&fixture); btf = fixture.bytes;
+    reset(VERSION(5,15,74));
+    assert(!kclf_compat_init() && kclf_vma_direct);
+    kclf_ks.find_vma = NULL;
+    assert(!kclf_compat_init() && !kclf_vma_direct);
+    kclf_ks.find_vma_prev = (void *)1;
+    assert(!kclf_compat_init() && kclf_vma_direct);
+    kclf_ks.up_read = NULL;
+    assert(!kclf_compat_init() && !kclf_vma_direct);
+    btf = NULL;
+    reset(VERSION(5,15,74));
+    kclf_ks.find_vma = NULL; kclf_ks.find_vma_prev = (void *)1;
+    assert(!kclf_compat_init() && !kclf_vma_direct);
+    puts("find_vma_prev selection requires verified VMA layout and both lock operations: PASS");
     struct {
         struct kclf_btf_header h;
         char strings[4];
@@ -181,12 +213,17 @@ int main(int argc, char **argv) {
         reset(VERSION(6,1,134));
         kclf_ks.find_vma = NULL;
         assert(!kclf_compat_init() && !kclf_vma_direct);
+        kclf_ks.find_vma_prev = (void *)1;
+        assert(!kclf_compat_init() && kclf_vma_direct);
+        kclf_ks.down_read = NULL;
+        assert(!kclf_compat_init() && !kclf_vma_direct);
+        puts("saved device BTF: find_vma_prev enables locked fallback only with verified locking: PASS");
         reset(VERSION(6,1,134));
         memset(mock_current.bytes + offset, 0, sizeof(mm));
         assert(!kclf_compat_init() && kclf_mm_off == -1);
         assert(kclf_task_mm(current) == &target_mm && gets == puts_count);
         free(btf);
-        puts("saved 6.1 BTF: real layout selection, missing-symbol fallback, balanced mm references: PASS");
+        puts("saved device BTF: real layout selection, missing-symbol fallback, balanced mm references: PASS");
     }
     kclf_mmap_lock_off = -1;
     kclf_ks.mmap_read_lock = kclf_ks.mmap_read_unlock = fake_mmap_lock;

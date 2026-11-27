@@ -7,10 +7,13 @@ param(
     [ValidateSet('manual', 'linker')][string]$Backend = 'manual',
     [switch]$ExpectPoll,
     [switch]$RootInstall,
+    [switch]$NonDumpable,
+    [string]$RootContext = '',
     [ValidateRange(1, 100)][int]$Repeat = 10
 )
 $ErrorActionPreference = 'Stop'
 if ($SuperKey -notmatch '^[A-Za-z0-9_@.+-]+$') { throw 'Use a shell-safe superkey with this test runner.' }
+if ($RootContext -and $RootContext -notmatch '^[A-Za-z0-9_:.,-]+$') { throw 'Invalid root context.' }
 $ModuleDir = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $RepoDir = $ModuleDir
 if (-not $Apk) { $Apk = Join-Path $RepoDir 'build/kclf-apptest/app.apk' }
@@ -41,7 +44,8 @@ function Invoke-Adb([string[]]$Arguments, [switch]$AllowFailure) {
 }
 function Root([string]$Command) {
     if ($Command.Contains("'")) { throw 'Internal quoting error' }
-    (Invoke-Adb @('shell', "/data/local/tmp/kpatch $SuperKey su -c '$Command'")).Text
+    $ContextOption = if ($RootContext) { " -Z $RootContext" } else { '' }
+    (Invoke-Adb @('shell', "/data/local/tmp/kpatch $SuperKey su$ContextOption -c '$Command'")).Text
 }
 function Kpm([string[]]$Arguments, [switch]$AllowFailure) {
     $Result = Invoke-Adb (@('shell', '/data/local/tmp/kpatch', $SuperKey, 'kpm') + $Arguments) -AllowFailure:$AllowFailure
@@ -72,7 +76,8 @@ function Start-App {
         } while ($Watch.ElapsedMilliseconds -lt 5000)
         Check ($Exists.Code -eq 1) "old app process $OldId exited before restart"
     }
-    $Result = Invoke-Adb @('shell', 'am', 'start', '-W', '-n', "$Package/.MainActivity")
+    $Result = Invoke-Adb @('shell', 'am', 'start', '-W', '-n', "$Package/.MainActivity",
+                          '--ez', 'non_dumpable', "$NonDumpable".ToLowerInvariant())
     Log $Result.Text
     Check ($Result.Text -match 'Status: ok') 'test app activity starts successfully'
     $Text = (Invoke-Adb @('shell', 'pidof', $Package)).Text.Trim()
@@ -193,6 +198,7 @@ try {
     Log ((Invoke-Adb @('shell', 'uname', '-a')).Text)
     Log ('serial=' + $Serial)
     Log ('backend=' + $Backend)
+    Log ('non_dumpable=' + $NonDumpable)
     Log ('module SHA256=' + (Get-FileHash -Algorithm SHA256 $Kpm).Hash)
     Log ('APK SHA256=' + (Get-FileHash -Algorithm SHA256 $Apk).Hash)
     $BootBefore = Root 'cat /proc/sys/kernel/random/boot_id'

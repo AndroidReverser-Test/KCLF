@@ -75,6 +75,11 @@ int main(void) {
     assert(!kclf_ks.task_work_cancel_func && !kclf_ks.task_work_cancel_match && !kclf_ks.task_work_cancel_object);
     memset(absent, 0, sizeof(absent)); absent[0] = "__rcu_read_lock";
     assert(kclf_sym_lookup_all() == -EOPNOTSUPP);
+    memset(absent, 0, sizeof(absent)); absent[0] = "find_vma";
+    assert(!kclf_sym_lookup_all() && !kclf_ks.find_vma && kclf_ks.find_vma_prev);
+    absent[1] = "find_vma_prev";
+    assert(!kclf_sym_lookup_all() && !kclf_ks.find_vma && !kclf_ks.find_vma_prev);
+    puts("exact-name find_vma_prev fallback resolved; both missing leaves procfs available: PASS");
     puts("vmalloc_noprof/probe_user_read aliases; required allocators; optional nofault; ambiguous cancel deferral: PASS");
     kclf_rcu_read_lock = mock_lock; kclf_rcu_read_unlock = mock_unlock;
     kclf_ks.pid_task = mock_pid_task; work.func = mock_work;

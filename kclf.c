@@ -181,6 +181,9 @@ int kclf_sym_lookup_all(void)
     KCLF_KS(vm_mmap, "vm_mmap");
     KCLF_KS(vm_munmap, "vm_munmap");
     kclf_ks.find_vma = (typeof(kclf_ks.find_vma))kclf_lookup("find_vma");
+    /* Some Android LTO kernels inline find_vma but retain this exact-name
+     * accessor. It has the same next-VMA semantics plus an output argument. */
+    kclf_ks.find_vma_prev = (typeof(kclf_ks.find_vma_prev))kclf_lookup("find_vma_prev");
     KCLF_KS(filp_open, "filp_open");
     KCLF_KS(kernel_read, "kernel_read");
     kclf_ks.vfs_read = (typeof(kclf_ks.vfs_read))kclf_lookup("vfs_read");
@@ -1589,6 +1592,7 @@ static long kclf_cmd_sym(char *out, int outlen, int *off)
         "vm_mmap",
         "vm_munmap",
         "find_vma",
+        "find_vma_prev",
         "filp_open",
         "kernel_read",
         "fput",

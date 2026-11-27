@@ -2,6 +2,17 @@
 
 [文档目录 / Documentation](README.md) · [发布产物 / Releases](https://github.com/AndroidReverser-Test/KCLF/releases)
 
+## 未发布 / Unreleased
+
+- 修复部分 Android 5.15 内核缺少 `find_vma` 时 non-dumpable 目标无法准备的问题；
+  通过明确的三参数 `find_vma_prev` ABI 保留 BTF 校验和加锁 VMA 回退。
+  Retain the locked VMA fallback through `find_vma_prev` when `find_vma` is absent.
+- `probe` 显示实际 VMA accessor，PT_LOAD 映射失败显示段号、权限和访问策略提示；
+  增加 non-dumpable App 与 accessor 缺失回归。
+  Report the selected accessor and mapping errors; add non-dumpable regression.
+
+复现、路径权限与验证结果见 [HybridCLR 加载失败分析](HYBRIDCLR_LOADING_FIX.md)。
+
 ## 1.6.4
 
 - 修复 worker 引用释放、槽位回收、取消与回滚之间的所有权竞争。

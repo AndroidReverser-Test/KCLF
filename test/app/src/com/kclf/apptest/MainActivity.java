@@ -14,7 +14,7 @@ import java.io.File;
  */
 public final class MainActivity extends Activity {
     private Thread sleeper;
-    private static native int startProbes();
+    private static native int startProbes(boolean nonDumpable);
     static {
         System.loadLibrary("kclfhost");
     }
@@ -23,11 +23,13 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         File files = getFilesDir();
-        int probeResult = startProbes();
+        boolean nonDumpable = getIntent().getBooleanExtra("non_dumpable", false);
+        int probeResult = startProbes(nonDumpable);
         if (probeResult != 0) throw new IllegalStateException("native probes: " + probeResult);
         Log.i("KCLFAPP", "created pid=" + Process.myPid() + " tid=" + Process.myTid()
                 + " files=" + files.getAbsolutePath()
-                + " libdir=" + getApplicationInfo().nativeLibraryDir);
+                + " libdir=" + getApplicationInfo().nativeLibraryDir
+                + " non_dumpable=" + nonDumpable);
 
         sleeper = new Thread(new Runnable() {
             @Override

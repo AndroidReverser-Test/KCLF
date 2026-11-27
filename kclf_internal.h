@@ -251,6 +251,8 @@ struct kclf_syms
                              unsigned long offset);
     int (*vm_munmap)(unsigned long start, size_t len);
     struct vm_area_struct *(*find_vma)(struct mm_struct *mm, unsigned long addr);
+    struct vm_area_struct *(*find_vma_prev)(struct mm_struct *mm, unsigned long addr,
+                                          struct vm_area_struct **prev);
     long (*copy_from_user_nofault)(void *to, const void *from, unsigned long n);
     int (*access_process_vm)(struct task_struct *tsk, unsigned long addr, void *buf, int len, unsigned int gup_flags);
     /* access_process_vm() goes through get_task_mm(), which deliberately returns

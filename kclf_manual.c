@@ -954,7 +954,12 @@ static int map_image(struct km_context *c)
         writable = !!(prot & KM_PROT_WRITE);
         if (flen) {
             rc = map_fixed(first, c->file, flen, (int)prot, p->offset & ~(page - 1));
-            if (rc) return rc;
+            if (rc) {
+                kclf_set_err(c->r, "manual: PT_LOAD[%u] mmap prot=%u rc=%d%s", i, prot, rc,
+                             (rc == -EACCES || rc == -EPERM)
+                                 ? "; check target file access/SELinux execute permission" : "");
+                return rc;
+            }
         }
         if (end - first > flen) {
             u64 tail = end - first - flen;

@@ -162,7 +162,8 @@ int kclf_compat_init(void)
     /* With no verified VMA/lock layout, procfs provides a kernel-locked VMA
      * iterator. No mmap_sem offsets or rb-tree/maple-tree internals are guessed. */
     kclf_vma_direct = kclf_btf_ok && kclf_vma_start_off >= 0 && kclf_vma_end_off >= 0 &&
-                      kclf_vma_start_off != kclf_vma_end_off && kclf_ks.find_vma &&
+                      kclf_vma_start_off != kclf_vma_end_off &&
+                      (kclf_ks.find_vma || kclf_ks.find_vma_prev) &&
                       ((kclf_mmap_lock_off >= 0 && kclf_ks.down_read && kclf_ks.up_read) ||
                        (kclf_mmap_lock_off < 0 && kclf_ks.mmap_read_lock && kclf_ks.mmap_read_unlock));
     logki("kclf: kernel=%x btf=%d mm=%d mmap_lock=%d regs=%d vma=%s\n", kver, kclf_btf_ok, kclf_mm_off,

@@ -10,6 +10,7 @@ Current version: 1.6.4. Start with usage, then consult implementation and test d
 | [编译与使用 / Build and use](USAGE.md) | 工具链、测试 App、控制命令、路径要求、清理与卸载 / Toolchains, app, commands, paths and cleanup |
 | [实现说明 / Implementation](IMPLEMENTATION.md) | 执行模型、状态机、ELF/TLS、内核适配及能力边界 / Execution, states, ELF/TLS, kernel compatibility and limits |
 | [TLS 测试 / TLS testing](TLS_TESTING.md) | 主机与设备回归步骤 / Host and device regression instructions |
+| [HybridCLR 加载失败修复 / Loading fix](HYBRIDCLR_LOADING_FIX.md) | Android 5.15 non-dumpable VMA 回退与 SO 路径权限 / VMA fallback and payload access |
 | [1.6.4 审计 / Audit](AUDIT_1.6.4.md) | 修复、效率、可靠性与实测范围 / Fixes, performance, reliability and validation scope |
 | [1.6.4 证据索引 / Evidence](EVIDENCE_1.6.4.json) | 产物和本地测试日志的 SHA-256 / Artifact and local test-log hashes |
 | [更新记录 / Changelog](CHANGELOG.md) | 简要版本变化 / Concise release history |

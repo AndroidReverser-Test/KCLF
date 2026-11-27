@@ -569,7 +569,14 @@ static long kclf_vma_next(struct kclf_vma_iter *it, struct kclf_vma *out)
         u64 offset = 0;
         int prot = -1;
         kclf_mmap_read_lock(it->mm);
-        vma = kclf_ks.find_vma(it->mm, it->addr);
+        if (kclf_ks.find_vma) {
+            vma = kclf_ks.find_vma(it->mm, it->addr);
+        } else {
+            struct vm_area_struct *prev = 0;
+            /* Do not cast the three-argument ABI to find_vma's prototype:
+             * find_vma_prev writes through prev, including at end of scan. */
+            vma = kclf_ks.find_vma_prev(it->mm, it->addr, &prev);
+        }
         if (!vma) {
             kclf_mmap_read_unlock(it->mm);
             return 0;
@@ -1650,11 +1657,12 @@ int kclf_exec_probe(char *out, int outlen)
                           regs ? "ok" : "unavailable", kclf_regs_size, thread_size, kclf_page_size);
     off += kclf_scnprintf(out + off, outlen - off, "user_limit=%llx tbi=%d\n", (unsigned long long)kclf_user_limit,
                           kclf_user_tbi);
-    off += kclf_scnprintf(out + off, outlen - off, "vma_backend=%s mm_access=%s vma_meta=%d dpath=%d\n",
+    off += kclf_scnprintf(out + off, outlen - off, "vma_backend=%s mm_access=%s vma_meta=%d dpath=%d vma_find=%s\n",
                           kclf_vma_direct ? "locked" : "proc_maps", kclf_mm_off > 0 ? "offset" : "get_task_mm",
                           kclf_vma_file_off >= 0 && kclf_vma_pgoff_off >= 0 && kclf_vma_flags_off >= 0 &&
                                   kclf_file_path_off >= 0,
-                          !!kclf_ks.d_path);
+                          !!kclf_ks.d_path,
+                          kclf_ks.find_vma ? "find_vma" : (kclf_ks.find_vma_prev ? "find_vma_prev" : "none"));
     off += kclf_scnprintf(out + off, outlen - off, "cancel=%s user_io=access_process_vm wake=%s quiescing=%d\n",
                           kclf_ks.task_work_cancel_match ? "match" : (kclf_ks.task_work_cancel_object ? "object" : "func"),
                           kclf_wake_supported ? "task_work_signal" : "unsupported", kclf_unloading);

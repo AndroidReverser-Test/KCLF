@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -47,12 +48,14 @@ static void *fp_probe(void *arg)
     }
 }
 
-JNIEXPORT jint JNICALL Java_com_kclf_apptest_MainActivity_startProbes(JNIEnv *env, jclass cls)
+JNIEXPORT jint JNICALL Java_com_kclf_apptest_MainActivity_startProbes(JNIEnv *env, jclass cls, jboolean non_dumpable)
 {
     pthread_t thread;
     int rc = 0;
     (void)env;
     (void)cls;
+    /* Exercise the worker's locked VMA fallback when procfs denies maps. */
+    if (non_dumpable && prctl(PR_SET_DUMPABLE, 0)) return errno;
     pthread_mutex_lock(&probe_lock);
     if (!probes_started) {
         probes_started = 1;

@@ -50,6 +50,8 @@ KCLF 是 KernelPatch 加载的可重定位 KPM（`ld -r`），不是常规 Linux
 - syscall hook 只用 nofault 读取；缺少 nofault 时通过可睡眠 poll task_work 使用 GUP。
 
 `probe` 输出 BTF、页大小、寄存器帧、VMA 方法、wake ABI、HWCAP 来源和完成观察能力。
+直接 VMA 遍历优先使用 `find_vma`；缺少该符号时使用三参数的 `find_vma_prev`，
+仍要求 BTF 验证布局及可用的 mmap 读锁/解锁。`probe` 的 `vma_find` 显示选用的 accessor。
 无 syscall 观察且无已知 `pt_regs` 时不能注入。TIF 宏不在 BTF 中，仍使用版本基线；
 6.16 的 UPROBE 位变化等已有处理，但厂商回移标志位仍需要核验。
 
@@ -428,7 +430,10 @@ Without verified layouts:
 - syscall hooks use nofault reads only; sleepable poll task_work can use GUP.
 
 probe reports BTF, pages, register frame, VMA method, wake ABI, HWCAP source and
-completion observation. Injection requires syscall observation or an already
+completion observation. The locked walker prefers `find_vma`, falling back to
+the three-argument `find_vma_prev` when needed; both require verified BTF layout
+and paired mmap lock operations. `vma_find` identifies the selected accessor.
+Injection requires syscall observation or an already
 known pt_regs layout. TIF macros are absent from BTF and still use version
 baselines, including the 6.16 UPROBE bit change; vendor backports need verification.
 

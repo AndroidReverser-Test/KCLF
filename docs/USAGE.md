@@ -82,6 +82,12 @@ adb shell run-as com.kclf.apptest cat /data/user/0/com.kclf.apptest/files/hit_$T
   `linker` 还要求路径属于目标 linker namespace 允许的范围，并允许文件的可执行映射；
   本示例使用安装后的 native library 目录。`/data/local/tmp` 不能视为普通 App 通用可用的路径。
 
+`manual: PT_LOAD[...] mmap prot=5 rc=-13` 表示文件的 RX 映射被拒绝，应检查目标的
+文件访问权限和 SELinux execute 策略；单独 `chmod 777` 或控制端提权不能解决标签限制。
+若文件路径已允许执行，但出现 `mapping permission snapshot rc=-2/-13`，检查
+`probe` 的 `vma_backend` / `vma_find`；non-dumpable 目标可能拒绝 worker 的 procfs 读取。
+具体复现和修复见 [HybridCLR 加载失败分析](HYBRIDCLR_LOADING_FIX.md)。
+
 常用控制字符串（作为 `kpm ctl0 kclf` 的最后一个参数）：
 
 | 命令 | 含义 |
@@ -135,6 +141,14 @@ adb shell /data/local/tmp/kpatch "$KEY" kpm unload kclf
 ```powershell
 .\test\app\device-test.ps1 -SuperKey (Read-Host 'KernelPatch superkey') -Serial '<SERIAL>' -Backend manual -Repeat 10
 # -Backend linker 测试另一后端；-Apk / -Kpm 可指定产物
+```
+
+追加 `-NonDumpable` 让测试 App 调用 `PR_SET_DUMPABLE=0`，覆盖 procfs 不可读时的
+加锁 VMA 回退；可选 `-RootContext <context>` 仅指定控制端 `kpatch su -Z` 的上下文，
+用于读取测试日志，不改变测试 App 或 worker 的凭据。示例：
+
+```powershell
+.\test\app\device-test.ps1 -SuperKey $env:KCLF_SUPERKEY -Serial '<SERIAL>' -Backend manual -Repeat 3 -NonDumpable -RootContext u:r:magisk:s0
 ```
 
 ## English
@@ -226,6 +240,12 @@ injecting another SO.
   requires an allowed path in the target linker namespace and permission for
   executable file mappings. This example uses the installed native library
   directory. Do not assume `/data/local/tmp` is usable by an ordinary app.
+
+`PT_LOAD[...] mmap prot=5 rc=-13` means the RX file mapping was denied. Check
+target file access and SELinux execute policy; `chmod 777` or controller root
+does not fix a file-label restriction. For `mapping permission snapshot rc=-2/-13`
+on a non-dumpable target, check `probe` fields `vma_backend` / `vma_find`.
+See the [loading failure investigation](HYBRIDCLR_LOADING_FIX.md).
 
 Common control strings, passed as the last argument to `kpm ctl0 kclf`:
 

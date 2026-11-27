@@ -37,12 +37,13 @@ static int kclf_vma_direct, kclf_vma_start_off, kclf_vma_end_off = 8;
 static int kclf_vma_file_off = -1, kclf_vma_pgoff_off = -1, kclf_vma_flags_off = -1;
 static int kclf_file_path_off = -1;
 static int kclf_page_size = 4096;
-static int locks, opened, closed, io_error, open_error, copy_error;
+static int locks, opened, closed, io_error, open_error, copy_error, prev_calls;
 static size_t chunk = 512;
 static char text[8192], scratch[512];
 static int kclf_is_err(const void *p) { return (uintptr_t)p >= (uintptr_t)-4095; }
 static struct file *fake_open(const char *path, int flags, unsigned short mode) {
-    assert(!strcmp(path, "/proc/thread-self/maps") && !flags && !mode);
+    assert(!strcmp(path, kclf_io_worker == current ? "/proc/42/maps" : "/proc/thread-self/maps"));
+    assert(!flags && !mode);
     if (open_error) return (void *)(intptr_t)open_error;
     opened++;
     return &file;
@@ -71,6 +72,14 @@ static struct vm_area_struct *fake_find(struct mm_struct *m, unsigned long addr)
     for (unsigned int i = 0; i < 3; i++) if (vmas[i].end > addr) return &vmas[i];
     return NULL;
 }
+static struct vm_area_struct *fake_find_prev(struct mm_struct *m, unsigned long addr,
+                                            struct vm_area_struct **prev) {
+    assert(prev && !*prev);
+    struct vm_area_struct *v = fake_find(m, addr);
+    *prev = v ? (v == vmas ? NULL : v - 1) : &vmas[2];
+    prev_calls++;
+    return v;
+}
 static char *fake_d_path(const void *path, char *buf, int len)
 {
     assert(len == 256);
@@ -82,8 +91,9 @@ static struct {
     long (*vfs_read)(struct file *, char *, unsigned long, loff_t *);
     void (*fput)(struct file *);
     struct vm_area_struct *(*find_vma)(struct mm_struct *, unsigned long);
+    struct vm_area_struct *(*find_vma_prev)(struct mm_struct *, unsigned long, struct vm_area_struct **);
     char *(*d_path)(const void *, char *, int);
-} kclf_ks = {fake_open, fake_read, fake_close, fake_find, fake_d_path};
+} kclf_ks = {fake_open, fake_read, fake_close, fake_find, fake_find_prev, fake_d_path};
 '''
 MAIN = r'''
 int main(void) {
@@ -161,8 +171,26 @@ int main(void) {
     kclf_vma_iter_close(&it);
     assert(!kclf_vma_at(&mm, 0x3800, &v, 0) && v.start == 0x3000);
     assert(kclf_vma_at(&mm, 0x8000, &v, 0) == -ENOENT);
+    assert(!prev_calls); /* Prefer the two-argument accessor when present. */
     open_error = -EACCES;
     assert(kclf_snapshot_vmas(0, ranges, 3) == 3 && ranges[0].prot == 5);
+    /* Android 5.15 LTO: find_vma absent, find_vma_prev retained. The worker
+     * sees ENOENT/EACCES for a live non-dumpable target's /proc/<tgid>/maps. */
+    kclf_ks.find_vma = NULL;
+    kclf_io_worker = current; kclf_io_tgid = 42;
+    for (unsigned i = 0; i < 2; i++) {
+        open_error = i ? -EACCES : -ENOENT;
+        assert(kclf_snapshot_vmas(0, ranges, 3) == 3);
+        assert(ranges[0].prot == 5 && ranges[1].prot == 7 && ranges[2].prot == 0);
+        assert(kclf_snapshot_vmas(0, ranges, 2) == -E2BIG);
+        assert(!kclf_vma_at(&mm, 0x2800, &v, 0) && v.start == 0x3000);
+        assert(v.offset == 3 * 4096 && !strcmp(v.path, "/system/lib64/libfoo.so"));
+        assert(!kclf_vma_at(&mm, 0x3800, &v, 0) && v.start == 0x3000);
+        assert(kclf_vma_at(&mm, 0x8000, &v, 0) == -ENOENT && !locks);
+    }
+    assert(prev_calls && opened == closed);
+    puts("find_vma_prev fallback: non-dumpable worker, holes, EOF, permissions, lock balance: PASS");
+    kclf_io_worker = NULL; kclf_io_tgid = 0;
     open_error = 0;
     vmas[0].end = KCLF_USER_MAX + 1;
     assert(kclf_vma_at(&mm, 0, &v, 0) == -EFAULT && !locks);
